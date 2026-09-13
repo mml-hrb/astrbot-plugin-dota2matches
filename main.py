@@ -110,6 +110,11 @@ REPARSE_REQUEST_EVERY = 5
 #: 同一局里被监听的玩家越多，这几段统计就会把提示词撑得越长，因此设上限。
 MAX_FOCUS_RECENT_CONTEXT = 4
 
+#: 命令行里分隔多个焦点玩家的分隔符。
+#: 昵称本身可以含空格（例如「你刚才确实说了【钢板】对吧」），因此**不能**
+#: 用空格分隔，必须用顿号 / 逗号 / 分号 / 竖线 / 斜杠这类显式分隔符。
+FOCUS_SPLIT_RE = re.compile(r"[、,，;；|/]+")
+
 #: 已知「无法主动推送消息」的平台。这些平台只能被动回复，
 #: 因此比赛结束后的自动推送无法送达，需要在添加监听时就提醒用户。
 PLATFORMS_WITHOUT_PROACTIVE_PUSH = {
@@ -280,8 +285,17 @@ class Dota2Plugin(Star):
     # ==================================================================
     # 目标解析
     # ==================================================================
-    async def _resolve_account(self, target: str) -> tuple[int, str]:
+    async def _resolve_account(
+        self, target: str, in_match_players: list[dict] | None = None
+    ) -> tuple[int, str]:
         """把用户输入解析成 ``(account_id, personaname)``。
+
+        Args:
+            target: 用户输入的昵称 / 32 位 ID / 64 位 SteamID / 个人主页链接。
+            in_match_players: 可选的「本局选手列表」。给出时，昵称会先在这
+                10 个人里精确匹配；命中唯一就直接采用。OpenDota 上重名昵称
+                极多（例如「大魔导师马化腾」有 5 个同名账号），只靠全局搜索
+                会让这些玩家永远解析不出来，而复盘场景下本局选手就是天然消歧器。
 
         Raises:
             TargetNotFoundError: 找不到唯一确定的玩家。
@@ -315,6 +329,20 @@ class Dota2Plugin(Star):
                 )
             profile = player.get("profile") or {}
             return account_id, profile.get("personaname") or f"账号{account_id}"
+
+        # 昵称在本局选手里唯一命中时直接采用，跳过全局搜索（重名消歧）
+        if in_match_players:
+            lowered_target = target.lower()
+            hits = [
+                player
+                for player in in_match_players
+                if isinstance(player, dict)
+                and player.get("account_id")
+                and str(player.get("personaname") or "").lower() == lowered_target
+            ]
+            if len(hits) == 1:
+                hit_id = int(hits[0]["account_id"])
+                return hit_id, str(hits[0].get("personaname") or f"账号{hit_id}")
 
         # 昵称：走 OpenDota 搜索
         try:
@@ -761,12 +789,14 @@ class Dota2Plugin(Star):
     # ==================================================================
     @d2.command("match", alias={"单场", "detail", "复盘单场"})
     async def d2_match(self, event: AstrMessageEvent, args: GreedyStr):
-        """AI 深度复盘单场比赛：/d2 单场 <比赛ID> [昵称|账号ID]"""
+        """AI 深度复盘单场比赛：/d2 单场 <比赛ID> [焦点玩家]（多位用 、或 , 分隔）"""
         tokens = [token for token in re.split(r"\s+", str(args).strip()) if token]
         if not tokens or not re.fullmatch(r"\d{6,20}", tokens[0]):
             yield event.plain_result(
-                "用法：`/d2 单场 <比赛ID> [昵称|账号ID]`\n"
+                "用法：`/d2 单场 <比赛ID> [焦点玩家]`\n"
                 "例如：`/d2 单场 8989601141`\n"
+                "多位焦点：`/d2 单场 8989601141 张三、李四、王五`"
+                "（昵称或账号 ID，用 、/, 分隔；昵称可以含空格）\n"
                 "比赛 ID 可以从 `/d2 战绩` 的结果中获取，或直接使用 Dota 客户端的比赛编号。"
             )
             return
@@ -774,18 +804,9 @@ class Dota2Plugin(Star):
         match_id = int(tokens[0])
         rest = " ".join(tokens[1:])
 
-        if rest:
-            try:
-                focus_account_id, focus_name = await self._resolve_account(rest)
-            except OpenDotaError as e:
-                yield event.plain_result(f"❌ 焦点玩家解析失败：{e}")
-                return
-        else:
-            binding, _ = self._effective_binding(event)
-            focus_account_id = int(binding.get("account_id") or 0) if binding else None
-            focus_name = (binding.get("personaname") or "") if binding else ""
-
-        yield event.plain_result(f"⏳ 正在拉取比赛 {match_id} 的详细数据并生成复盘，请稍候…")
+        yield event.plain_result(
+            f"⏳ 正在拉取比赛 {match_id} 的详细数据并生成复盘，请稍候…"
+        )
 
         try:
             match = await self.api.get_match(match_id)
@@ -800,8 +821,48 @@ class Dota2Plugin(Star):
             yield event.plain_result(f"❌ 拉取比赛数据失败：{e}")
             return
 
+        # 焦点解析放在拉取之后：本局十人名单是天然的昵称消歧器，
+        # 「大魔导师马化腾」这类重名昵称只有在局内唯一时才能被解析出来。
+        players_in_match = [
+            player
+            for player in (match.get("players") or [])
+            if isinstance(player, dict)
+        ]
+
+        focus_ids: list[int] = []
+        focus_names: dict[int, str] = {}
+        failed: list[str] = []
+
+        if rest:
+            for query in (q.strip() for q in FOCUS_SPLIT_RE.split(rest)):
+                if not query:
+                    continue
+                try:
+                    account_id, name = await self._resolve_account(
+                        query, in_match_players=players_in_match
+                    )
+                except OpenDotaError as e:
+                    failed.append(f"{query}（{e}）")
+                    continue
+                account_id = int(account_id or 0)
+                if account_id and account_id not in focus_ids:
+                    focus_ids.append(account_id)
+                    focus_names[account_id] = name
+            if failed and not focus_ids:
+                yield event.plain_result(
+                    "❌ 焦点玩家解析失败：\n"
+                    + "\n".join(f"· {item}" for item in failed)
+                    + "\n建议直接使用 32 位账号 ID 或 64 位 SteamID，结果更准确。"
+                )
+                return
+
+        if failed:
+            yield event.plain_result(
+                "⚠️ 以下焦点未能解析，已跳过：" + "、".join(failed)
+            )
+
         # 未指定焦点玩家时，若本会话的绑定出现在这场比赛中，则自动聚焦
-        if not focus_account_id:
+        if not focus_ids:
             binding, _ = self._effective_binding(event)
             if binding:
                 candidate = int(binding.get("account_id") or 0)
@@ -810,47 +871,62 @@ class Dota2Plugin(Star):
                     and player.get("account_id") == candidate
                     for player in match.get("players") or []
                 ):
-                    focus_account_id = candidate
-                    focus_name = binding.get("personaname") or ""
+                    focus_ids.append(candidate)
+                    focus_names[candidate] = binding.get("personaname") or ""
 
         parsed = OpenDotaClient.is_parsed(match)
-        headline = self.match_headline(match, heroes, focus_account_id, parsed)
+        headline = self.match_headline(match, heroes, focus_ids or None, parsed)
 
-        # 附上该玩家近期的整体状态，让复盘更有上下文
+        # 附上焦点玩家近期的整体状态，让复盘更有上下文。
+        # 焦点可能不止一位，逐位取；超过上限的只做本场复盘，避免提示词被撑爆。
         extra_context = ""
         recent_count = max(0, int(self.cfg("watch_match_analysis_count", 10)))
-        if focus_account_id and recent_count:
-            try:
-                recent_matches, economy_samples = (
-                    await self.api.get_player_matches_enriched(
-                        focus_account_id, recent_count
+        if focus_ids and recent_count:
+            blocks: list[str] = []
+            for focus_id in focus_ids[:MAX_FOCUS_RECENT_CONTEXT]:
+                label = focus_names.get(focus_id) or focus_id
+                try:
+                    recent_matches, economy_samples = (
+                        await self.api.get_player_matches_enriched(
+                            focus_id, recent_count
+                        )
+                    )
+                    recent_matches = [
+                        m
+                        for m in recent_matches
+                        if int(m.get("match_id") or 0) != match_id
+                    ]
+                except OpenDotaError as e:
+                    logger.debug(f"[dota2] 获取 {focus_id} 近期状态上下文失败: {e}")
+                    continue
+                if not recent_matches:
+                    continue
+                summary = summarize_matches(
+                    recent_matches, economy_samples=economy_samples
+                )
+                blocks.append(
+                    f"—— {label}（account_id={focus_id}）在本场之外最近 "
+                    f"{len(recent_matches)} 场的整体情况"
+                    f"（用于判断本场是他的正常发挥还是异常）：\n"
+                    + format_summary_block(summary, heroes)
+                )
+            if blocks:
+                extra_context = "\n\n".join(blocks) + (
+                    "\n\n请在报告最后额外增加一节「## 近期状态」"
+                    + (
+                        "，为上面每位焦点玩家各起一个小标题，"
+                        "各用 3 句以内说明其最近的竞技走向。"
+                        if len(focus_ids) > 1
+                        else "，用 3 句以内说明这名玩家最近的整体竞技走向。"
                     )
                 )
-                recent_matches = [
-                    m
-                    for m in recent_matches
-                    if int(m.get("match_id") or 0) != match_id
-                ]
-                if recent_matches:
-                    summary = summarize_matches(
-                        recent_matches, economy_samples=economy_samples
-                    )
-                    extra_context = (
-                        f"该玩家在本场之外最近 {len(recent_matches)} 场的整体情况"
-                        f"（用于判断本场是他的正常发挥还是异常）：\n"
-                        + format_summary_block(summary, heroes)
-                        + "\n\n请在报告最后额外增加一节「## 近期状态」，"
-                        "用 3 句以内说明这名玩家最近的整体竞技走向。"
-                    )
-            except OpenDotaError as e:
-                logger.debug(f"[dota2] 获取近期状态上下文失败: {e}")
 
         prompt = build_single_match_analysis_prompt(
             match=match,
             heroes=heroes,
             items=items,
-            focus_account_ids=focus_account_id or None,
-            focus_names={int(focus_account_id): focus_name} if focus_account_id else None,
+            focus_account_ids=focus_ids or None,
+            focus_names=focus_names or None,
             extra_context=extra_context,
         )
 
@@ -867,7 +943,7 @@ class Dota2Plugin(Star):
                     match,
                     heroes,
                     items,
-                    focus_account_ids=focus_account_id or None,
+                    focus_account_ids=focus_ids or None,
                 )
             )
             for chunk in self._chunk_text(raw):
