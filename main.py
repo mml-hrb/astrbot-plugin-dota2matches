@@ -11,6 +11,8 @@
 """
 
 import asyncio
+import functools
+import inspect
 import re
 import time
 from pathlib import Path
@@ -51,6 +53,7 @@ try:  # 插件目录被作为包加载时的相对导入
         summarize_matches,
     )
     from .dota_store import DotaStore
+    from . import dota_nlu
 except ImportError:  # 兜底：以普通模块方式加载时（把插件目录加入 sys.path）
     import os
     import sys
@@ -87,6 +90,8 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
     )
     from dota_store import DotaStore  # type: ignore[no-redef]
 
+    import dota_nlu  # type: ignore[no-redef]
+
 try:
     # AstrBot 用 GreedyStr 标记「接收剩余全部文本」的参数
     from astrbot.core.star.filter.command import GreedyStr
@@ -121,6 +126,27 @@ PLATFORMS_WITHOUT_PROACTIVE_PUSH = {
     "qq_official": "QQ 官方机器人",
     "qq_official_webhook": "QQ 官方机器人(Webhook)",
 }
+
+# ======================================================================
+# 自然语言入口相关的常量
+# ======================================================================
+#: 多义意图：这几个意图既可能是闲聊，也可能是真要操作。在群里直接执行
+#: 有误触风险，因此先回一句确认，等用户回「确认」再动手。
+NLU_CONFIRM_INTENTS = {"bind", "unbind", "watch"}
+
+#: 确认 / 取消词（命中即认为用户回的是确认或放弃）
+NLU_CONFIRM_WORDS = frozenset(
+    {"确认", "确定", "是的", "对", "对的", "ok", "okay", "好", "好的", "嗯", "yes", "y"}
+)
+NLU_CANCEL_WORDS = frozenset(
+    {"取消", "不用了", "算了", "不", "不要", "否", "no", "n", "别"}
+)
+
+#: 等待确认的超时时间（秒）
+NLU_CONFIRM_TTL = 120
+
+#: 看到这些开头的消息一律跳过：那是别的插件 / 本插件的指令，不该被截胡。
+NLU_SKIP_PREFIXES = ("/", "／", "!", "！", "#", "。", "~", "～")
 
 #: 配置中未填写系统提示词时的兜底内容
 DEFAULT_SYSTEM_PROMPT = (
@@ -161,7 +187,49 @@ HELP_TEXT = """🎮 Dota2 数据查询助手（数据来源：OpenDota）
 · 不填「目标」时，默认使用你在当前会话绑定的账号；
 · 一局比赛只分析一次：若这场比赛里有多位被监听的玩家，报告会对他们逐一深入点评；
 · 「绑定列表」中他人的账号与用户 ID 默认打码，保护群聊隐私；
-· 想让查询结果更好看，可以在配置中调整「长报告转为图片发送」。"""
+· 想让查询结果更好看，可以在配置中调整「长报告转为图片发送」。
+
+自然语言（不用记指令）：
+· 直接说人话也能用，例如「帮我看看我的战绩」「分析一下天鸽最近的发挥」
+  「这局 8993438099 复盘一下」「最近 20 把打得怎么样」；
+· 群聊里需要 @ 机器人 才会响应（可在配置中关闭这个限制）；
+· 群里说「绑定 86745912」这类闲聊式指令时，插件会先确认再执行，避免误触。"""
+
+
+def take_over_event(func):
+    """接管事件：直发回复 + 结束后终止事件传播。
+
+    AstrBot 的流水线是「洋葱模型」：handler 每 ``yield`` 一条结果，后续
+    阶段（含默认大模型的请求阶段）就会被执行一次。本插件的指令往往要先
+    yield 一条「⏳ 正在拉取…」再花十几秒拉数据，如果不做处理，默认大模型
+    就会在这个空档里插嘴，编造出「没有绑定成功，无法读取数据。」这类
+    插件代码里根本不存在的话术，最后还会在真正的分析结果之前先冒出来。
+
+    因此这里做两件事：
+
+    1. **直发**：把 handler yield 出来的结果通过 ``event.send()`` 直接投递
+       （这正是 AstrBot 自己的 RespondStage 使用的通道），不再回灌流水线。
+       这样插件执行期间流水线里不会产生任何额外的执行机会。
+    2. **终止传播**：handler 结束后调用 ``event.stop_event()``，阻止流水线
+       继续走到默认大模型阶段。
+
+    两步都做了降级：运行时没有 ``event.send`` 或结果上没有 ``chain`` 时，
+    自动退回为正常 ``yield``，保证在老版本 / 自定义 Event 上也能出消息。
+    """
+
+    @functools.wraps(func)
+    async def wrapper(self, event: AstrMessageEvent, *args, **kwargs):
+        try:
+            async for result in func(self, event, *args, **kwargs):
+                if not await self._deliver_now(event, result):
+                    yield result
+        finally:
+            try:
+                event.stop_event()
+            except Exception as e:  # noqa: BLE001 - 老版本没有该 API
+                logger.debug(f"[dota2] 终止事件传播失败（可忽略）: {e}")
+
+    return wrapper
 
 
 class Dota2Plugin(Star):
@@ -190,6 +258,9 @@ class Dota2Plugin(Star):
         self._watch_task: asyncio.Task | None = None
         self._stopping = False
         self._next_poll_at = 0.0
+        #: 自然语言确认状态：``{(umo, uid): (intent_name, args, 过期时间戳)}``
+        #: 群里说「绑定 xxx」这类多义指令时，先记下来等用户确认再执行。
+        self._nlu_confirm: dict[tuple[str, str], tuple[str, str, float]] = {}
         logger.info(
             f"[dota2] 插件已加载，数据目录: {self.data_dir}，"
             f"监听: {'开启' if self.cfg('watch_enabled', True) else '关闭'}"
@@ -266,6 +337,26 @@ class Dota2Plugin(Star):
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[dota2] 文本转图片失败，回退为纯文本发送: {e}")
             return None
+
+    async def _deliver_now(self, event: AstrMessageEvent, result) -> bool:
+        """尽量把一条结果直接投递出去，成功返回 True。
+
+        直接使用 ``event.send()`` 发送，绕过流水线（AstrBot 自己的
+        RespondStage 也是走这个通道）。这样插件在执行期间不会给流水线
+        制造新的执行机会，默认大模型也就没有插嘴的时机。
+
+        当前运行时不支持直发时返回 False，由调用方回退为 ``yield``。
+        """
+        send = getattr(event, "send", None)
+        chain = getattr(result, "chain", None)
+        if not callable(send) or chain is None:
+            return False
+        try:
+            await send(chain)
+        except Exception as e:  # noqa: BLE001 - 直发不可用时回退为流水线发送
+            logger.warning(f"[dota2] 直接发送失败，回退为流水线发送: {e}")
+            return False
+        return True
 
     async def _emit(self, event: AstrMessageEvent, text: str, as_image: bool = False):
         """把文本发送到当前会话（可作为异步生成器使用）。
@@ -423,14 +514,206 @@ class Dota2Plugin(Star):
         """Dota2 数据查询助手"""
 
     @d2.command("help", alias={"帮助", "h", "?", "菜单"})
+    @take_over_event
     async def d2_help(self, event: AstrMessageEvent):
         """查看 Dota2 助手的使用说明"""
         yield event.plain_result(HELP_TEXT)
 
     # ==================================================================
+    # 自然语言入口：不用记指令，直接说人话
+    # ==================================================================
+    #: 意图 → 处理函数名。自然语言识别出意图后，直接复用对应的指令实现，
+    #: 保证「说人话」与「打指令」两条路径的行为完全一致。
+    NLU_DISPATCH: dict[str, str] = {
+        "help": "d2_help",
+        "bind": "d2_bind",
+        "unbind": "d2_unbind",
+        "my": "d2_my",
+        "bindings": "d2_bindings",
+        "info": "d2_info",
+        "heroes": "d2_heroes",
+        "matches": "d2_matches",
+        "analyze": "d2_analyze",
+        "match": "d2_match",
+        "watch": "d2_watch",
+        "unwatch": "d2_unwatch",
+        "watchlist": "d2_watchlist",
+    }
+
+    def _nlu_invoke(self, name: str, event: AstrMessageEvent, args: str):
+        """按目标 handler 的真实签名决定要不要传参数。
+
+        指令 handler 有两类：带 ``args`` 的（查询 / 绑定 / 监听）和不带
+        参数的（帮助 / 我的 / 绑定列表 / 监听列表）。自然语言入口不该
+        关心这个差别，这里统一处理。
+        """
+        handler = getattr(self, self.NLU_DISPATCH.get(name, ""), None)
+        if handler is None:
+            return None
+        func = getattr(handler, "__wrapped__", handler)
+        try:
+            sig = inspect.signature(func)
+            takes_args = len(sig.parameters) >= 3
+        except (TypeError, ValueError):  # pragma: no cover - 理论不会发生
+            takes_args = True
+        if takes_args:
+            return handler(event, args)
+        return handler(event)
+
+    def _nlu_should_handle(self, event: AstrMessageEvent, text: str) -> bool:
+        """判断这条消息要不要交给自然语言入口处理。"""
+        if not self.cfg("nlu_enabled", True):
+            return False
+        text = (text or "").strip()
+        if not text:
+            return False
+        # 指令类消息交给命令 handler，这里不截胡
+        if text.startswith(NLU_SKIP_PREFIXES):
+            return False
+
+        # 群聊 / 私聊判断：用消息类型与 umo 双重判断，兼容各适配器。
+        # get_message_type 在少数自定义 Event 上可能不存在，因此做了容错。
+        umo = str(event.unified_msg_origin)
+        try:
+            message_type = str(event.get_message_type())
+        except Exception:  # noqa: BLE001
+            message_type = ""
+        is_group = "GROUP_MESSAGE" in message_type or "GroupMessage" in umo
+        if is_group and self.cfg("nlu_group_require_at", True):
+            # 群里必须 @ 机器人（或使用唤醒前缀，此时 message_str 里已带前缀）。
+            # 这条限制能挡掉绝大多数「群里别人随口一说就被插件抢答」的情况。
+            try:
+                if not event.is_at_or_wake_command:
+                    return False
+            except AttributeError:
+                return False
+        return True
+
+    async def _nlu_classify_with_llm(
+        self, event: AstrMessageEvent, text: str
+    ) -> dota_nlu.Intent | None:
+        """规则没把握时，可选地用大模型兜底分类一次。"""
+        provider = await resolve_provider(
+            self.context, event.unified_msg_origin, self.cfg("llm_provider_id", "")
+        )
+        if not provider:
+            return None
+        prompt = dota_nlu.build_classifier_prompt(text)
+        try:
+            reply = await call_llm(provider, dota_nlu.CLASSIFIER_SYSTEM_PROMPT, prompt)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[dota2] 自然语言分类调用失败: {e}")
+            return None
+        return dota_nlu.parse_classifier_reply(reply)
+
+    def _nlu_pop_confirm(
+        self, umo: str, uid: str
+    ) -> tuple[str, str, float] | None:
+        """取出并清理某个用户的待确认项（过期的自动丢弃）。"""
+        key = (umo, uid)
+        item = self._nlu_confirm.pop(key, None)
+        if not item:
+            return None
+        if item[2] < time.time():
+            return None
+        return item
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    @take_over_event
+    async def d2_natural(self, event: AstrMessageEvent):
+        """自然语言入口：把「帮我看看我的战绩」这类人话转成对应功能。"""
+        text = dota_nlu.normalize(getattr(event, "message_str", "") or "")
+        umo = event.unified_msg_origin
+        uid = str(event.get_sender_id())
+
+        # ---------- 1. 先处理「确认 / 取消」回复 ----------
+        pending = self._nlu_confirm.get((umo, uid))
+        if pending is not None:
+            if pending[2] < time.time():
+                self._nlu_confirm.pop((umo, uid), None)
+            elif text in NLU_CONFIRM_WORDS:
+                name, args, _ = self._nlu_pop_confirm(umo, uid)
+                agen = self._nlu_invoke(name, event, args)
+                if agen is not None:
+                    logger.info(f"[dota2] 自然语言确认执行: {name} {args!r}")
+                    async for item in agen:
+                        yield item
+                return
+            elif text in NLU_CANCEL_WORDS:
+                self._nlu_pop_confirm(umo, uid)
+                yield event.plain_result("好的，已取消。")
+                return
+
+        # ---------- 2. 该不该处理这条消息 ----------
+        if not self._nlu_should_handle(event, text):
+            return
+
+        # ---------- 3. 识别意图 ----------
+        intent = dota_nlu.parse(text)
+        if intent is None and self.cfg("nlu_llm_fallback", False):
+            intent = await self._nlu_classify_with_llm(event, text)
+        if intent is None:
+            # 没识别出来：什么都不做，把消息让给默认大模型，避免抢答
+            return
+
+        handler_name = self.NLU_DISPATCH.get(intent.name)
+        if not handler_name:
+            return
+        # 缺参数的意图直接告诉用户怎么补，别去猜
+        if intent.name in dota_nlu.INTENT_NEEDS_TARGET and not intent.args:
+            if intent.name == "unwatch":
+                pass  # 取消监听允许不带目标（按当前绑定来）
+            elif intent.name == "match":
+                yield event.plain_result(
+                    "复盘单场需要比赛 ID，例如：`这局 8993438099 帮我复盘一下`。\n"
+                    "比赛 ID 可以从「我的战绩」里拿，或直接用 Dota 客户端的比赛编号。"
+                )
+                return
+            elif intent.name in {"bind", "info", "heroes", "matches", "analyze", "watch"}:
+                # 无法确定是谁：交给 handler，它会回落到当前会话的绑定
+                pass
+
+        handler = getattr(self, handler_name, None)
+        if handler is None:
+            return
+
+        # ---------- 4. 多义意图先确认，避免群里误触 ----------
+        if (
+            intent.name in NLU_CONFIRM_INTENTS
+            and intent.args
+            and self.cfg("nlu_confirm_sensitive", True)
+        ):
+            self._nlu_confirm[(umo, uid)] = (
+                intent.name,
+                intent.args,
+                time.time() + NLU_CONFIRM_TTL,
+            )
+            verb = {
+                "bind": "绑定账号",
+                "unbind": "解除绑定",
+                "watch": "添加监听",
+            }.get(intent.name, intent.name)
+            yield event.plain_result(
+                f"你刚才是想让我{verb}「{intent.args}」吗？\n"
+                f"回复「确认」我就执行；回复「取消」就当我没说。"
+            )
+            return
+
+        logger.info(
+            f"[dota2] 自然语言识别: {intent.name} args={intent.args!r} "
+            f"score={intent.score} via={intent.via}"
+        )
+        agen = self._nlu_invoke(intent.name, event, intent.args)
+        if agen is None:
+            return
+        async for item in agen:
+            yield item
+
+    # ==================================================================
     # 指令：绑定 / 解绑
     # ==================================================================
     @d2.command("bind", alias={"绑定", "bd"})
+    @take_over_event
     async def d2_bind(self, event: AstrMessageEvent, args: GreedyStr):
         """绑定 Dota2 玩家账号：/d2 绑定 <昵称|32位ID|64位SteamID>"""
         target = str(args).strip()
@@ -462,6 +745,7 @@ class Dota2Plugin(Star):
         )
 
     @d2.command("unbind", alias={"解绑", "ub"})
+    @take_over_event
     async def d2_unbind(self, event: AstrMessageEvent):
         """解除当前会话的 Dota2 账号绑定"""
         umo = event.unified_msg_origin
@@ -488,6 +772,7 @@ class Dota2Plugin(Star):
         yield event.plain_result(message)
 
     @d2.command("my", alias={"我的", "me", "当前绑定"})
+    @take_over_event
     async def d2_my(self, event: AstrMessageEvent):
         """查看自己在当前会话的绑定"""
         umo = event.unified_msg_origin
@@ -509,6 +794,7 @@ class Dota2Plugin(Star):
         )
 
     @d2.command("bindings", alias={"绑定列表", "列表", "blist"})
+    @take_over_event
     async def d2_bindings(self, event: AstrMessageEvent):
         """查看本会话中所有成员绑定的账号"""
         umo = event.unified_msg_origin
@@ -594,6 +880,7 @@ class Dota2Plugin(Star):
     # 指令：玩家资料 / 英雄统计
     # ==================================================================
     @d2.command("info", alias={"资料", "player", "玩家"})
+    @take_over_event
     async def d2_info(self, event: AstrMessageEvent, args: GreedyStr):
         """查看玩家资料：/d2 资料 [昵称|账号ID]"""
         target = str(args).strip()
@@ -628,6 +915,7 @@ class Dota2Plugin(Star):
         )
 
     @d2.command("heroes", alias={"英雄", "hero", "英雄池"})
+    @take_over_event
     async def d2_heroes(self, event: AstrMessageEvent, args: GreedyStr):
         """查看英雄使用统计：/d2 英雄 [昵称|账号ID]"""
         target = str(args).strip()
@@ -660,6 +948,7 @@ class Dota2Plugin(Star):
     # 指令：战绩
     # ==================================================================
     @d2.command("matches", alias={"战绩", "rec", "比赛"})
+    @take_over_event
     async def d2_matches(self, event: AstrMessageEvent, args: GreedyStr):
         """查看最近战绩：/d2 战绩 [场次] [昵称|账号ID]"""
         count, target = self._split_count_target(str(args))
@@ -709,6 +998,7 @@ class Dota2Plugin(Star):
     # 指令：分析近期表现
     # ==================================================================
     @d2.command("analyze", alias={"分析", "recent", "复盘"})
+    @take_over_event
     async def d2_analyze(self, event: AstrMessageEvent, args: GreedyStr):
         """AI 分析近期表现与打法风格：/d2 分析 [场次] [昵称|账号ID]"""
         count, target = self._split_count_target(str(args))
@@ -788,6 +1078,7 @@ class Dota2Plugin(Star):
     # 指令：单场复盘
     # ==================================================================
     @d2.command("match", alias={"单场", "detail", "复盘单场"})
+    @take_over_event
     async def d2_match(self, event: AstrMessageEvent, args: GreedyStr):
         """AI 深度复盘单场比赛：/d2 单场 <比赛ID> [焦点玩家]（多位用 、或 , 分隔）"""
         tokens = [token for token in re.split(r"\s+", str(args).strip()) if token]
@@ -953,6 +1244,7 @@ class Dota2Plugin(Star):
     # 指令：监听
     # ==================================================================
     @d2.command("watch", alias={"监听", "订阅"})
+    @take_over_event
     async def d2_watch(self, event: AstrMessageEvent, args: GreedyStr):
         """监听玩家，比赛结束后自动推送分析：/d2 监听 [昵称|账号ID]"""
         target = str(args).strip()
@@ -1043,6 +1335,7 @@ class Dota2Plugin(Star):
         )
 
     @d2.command("unwatch", alias={"取消监听", "取消订阅"})
+    @take_over_event
     async def d2_unwatch(self, event: AstrMessageEvent, args: GreedyStr):
         """取消监听：/d2 取消监听 <昵称|账号ID|全部>"""
         umo = event.unified_msg_origin
@@ -1124,6 +1417,7 @@ class Dota2Plugin(Star):
         )
 
     @d2.command("watchlist", alias={"监听列表", "我的监听", "wlist"})
+    @take_over_event
     async def d2_watchlist(self, event: AstrMessageEvent):
         """查看本会话的监听列表"""
         umo = event.unified_msg_origin

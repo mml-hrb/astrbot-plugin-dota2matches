@@ -43,6 +43,30 @@
     "default": 50,
     "hint": "防止用户一次性拉取过多数据导致 API 配额被耗尽。"
   },
+  "nlu_enabled": {
+    "description": "自然语言识别（免指令）",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后可以直接说人话触发功能，例如「帮我看看我的战绩」「分析一下天鸽最近的发挥」「这局 8993438099 复盘一下」。识别不出来时会把消息原样交给默认大模型，不会抢答。"
+  },
+  "nlu_group_require_at": {
+    "description": "群聊中需要 @ 机器人才响应",
+    "type": "bool",
+    "default": true,
+    "hint": "强烈建议保持开启：群聊里随口一句话就触发数据查询既费 OpenDota 配额又容易刷屏。关闭后群里任何符合语意的消息都会被响应。"
+  },
+  "nlu_confirm_sensitive": {
+    "description": "敏感操作先让用户确认",
+    "type": "bool",
+    "default": true,
+    "hint": "「绑定」「解绑」「添加监听」这三类会改动数据的操作，在自然语言触发时先回一句确认，用户回复「确认」才执行，避免群里误触。"
+  },
+  "nlu_llm_fallback": {
+    "description": "规则识别不了时交给大模型判断",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭以节省 token。开启后，规则没识别出意图的消息会额外调用一次模型做意图分类；若模型也判断不出，仍会把消息交回给默认大模型正常回复。"
+  },
   "enable_llm_analysis": {
     "description": "启用 LLM 分析",
     "type": "bool",
