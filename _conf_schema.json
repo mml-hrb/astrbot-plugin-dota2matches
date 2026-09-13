@@ -1,0 +1,157 @@
+{
+  "opendota_api_key": {
+    "description": "OpenDota API Key（可选）",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "留空则使用匿名额度（约 60 次/分钟、2000 次/天）。填写后可提升到约 1200 次/分钟。可在 https://www.opendota.com/api-keys 免费申请。",
+    "obvious_hint": true
+  },
+  "http_proxy": {
+    "description": "HTTP 代理",
+    "type": "string",
+    "default": "",
+    "hint": "例如 http://127.0.0.1:7890 。国内服务器访问 api.opendota.com 不稳定时建议配置。留空表示不使用代理。"
+  },
+  "request_timeout": {
+    "description": "API 请求超时（秒）",
+    "type": "int",
+    "default": 30,
+    "hint": "普通接口的超时时间。单场比赛详情接口数据量很大，会自动使用该值的 3 倍作为超时。"
+  },
+  "max_retries": {
+    "description": "API 请求重试次数",
+    "type": "int",
+    "default": 3,
+    "hint": "遇到网络错误、429、5xx 时自动重试的次数。"
+  },
+  "rate_limit_per_minute": {
+    "description": "每分钟最大请求数",
+    "type": "int",
+    "default": 55,
+    "hint": "用于保护 OpenDota 配额。匿名额度建议不要超过 55；填写了 API Key 后可以调高。"
+  },
+  "default_match_count": {
+    "description": "默认查询/分析场次",
+    "type": "int",
+    "default": 20,
+    "hint": "用户不指定场次时使用的默认值。"
+  },
+  "max_match_count": {
+    "description": "允许查询的最大场次",
+    "type": "int",
+    "default": 50,
+    "hint": "防止用户一次性拉取过多数据导致 API 配额被耗尽。"
+  },
+  "enable_llm_analysis": {
+    "description": "启用 LLM 分析",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后「分析」「单场」以及监听推送只输出整理好的原始数据，不调用大模型。"
+  },
+  "llm_provider_id": {
+    "description": "用于分析的模型提供商",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "留空则使用当前会话默认的模型提供商。"
+  },
+  "analysis_system_prompt": {
+    "description": "分析报告系统提示词",
+    "type": "text",
+    "default": "你是一位资深的 Dota 2 分析师与教练，擅长从 OpenDota 的对局数据中读出比赛的真实走向、队伍决策与选手表现。\n\n严格遵守以下原则：\n1. 只依据我提供的数据进行推断，绝不编造数据中不存在的信息；数据不足时必须明确指出「数据不足，无法判断」。\n2. 每一条结论都要有数据支撑，引用具体数值（时间点、经济差、KDA、GPM、补刀、伤害占比等）。\n3. 语言简洁、专业、克制。不要写「综上所述」「值得注意的是」「希望对你有帮助」之类的填充语，不要复述我已经给你的数据表格。\n4. 使用中文输出，用 Markdown 小标题与短列表组织内容，总长度控制在 800 字以内。\n5. 游戏术语保留通行英文写法（Gank、Farm、Roshan、TP、Buyback、Teamfight、BKB 等）。\n6. 点评选手时对事不对人，指出具体该做而没做的事，不要空泛地夸或骂。",
+    "hint": "定义大模型在生成分析报告时扮演的角色与输出规范，可按需自定义。",
+    "editor_mode": true,
+    "editor_language": "markdown"
+  },
+  "analysis_as_image": {
+    "description": "长报告转为图片发送",
+    "type": "bool",
+    "default": true,
+    "hint": "AI 分析报告通常较长，转成图片可避免刷屏。若 AstrBot 未配置文本转图片服务，会自动回退为文本发送。"
+  },
+  "max_message_length": {
+    "description": "单条消息最大字符数",
+    "type": "int",
+    "default": 1500,
+    "hint": "超过该长度的文本消息会被自动拆分为多条发送。"
+  },
+  "watch_enabled": {
+    "description": "启用比赛监听",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后会按下面的轮询间隔检查被监听玩家是否有新比赛，并在数据就绪后推送分析。"
+  },
+  "watch_interval": {
+    "description": "监听轮询间隔（秒）",
+    "type": "int",
+    "default": 180,
+    "hint": "拉取被监听玩家比赛列表的间隔，建议不低于 120 秒，以免消耗过多 OpenDota 配额。注意：等待解析的重试有独立的 30 秒节拍，不受此值影响。"
+  },
+  "watch_require_parsed": {
+    "description": "等待录像解析完成后再分析",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后会主动向 OpenDota 提交解析任务（POST /request/{match_id}），拿到逐分钟经济/团战等详细数据后再调用大模型，分析质量更高，但可能需要等几分钟到几十分钟。"
+  },
+  "watch_max_parse_attempts": {
+    "description": "等待解析最大尝试次数",
+    "type": "int",
+    "default": 20,
+    "hint": "仅统计「比赛已被 OpenDota 收录但还没解析完」的次数。超过该次数后按下面的策略处理。"
+  },
+  "watch_max_wait_attempts": {
+    "description": "等待收录最大尝试次数",
+    "type": "int",
+    "default": 30,
+    "hint": "比赛刚打完时可能还没被 OpenDota 收录，这段等待单独计数，不消耗上面的解析次数。超过该次数后放弃推送该场比赛。"
+  },
+  "watch_fallback_unparsed": {
+    "description": "超时后仍用基础数据分析",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后，如果一直拿不到解析数据就放弃推送该场比赛（仅记录日志）。"
+  },
+  "watch_match_analysis_count": {
+    "description": "推送时附带的近期场次",
+    "type": "int",
+    "default": 10,
+    "hint": "推送分析时，除了本场复盘外还会附带最近若干场的整体状态评价。设为 0 表示只做单场复盘。"
+  },
+  "watch_notify_at": {
+    "description": "推送时 @ 添加监听的人",
+    "type": "bool",
+    "default": true,
+    "hint": "仅对支持 @ 的平台（如 QQ / aiocqhttp）生效。"
+  },
+  "watch_concurrency": {
+    "description": "监听检查并发数",
+    "type": "int",
+    "default": 2,
+    "hint": "同时检查的玩家数量。数值越大越容易触发 OpenDota 限流。"
+  },
+  "watch_max_pending": {
+    "description": "等待解析的比赛上限",
+    "type": "int",
+    "default": 20,
+    "hint": "同时等待解析的「比赛 + 焦点玩家」条目上限。超出后会暂时让出最旧的条目，下一轮重新入队，不会漏推。"
+  },
+  "watch_max_per_session": {
+    "description": "单会话监听数量上限",
+    "type": "int",
+    "default": 5,
+    "hint": "每场比赛都会消耗一次大模型调用，限制单会话可添加的监听数量可以避免群成员无限叠加监听。"
+  },
+  "admin_users": {
+    "description": "监听管理员用户 ID",
+    "type": "string",
+    "default": "",
+    "hint": "多个 ID 用逗号分隔。列出的用户可以取消本会话中他人添加的监听；留空时所有人都只能管理自己添加的监听。AstrBot 自带管理员通常也具备该权限。"
+  },
+  "mask_others_id": {
+    "description": "在群聊中隐藏他人的账号 / 用户 ID",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后「绑定列表」中他人的 QQ 号与账号 ID 会打码显示，本人始终可以看到自己的完整信息。"
+  }
+}
