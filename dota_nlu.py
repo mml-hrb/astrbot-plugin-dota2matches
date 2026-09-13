@@ -153,6 +153,24 @@ INTENT_KEYWORDS: dict[str, dict[str, int]] = {
         "那场比赛": 4,
         "录像": 2,
     },
+    "forceparse": {
+        "催一下解析": 8,
+        "催解析": 8,
+        "催一下": 5,
+        "申请解析": 8,
+        "提交解析": 8,
+        "强制解析": 8,
+        "让它解析": 5,
+        "让 opendota 解析": 8,
+        "解析一下这局": 7,
+        "解析一下": 4,
+        "解析状态": 7,
+        "解析好了吗": 8,
+        "解析完了吗": 8,
+        "解析了没": 7,
+        "解析没有": 6,
+        "解析完成了吗": 8,
+    },
     "watch": {
         "监听": 4,
         "订阅": 4,
@@ -199,6 +217,7 @@ INTENT_NEEDS_TARGET = {
     "analyze",
     "watch",
     "unwatch",
+    "forceparse",
 }
 
 #: 意图 → 人类可读的说明（给大模型兜底分类用，也用于日志）
@@ -213,6 +232,7 @@ INTENT_LABELS: dict[str, str] = {
     "matches": "查询最近战绩列表",
     "analyze": "用 AI 分析近期表现与打法风格（需要指定场次时给出场次）",
     "match": "深度复盘某一场比赛（需要比赛 ID）",
+    "forceparse": "催 OpenDota 解析某一场比赛 / 查这局解析好了没（需要比赛 ID）",
     "watch": "监听玩家，比赛结束后自动推送分析（需要昵称或账号 ID）",
     "unwatch": "取消监听（需要昵称、账号 ID，或「全部」）",
     "watchlist": "查看本会话的监听列表",
@@ -577,6 +597,16 @@ def parse(text: str) -> Intent | None:
     if not scores:
         return None
 
+    # 「催解析 / 解析好了吗」这类问法里通常也带比赛 ID，而 ID 本身会给
+    # ``match`` 加权，很容易把 forceparse 挤掉。只要 forceparse 已经踩到
+    # 阈值（说明出现了「催解析」「申请解析」「解析好了吗」这类独有的说法），
+    # 就让它优先——用户的意图明显是问解析状态，而不是要一份复盘。
+    if scores.get("forceparse", 0) >= MIN_SCORE and scores.get(
+        "forceparse", 0
+    ) >= scores.get("match", 0) - 5:
+        best = "forceparse"
+        return _build_intent(best, raw, scores[best], match_id, False)
+
     best = max(scores, key=lambda name: (scores[name], name))
     if scores[best] < MIN_SCORE:
         return None
@@ -608,6 +638,9 @@ def _build_intent(
         count = extract_count(text)
         return Intent(name, args, score, "rule", detail)
 
+    if name == "forceparse":
+        # 催解析只关心比赛 ID，没有 ID 就没有意义（由入口提示怎么补）
+        return Intent(name, str(match_id) if match_id else "", score, "rule", detail)
     if name in {"help", "my", "bindings", "unbind", "watchlist"}:
         # 取消监听 / 解绑支持「全部」
         if name == "unwatch" and re.search(r"全部|所有|都取消|清掉|清空", text):

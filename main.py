@@ -54,6 +54,7 @@ try:  # 插件目录被作为包加载时的相对导入
     )
     from .dota_store import DotaStore
     from . import dota_nlu
+    from . import dota_parse
 except ImportError:  # 兜底：以普通模块方式加载时（把插件目录加入 sys.path）
     import os
     import sys
@@ -91,6 +92,7 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
     from dota_store import DotaStore  # type: ignore[no-redef]
 
     import dota_nlu  # type: ignore[no-redef]
+    import dota_parse  # type: ignore[no-redef]
 
 try:
     # AstrBot 用 GreedyStr 标记「接收剩余全部文本」的参数
@@ -126,6 +128,32 @@ PLATFORMS_WITHOUT_PROACTIVE_PUSH = {
     "qq_official": "QQ 官方机器人",
     "qq_official_webhook": "QQ 官方机器人(Webhook)",
 }
+
+# ======================================================================
+# 「催解析 + 等解析」相关的常量
+# ======================================================================
+#: 单场查询里用来跳过等待的开关词：`/d2 单场 <id> skip`
+PARSE_SKIP_WORDS = frozenset({"skip", "跳过", "不等", "直接", "fast", "快"})
+
+#: 等待解析时的并发上限兜底（配置项 parse_max_concurrent 缺失时使用）。
+#: 每个等待任务每分钟会查一次 ``/matches/{id}``，并发太高容易触发限流。
+DEFAULT_PARSE_MAX_CONCURRENT = 3
+
+#: 后台解析任务的登记表容量上限：超过后拒绝新的等待请求，
+#: 避免群里刷屏式提交把内存和配额一起吃光。
+MAX_PARSE_TASKS = 50
+
+
+def _fmt_clock(seconds: float) -> str:
+    """把秒数格式化成 ``1分30秒`` 这样的可读文本。"""
+    total = max(0, int(seconds))
+    minutes, secs = divmod(total, 60)
+    if minutes and secs:
+        return f"{minutes}分{secs}秒"
+    if minutes:
+        return f"{minutes}分钟"
+    return f"{secs}秒"
+
 
 # ======================================================================
 # 自然语言入口相关的常量
@@ -176,6 +204,8 @@ HELP_TEXT = """🎮 Dota2 数据查询助手（数据来源：OpenDota）
 /d2 战绩 [场次] [目标]　　　　 查看最近战绩（默认 20 场）
 /d2 分析 [场次] [目标]　　　　 AI 分析近期表现与打法风格
 /d2 单场 <比赛ID> [账号]　　　 AI 深度复盘单场比赛
+　　　　（未解析时会自动催解析并等待，最多 10 分钟）
+/d2 催解析 <比赛ID>　　　　　 只催 OpenDota 解析这局，不等结果
 
 【监听】
 /d2 监听 [目标]　　　　　　　 比赛结束后自动推送分析到本会话
@@ -189,9 +219,17 @@ HELP_TEXT = """🎮 Dota2 数据查询助手（数据来源：OpenDota）
 · 「绑定列表」中他人的账号与用户 ID 默认打码，保护群聊隐私；
 · 想让查询结果更好看，可以在配置中调整「长报告转为图片发送」。
 
+关于解析（AI 复盘质量的关键）：
+· OpenDota 收录一场比赛 ≠ 解析完这场比赛的录像。只有解析完成才有逐分钟
+  经济、团战、出装这些数据，AI 复盘才有质量；
+· `/d2 单场 <比赛ID>` 遇到未解析的局会自动提交解析申请，之后每分钟检查一次，
+  解析完成就把报告发到本会话，最多等 10 分钟；等不及可以用
+  `/d2 单场 <比赛ID> skip` 直接用基础数据出报告；
+· 想先排上队、晚点再看，用 `/d2 催解析 <比赛ID>`。
+
 自然语言（不用记指令）：
 · 直接说人话也能用，例如「帮我看看我的战绩」「分析一下天鸽最近的发挥」
-  「这局 8993438099 复盘一下」「最近 20 把打得怎么样」；
+  「这局 8993438099 复盘一下」「催一下 8993438099 的解析」「最近 20 把打得怎么样」；
 · 群聊里需要 @ 机器人 才会响应（可在配置中关闭这个限制）；
 · 群里说「绑定 86745912」这类闲聊式指令时，插件会先确认再执行，避免误触。"""
 
@@ -261,11 +299,350 @@ class Dota2Plugin(Star):
         #: 自然语言确认状态：``{(umo, uid): (intent_name, args, 过期时间戳)}``
         #: 群里说「绑定 xxx」这类多义指令时，先记下来等用户确认再执行。
         self._nlu_confirm: dict[tuple[str, str], tuple[str, str, float]] = {}
+        #: 正在等待解析的后台任务：``{(umo, match_id, sender_id): task}``
+        #: 等待解析最长要十分钟，绝不能把 handler 挂在那里——AstrBot 的流水线
+        #: 是洋葱模型，handler 每 yield 一次后续阶段就整体跑一遍。改为后台
+        #: 任务等待、完成后主动推送到原会话。
+        self._parse_tasks: dict[tuple[str, int, str], asyncio.Task] = {}
+        #: 等待解析的并发闸门：同时等待的场次上限由配置决定
+        self._parse_sem: asyncio.Semaphore | None = None
+        self._parse_sem_size = 0
         logger.info(
             f"[dota2] 插件已加载，数据目录: {self.data_dir}，"
             f"监听: {'开启' if self.cfg('watch_enabled', True) else '关闭'}"
         )
         self._start_watcher()
+
+    # ==================================================================
+    # 催解析 + 等解析（后台任务）
+    # ==================================================================
+    def _parse_semaphore(self) -> asyncio.Semaphore:
+        """按配置返回等待解析的并发闸门（配置变了会自动重建）。"""
+        size = max(1, int(self.cfg("parse_max_concurrent", DEFAULT_PARSE_MAX_CONCURRENT)))
+        if self._parse_sem is None or self._parse_sem_size != size:
+            self._parse_sem = asyncio.Semaphore(size)
+            self._parse_sem_size = size
+        return self._parse_sem
+
+    def _parse_wait_options(self) -> dict[str, Any]:
+        """从配置里读出等待解析的节奏参数。"""
+        interval = max(
+            dota_parse.MIN_CHECK_INTERVAL,
+            int(self.cfg("parse_check_interval", dota_parse.DEFAULT_CHECK_INTERVAL)),
+        )
+        timeout = max(
+            interval,
+            int(self.cfg("parse_wait_timeout", dota_parse.DEFAULT_WAIT_TIMEOUT)),
+        )
+        return {"check_interval": interval, "timeout": timeout}
+
+    def _parse_task_key(self, umo: str, match_id: int, uid: str) -> tuple[str, int, str]:
+        return (str(umo), int(match_id), str(uid))
+
+    def _start_parse_task(
+        self,
+        event: AstrMessageEvent,
+        match_id: int,
+        focus_ids: list[int],
+        focus_names: dict[int, str],
+        fresh: bool = True,
+    ) -> bool:
+        """把「催解析 + 等待 + 完成后复盘」交给后台任务执行。
+
+        之所以不在这里直接 ``await``：handler 被 ``take_over_event`` 包装，
+        而 AstrBot 的流水线会在 handler 每次 yield 时执行后续阶段。等待十分钟
+        期间要保持连接、逐分钟 yield 进度，等于给流水线制造十次执行机会。
+        后台任务 + ``context.send_message`` 主动推送则完全没有这个问题。
+
+        Args:
+            fresh: 是否重新拉取一份比赛数据作为「第一次状态检查」的依据。
+                指令刚拉过数据时传 True 即可（省一次请求），后台任务里
+                重拉一次更保险，因此内部仍以重新拉取为准。
+
+        Returns:
+            是否成功排入后台任务。
+        """
+        umo = str(event.unified_msg_origin)
+        uid = str(event.get_sender_id())
+        key = self._parse_task_key(umo, match_id, uid)
+
+        existing = self._parse_tasks.get(key)
+        if existing is not None and not existing.done():
+            return False
+        if len(self._parse_tasks) >= MAX_PARSE_TASKS:
+            logger.warning(
+                f"[dota2] 等待解析的任务已达上限（{MAX_PARSE_TASKS}），"
+                f"拒绝 {match_id} 的等待请求"
+            )
+            return False
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - handler 一定在事件循环里
+            logger.error(f"[dota2] 无法排入等待解析任务 {match_id}：没有运行中的事件循环")
+            return False
+
+        platform = ""
+        try:
+            platform = event.get_platform_name()
+        except Exception:  # noqa: BLE001
+            platform = ""
+
+        task = loop.create_task(
+            self._parse_and_analyze(
+                umo=umo,
+                uid=uid,
+                match_id=int(match_id),
+                focus_ids=[int(i) for i in focus_ids],
+                focus_names={int(k): str(v) for k, v in (focus_names or {}).items()},
+                platform=platform,
+            )
+        )
+        self._parse_tasks[key] = task
+        task.add_done_callback(
+            lambda _t, _key=key: self._parse_tasks.pop(_key, None)
+        )
+        return True
+
+    async def _parse_notify(self, umo: str, text: str) -> None:
+        """向会话推送等待过程中的通知（失败只记日志，不影响任务）。"""
+        try:
+            for chunk in self._chunk_text(text):
+                await self._send(umo, MessageChain().message(chunk))
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[dota2] 推送解析进度失败（可忽略）: {e}")
+
+    async def _parse_and_analyze(
+        self,
+        *,
+        umo: str,
+        uid: str,
+        match_id: int,
+        focus_ids: list[int],
+        focus_names: dict[int, str],
+        platform: str = "",
+    ) -> None:
+        """后台任务：催解析 → 每分钟检查 → 解析完成后出复盘报告。
+
+        无论成功、超时还是异常，都会给用户一个明确的收尾消息。
+        """
+        options = self._parse_wait_options()
+        interval = int(options["check_interval"])
+        timeout = int(options["timeout"])
+        notify_progress = bool(self.cfg("parse_notify_progress", True))
+        submit = bool(self.cfg("parse_submit_request", True))
+        minutes = max(1, round(timeout / 60))
+
+        async with self._parse_semaphore():
+            try:
+                result = await dota_parse.wait_for_parse(
+                    self.api,
+                    match_id,
+                    check_interval=interval,
+                    timeout=timeout,
+                    submit=submit,
+                    resubmit_every=dota_parse.RESUBMIT_EVERY,
+                    on_submit=(
+                        (lambda ok: self._on_parse_submit(umo, match_id, ok))
+                        if submit
+                        else None
+                    ),
+                    on_check=(
+                        (lambda state, checks, elapsed: self._on_parse_check(
+                            umo, match_id, state, checks, elapsed, minutes
+                        ))
+                        if notify_progress
+                        else None
+                    ),
+                )
+            except asyncio.CancelledError:
+                logger.info(f"[dota2] 等待比赛 {match_id} 解析的任务被取消")
+                raise
+            except Exception as e:  # noqa: BLE001
+                logger.error(
+                    f"[dota2] 等待比赛 {match_id} 解析时出错：{e}", exc_info=True
+                )
+                await self._parse_notify(
+                    umo,
+                    f"❌ 等待比赛 {match_id} 解析时出错：{e}\n"
+                    f"可以稍后重试 `/d2 单场 {match_id}`。",
+                )
+                return
+
+        if not result.parsed or not result.match:
+            await self._parse_notify(umo, result.fail_text(match_id))
+            return
+
+        await self._parse_notify(
+            umo,
+            f"✅ 比赛 {match_id} 已解析完成（等待 {_fmt_clock(result.waited)}，"
+            f"共检查 {result.checks} 次），开始生成复盘报告…",
+        )
+        await self._analyze_match_data(
+            umo=umo,
+            match_id=match_id,
+            match=result.match,
+            focus_ids=focus_ids,
+            focus_names=focus_names,
+        )
+
+    async def _on_parse_submit(self, umo: str, match_id: int, ok: bool) -> None:
+        """催解析申请结果的通知。"""
+        if ok:
+            await self._parse_notify(
+                umo,
+                f"📨 已向 OpenDota 提交比赛 {match_id} 的解析申请，正在队列中。",
+            )
+        else:
+            await self._parse_notify(
+                umo,
+                f"ℹ️ 解析申请未返回排队凭据（可能已在队列中，或该局 OpenDota 无法解析）。"
+                f"仍会继续等待比赛 {match_id} 的解析结果。",
+            )
+
+    async def _on_parse_check(
+        self,
+        umo: str,
+        match_id: int,
+        state: dota_parse.ParseState,
+        checks: int,
+        elapsed: float,
+        limit_minutes: int,
+    ) -> None:
+        """每分钟的进度播报。"""
+        left = max(0.0, limit_minutes * 60 - elapsed)
+        await self._parse_notify(
+            umo,
+            f"⏳ 比赛 {match_id} 解析进度（第 {checks} 次检查，已等待 "
+            f"{_fmt_clock(elapsed)}，剩余最多 {_fmt_clock(left)}）：{state.describe()}",
+        )
+
+    async def _analyze_match_data(
+        self,
+        *,
+        umo: str,
+        match_id: int,
+        match: dict,
+        focus_ids: list[int],
+        focus_names: dict[int, str],
+    ) -> None:
+        """数据就绪后生成单场复盘并推送到会话。
+
+        与 ``d2_match`` 共用同一套提示词构造逻辑，保证「等解析出来的复盘」
+        与「直接查已解析比赛的复盘」完全一致。
+        """
+        try:
+            heroes = await self.api.get_heroes()
+            items = await self.api.get_items()
+        except OpenDotaError as e:
+            logger.error(f"[dota2] 复盘比赛 {match_id} 时拉取常量失败：{e}")
+            heroes, items = {}, {}
+
+        focus_ids = [int(i) for i in (focus_ids or []) if int(i or 0)]
+        parsed = dota_parse.parse_state(match).parsed
+        headline = self.match_headline(match, heroes, focus_ids or None, parsed)
+
+        extra_context = await self._build_recent_context(
+            match_id, focus_ids, focus_names, heroes
+        )
+        prompt = build_single_match_analysis_prompt(
+            match=match,
+            heroes=heroes,
+            items=items,
+            focus_account_ids=focus_ids or None,
+            focus_names=focus_names or None,
+            extra_context=extra_context,
+        )
+        report = await self._generate_report_for_umo(umo, prompt)
+
+        await self._parse_notify(umo, headline)
+        if report:
+            image_url = await self._render_image(report)
+            if image_url:
+                try:
+                    await self._send(umo, MessageChain().file_image(image_url))
+                    return
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"[dota2] 推送复盘图片失败，回退为文本：{e}")
+            for chunk in self._chunk_text(report):
+                await self._send(umo, MessageChain().message(chunk))
+            return
+
+        raw = (
+            "⚠️ 未启用大模型分析或模型不可用，以下为从数据源获取的完整原始数据：\n\n"
+            + build_match_data_text(
+                match, heroes, items, focus_account_ids=focus_ids or None
+            )
+        )
+        for chunk in self._chunk_text(raw):
+            await self._send(umo, MessageChain().message(chunk))
+
+    async def _generate_report_for_umo(self, umo: str, prompt: str) -> str | None:
+        """在指定会话下调用大模型生成报告（供后台任务使用）。"""
+        if not self.cfg("enable_llm_analysis", True):
+            return None
+        provider = await resolve_provider(
+            self.context, umo, str(self.cfg("llm_provider_id", "") or "")
+        )
+        if provider is None:
+            return None
+        system_prompt = str(self.cfg("analysis_system_prompt", "") or "").strip() or (
+            DEFAULT_SYSTEM_PROMPT
+        )
+        try:
+            return await call_llm(provider, system_prompt, prompt)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[dota2] 生成复盘报告失败：{e}")
+            return None
+
+    async def _build_recent_context(
+        self,
+        match_id: int,
+        focus_ids: list[int],
+        focus_names: dict[int, str],
+        heroes: dict[int, dict],
+    ) -> str:
+        """为焦点玩家拼出「本场之外的近期状态」上下文块。"""
+        recent_count = max(0, int(self.cfg("watch_match_analysis_count", 10)))
+        if not focus_ids or not recent_count:
+            return ""
+        blocks: list[str] = []
+        for focus_id in focus_ids[:MAX_FOCUS_RECENT_CONTEXT]:
+            label = focus_names.get(focus_id) or focus_id
+            try:
+                recent_matches, economy_samples = (
+                    await self.api.get_player_matches_enriched(focus_id, recent_count)
+                )
+                recent_matches = [
+                    m
+                    for m in recent_matches
+                    if int(m.get("match_id") or 0) != int(match_id)
+                ]
+            except OpenDotaError as e:
+                logger.debug(f"[dota2] 获取 {focus_id} 近期状态上下文失败: {e}")
+                continue
+            if not recent_matches:
+                continue
+            summary = summarize_matches(
+                recent_matches, economy_samples=economy_samples
+            )
+            blocks.append(
+                f"—— {label}（account_id={focus_id}）在本场之外最近 "
+                f"{len(recent_matches)} 场的整体情况"
+                f"（用于判断本场是他的正常发挥还是异常）：\n"
+                + format_summary_block(summary, heroes)
+            )
+        if not blocks:
+            return ""
+        return "\n\n".join(blocks) + (
+            "\n\n请在报告最后额外增加一节「## 近期状态」"
+            + (
+                "，为上面每位焦点玩家各起一个小标题，"
+                "各用 3 句以内说明其最近的竞技走向。"
+                if len(focus_ids) > 1
+                else "，用 3 句以内说明这名玩家最近的整体竞技走向。"
+            )
+        )
 
     # ==================================================================
     # 基础设施
@@ -535,9 +912,20 @@ class Dota2Plugin(Star):
         "matches": "d2_matches",
         "analyze": "d2_analyze",
         "match": "d2_match",
+        "forceparse": "d2_askparse",
         "watch": "d2_watch",
         "unwatch": "d2_unwatch",
         "watchlist": "d2_watchlist",
+    }
+
+    #: 单场复盘的指令别名 → handler。
+    #: AstrBot 本身负责事件分发，这里保留一份是为了让测试与内部调用
+    #: 能用和用户完全相同的入口（`/d2 单场` / `/d2 match` / `/d2 复盘单场`）。
+    MATCH_COMMANDS: dict[str, str] = {
+        "match": "d2_match",
+        "单场": "d2_match",
+        "detail": "d2_match",
+        "复盘单场": "d2_match",
     }
 
     def _nlu_invoke(self, name: str, event: AstrMessageEvent, args: str):
@@ -667,6 +1055,12 @@ class Dota2Plugin(Star):
                 yield event.plain_result(
                     "复盘单场需要比赛 ID，例如：`这局 8993438099 帮我复盘一下`。\n"
                     "比赛 ID 可以从「我的战绩」里拿，或直接用 Dota 客户端的比赛编号。"
+                )
+                return
+            elif intent.name == "forceparse":
+                yield event.plain_result(
+                    "催解析需要指定是哪一局，例如：`催一下 8993438099 的解析`。\n"
+                    "想让插件等解析完再自动出复盘，说「这局 8993438099 复盘一下」即可。"
                 )
                 return
             elif intent.name in {"bind", "info", "heroes", "matches", "analyze", "watch"}:
@@ -1080,20 +1474,28 @@ class Dota2Plugin(Star):
     @d2.command("match", alias={"单场", "detail", "复盘单场"})
     @take_over_event
     async def d2_match(self, event: AstrMessageEvent, args: GreedyStr):
-        """AI 深度复盘单场比赛：/d2 单场 <比赛ID> [焦点玩家]（多位用 、或 , 分隔）"""
+        """AI 深度复盘单场比赛：/d2 单场 <比赛ID> [焦点玩家]
+
+        未指定 skip 时，若该局尚未解析完成，会自动催解析并每分钟检查一次，
+        最多等 10 分钟（解析完成后再出复盘）。
+        """
         tokens = [token for token in re.split(r"\s+", str(args).strip()) if token]
         if not tokens or not re.fullmatch(r"\d{6,20}", tokens[0]):
             yield event.plain_result(
-                "用法：`/d2 单场 <比赛ID> [焦点玩家]`\n"
+                "用法：`/d2 单场 <比赛ID> [焦点玩家] [skip]`\n"
                 "例如：`/d2 单场 8989601141`\n"
                 "多位焦点：`/d2 单场 8989601141 张三、李四、王五`"
                 "（昵称或账号 ID，用 、/, 分隔；昵称可以含空格）\n"
+                "不想等待解析：`/d2 单场 8989601141 skip`\n"
                 "比赛 ID 可以从 `/d2 战绩` 的结果中获取，或直接使用 Dota 客户端的比赛编号。"
             )
             return
 
         match_id = int(tokens[0])
-        rest = " ".join(tokens[1:])
+        rest_tokens = tokens[1:]
+        # `/d2 单场 <id> skip`：跳过「等解析」，直接用现有数据出报告
+        skip_wait = any(t.lower() in PARSE_SKIP_WORDS for t in rest_tokens)
+        rest = " ".join(t for t in rest_tokens if t.lower() not in PARSE_SKIP_WORDS)
 
         yield event.plain_result(
             f"⏳ 正在拉取比赛 {match_id} 的详细数据并生成复盘，请稍候…"
@@ -1165,52 +1567,40 @@ class Dota2Plugin(Star):
                     focus_ids.append(candidate)
                     focus_names[candidate] = binding.get("personaname") or ""
 
-        parsed = OpenDotaClient.is_parsed(match)
+        parse_state = dota_parse.parse_state(match)
+        parsed = parse_state.parsed
+
+        # ---------- 未解析：催解析 + 等待，改由后台任务完成复盘 ----------
+        if not parsed and not skip_wait and self.cfg("parse_wait_enabled", True):
+            options = self._parse_wait_options()
+            minutes = max(1, round(int(options["timeout"]) / 60))
+            seconds = int(options["check_interval"])
+            if self._start_parse_task(
+                event, match_id, focus_ids, focus_names, fresh=False
+            ):
+                yield event.plain_result(
+                    f"🔍 比赛 {match_id} 数据完整度：{parse_state.describe()}\n"
+                    f"AI 复盘依赖逐分钟经济、团战与出装数据，"
+                    f"{'已提交催解析并' if self.cfg('parse_submit_request', True) else ''}"
+                    f"开始等待：每 {_fmt_clock(seconds)} 检查一次，"
+                    f"最多等 {minutes} 分钟。\n"
+                    f"解析完成后会自动把复盘报告发到本会话，你可以先去忙别的。\n"
+                    f"（不想等待：`/d2 单场 {match_id} skip` 直接用基础数据出报告）"
+                )
+                return
+            yield event.plain_result(
+                "⚠️ 当前等待解析的任务过多，无法排队。"
+                f"已改用基础数据（{parse_state.describe()}）生成复盘。\n"
+                f"稍后可用 `/d2 单场 {match_id}` 重新尝试等待解析。"
+            )
+
         headline = self.match_headline(match, heroes, focus_ids or None, parsed)
 
         # 附上焦点玩家近期的整体状态，让复盘更有上下文。
         # 焦点可能不止一位，逐位取；超过上限的只做本场复盘，避免提示词被撑爆。
-        extra_context = ""
-        recent_count = max(0, int(self.cfg("watch_match_analysis_count", 10)))
-        if focus_ids and recent_count:
-            blocks: list[str] = []
-            for focus_id in focus_ids[:MAX_FOCUS_RECENT_CONTEXT]:
-                label = focus_names.get(focus_id) or focus_id
-                try:
-                    recent_matches, economy_samples = (
-                        await self.api.get_player_matches_enriched(
-                            focus_id, recent_count
-                        )
-                    )
-                    recent_matches = [
-                        m
-                        for m in recent_matches
-                        if int(m.get("match_id") or 0) != match_id
-                    ]
-                except OpenDotaError as e:
-                    logger.debug(f"[dota2] 获取 {focus_id} 近期状态上下文失败: {e}")
-                    continue
-                if not recent_matches:
-                    continue
-                summary = summarize_matches(
-                    recent_matches, economy_samples=economy_samples
-                )
-                blocks.append(
-                    f"—— {label}（account_id={focus_id}）在本场之外最近 "
-                    f"{len(recent_matches)} 场的整体情况"
-                    f"（用于判断本场是他的正常发挥还是异常）：\n"
-                    + format_summary_block(summary, heroes)
-                )
-            if blocks:
-                extra_context = "\n\n".join(blocks) + (
-                    "\n\n请在报告最后额外增加一节「## 近期状态」"
-                    + (
-                        "，为上面每位焦点玩家各起一个小标题，"
-                        "各用 3 句以内说明其最近的竞技走向。"
-                        if len(focus_ids) > 1
-                        else "，用 3 句以内说明这名玩家最近的整体竞技走向。"
-                    )
-                )
+        extra_context = await self._build_recent_context(
+            match_id, focus_ids, focus_names, heroes
+        )
 
         prompt = build_single_match_analysis_prompt(
             match=match,
@@ -1239,6 +1629,70 @@ class Dota2Plugin(Star):
             )
             for chunk in self._chunk_text(raw):
                 yield event.plain_result(chunk)
+
+    # ==================================================================
+    # 指令：催解析（只催不等，适合还没打算看复盘时先排上队）
+    # ==================================================================
+    @d2.command("parse", alias={"催解析", "申请解析", "催一下", "强制解析"})
+    @take_over_event
+    async def d2_askparse(self, event: AstrMessageEvent, args: GreedyStr):
+        """只向 OpenDota 提交解析申请，不等待结果：/d2 催解析 <比赛ID>"""
+        tokens = [token for token in re.split(r"\s+", str(args).strip()) if token]
+        if not tokens or not re.fullmatch(r"\d{6,20}", tokens[0]):
+            yield event.plain_result(
+                "用法：`/d2 催解析 <比赛ID>`\n"
+                "例如：`/d2 催解析 8995419388`\n\n"
+                "作用：向 OpenDota 提交这局的存档解析申请（OpenDota 平时不一定会"
+                "主动解析别人的对局，催一下才会去取录像）。\n"
+                "· 只想催、不等结果 → 用本指令；\n"
+                "· 想等解析完自动出复盘报告 → 用 `/d2 单场 <比赛ID>`。"
+            )
+            return
+
+        match_id = int(tokens[0])
+        yield event.plain_result(
+            f"⏳ 正在检查比赛 {match_id} 的解析状态并提交申请…"
+        )
+
+        try:
+            match = await self.api.get_match(match_id)
+        except OpenDotaError as e:
+            yield event.plain_result(f"❌ 拉取比赛数据失败：{e}")
+            return
+
+        if not match:
+            yield event.plain_result(
+                f"❌ 找不到比赛 {match_id}，或该比赛尚未被 OpenDota 收录。\n"
+                f"未被收录时提交解析申请没有意义，"
+                f"一般等几分钟到几十分钟 OpenDota 会自动收录。"
+            )
+            return
+
+        state = dota_parse.parse_state(match)
+        if state.parsed:
+            yield event.plain_result(
+                f"✅ 比赛 {match_id} 已经解析完成（{state.describe()}），无需催解析。\n"
+                f"现在就可以用 `/d2 单场 {match_id}` 出复盘。"
+            )
+            return
+
+        granted = await dota_parse.submit_parse(self.api, match_id)
+        if granted:
+            yield event.plain_result(
+                f"📨 已向 OpenDota 提交比赛 {match_id} 的解析申请，任务已排队。\n"
+                f"当前状态：{state.describe()}\n\n"
+                f"解析通常需要几分钟到几十分钟。想拿到结果后自动出报告，"
+                f"用 `/d2 单场 {match_id}`（会每分钟检查一次，最多等 10 分钟）。"
+            )
+        else:
+            yield event.plain_result(
+                f"⚠️ 解析申请没有返回排队凭据，可能原因：\n"
+                f"· OpenDota 认为这局无法解析（临时对局 / 录像已过期）；\n"
+                f"· 该局已在解析队列中（这时其实不用再催）；\n"
+                f"· 请求被限流（配置里填写 OpenDota API Key 可以提升额度）。\n\n"
+                f"当前状态：{state.describe()}\n"
+                f"可以过几分钟再用 `/d2 单场 {match_id}` 试探一次。"
+            )
 
     # ==================================================================
     # 指令：监听
@@ -2184,5 +2638,17 @@ class Dota2Plugin(Star):
                 await task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+        # 等待解析的后台任务可能挂着十分钟，必须一并取消，
+        # 否则卸载后它们还会继续占用连接、并且向已下线的会话推消息。
+        parse_tasks = list(self._parse_tasks.values())
+        self._parse_tasks.clear()
+        for parse_task in parse_tasks:
+            if not parse_task.done():
+                parse_task.cancel()
+        for parse_task in parse_tasks:
+            try:
+                await parse_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         await self.api.close()
-        logger.info("[dota2] 插件已卸载，监听任务已停止")
+        logger.info("[dota2] 插件已卸载，监听任务与等待解析任务已停止")

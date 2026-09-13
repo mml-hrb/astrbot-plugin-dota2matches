@@ -100,6 +100,48 @@
     "default": 1500,
     "hint": "超过该长度的文本消息会被自动拆分为多条发送。"
   },
+  "parse_wait_enabled": {
+    "description": "单场复盘时等待解析完成",
+    "type": "bool",
+    "default": true,
+    "hint": "「/d2 单场」遇到未解析的比赛时，自动提交催解析并每分钟检查一次，解析完成后再出复盘报告。关闭后立即用现有数据出报告。"
+  },
+  "parse_submit_request": {
+    "description": "等待前先催一次解析",
+    "type": "bool",
+    "default": true,
+    "hint": "等待开始前先向 OpenDota 提交解析申请（POST /request/{match_id}），这是让未解析比赛尽快出结果的最有效手段。注意该接口按 10 倍额度计费，等待期间大约每 5 分钟补交一次。"
+  },
+  "parse_check_interval": {
+    "description": "解析状态检查间隔（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "等待解析期间每隔多久查一次比赛数据。不建议低于 30 秒，否则会明显消耗 OpenDota 配额。最低会被抬到 20 秒。"
+  },
+  "parse_wait_timeout": {
+    "description": "等待解析最长时间（秒）",
+    "type": "int",
+    "default": 600,
+    "hint": "默认 600 秒（10 分钟）。超时后放弃这一场的等待并通知用户，不会影响其他任务。"
+  },
+  "parse_notify_progress": {
+    "description": "等待期间每分钟播报进度",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后每次检查都会向会话发一条进度消息（当前状态、已等待多久、还剩多久）。群聊里嫌吵可以关掉，关掉后只在成功或超时时各发一条。"
+  },
+  "parse_max_concurrent": {
+    "description": "同时等待解析的场次上限",
+    "type": "int",
+    "default": 3,
+    "hint": "每个等待中的场次每分钟会产生一次查询请求，并发过高容易触发 OpenDota 限流。超出上限时新的请求会退化为「直接用基础数据出报告」。"
+  },
+  "parse_force_reparse": {
+    "description": "已解析的比赛也重新提交解析",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭。开启后即使 OpenDota 标记为已解析也会再催一次，用于「解析数据明显缺失」的情况；会额外消耗额度，一般不需要打开。"
+  },
   "watch_enabled": {
     "description": "启用比赛监听",
     "type": "bool",
