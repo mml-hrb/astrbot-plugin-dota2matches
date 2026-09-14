@@ -1,8 +1,8 @@
 name: astrbot_plugin_dota2 # 插件唯一识别名，以 astrbot_plugin_ 前缀开头
 display_name: Dota2 数据查询助手 # 用于展示的名字（需要 AstrBot >= v4.5.0）
-desc: 基于 OpenDota API 的 Dota2 战绩查询与 AI 分析助手。支持绑定玩家（昵称 / 32 位 account_id / 64 位 SteamID）、战绩查询、AI 复盘分析近期打法风格、单场比赛深度复盘（走势、质量评估、十人点评），以及比赛结束后自动推送分析到绑定会话。AI 报告可选用插件专用的 OpenAI 兼容 API Key，与 AstrBot 全局模型解耦。
+desc: 基于 STRATZ + OpenDota 双数据源的 Dota2 战绩查询与 AI 分析助手。默认以 STRATZ 为主数据源、OpenDota 为后备，主源失效时自动降级。支持绑定玩家（昵称 / 32 位 account_id / 64 位 SteamID）、战绩查询、AI 复盘分析近期打法风格、单场比赛深度复盘（走势、质量评估、十人点评），以及比赛结束后自动推送分析到绑定会话。AI 报告可选用插件专用的 OpenAI 兼容 API Key，与 AstrBot 全局模型解耦。
 short_desc: 绑定 Dota2 玩家，查战绩、AI 复盘、比赛结束自动推送分析。
-version: v1.5.0 # 插件版本号
+version: v1.6.0 # 插件版本号
 author: WorkBuddy # 作者
 repo: https://github.com/AstrBotDevs/astrbot_plugin_dota2 # 插件仓库地址
 astrbot_version: ">=4.5.0"

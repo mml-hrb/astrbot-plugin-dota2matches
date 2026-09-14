@@ -1,6 +1,6 @@
 # astrbot_plugin_dota2 · Dota2 数据查询助手
 
-基于 [OpenDota API](https://docs.opendota.com/) 的 AstrBot 插件，提供 Dota2 战绩查询与 AI 复盘分析能力。
+基于 [STRATZ](https://docs.stratz.com/) + [OpenDota API](https://docs.opendota.com/) 双数据源的 AstrBot 插件，提供 Dota2 战绩查询与 AI 复盘分析能力。默认以 STRATZ 为主源，失效时自动降级到 OpenDota。
 
 ## 功能
 
@@ -13,8 +13,9 @@
 | 5 | 监听玩家，比赛结束且详细数据就绪后自动推送分析，支持解绑 | `/d2 监听`、`/d2 取消监听`、`/d2 监听列表` |
 | 6 | **自然语言识别**：不用记指令，直接说人话就能触发 | 见下方「自然语言」 |
 | 7 | **催解析并等待**：单场复盘遇到未解析的局，自动催解析、每分钟检查一次、最多等 10 分钟 | `/d2 单场 <比赛ID>`、`/d2 催解析 <比赛ID>` |
+| 8 | **双数据源自动降级**：STRATZ 为主、OpenDota 为后备，主源失效自动切换 | `/d2 数据源` |
 
-辅助指令：`/d2 帮助`、`/d2 我的`、`/d2 绑定列表`、`/d2 资料 [目标]`、`/d2 英雄 [目标]`。
+辅助指令：`/d2 帮助`、`/d2 我的`、`/d2 绑定列表`、`/d2 资料 [目标]`、`/d2 英雄 [目标]`、`/d2 数据源`。
 
 ## 自然语言（免指令）
 
@@ -201,6 +202,65 @@
 （HTTP 状态码 / 连接情况）和对应的排查建议。没配专用 Key 时会说明当前走的是
 AstrBot 提供商，并实测一次该通道。
 
+### 数据源自检
+
+```
+/d2 数据源                       # 自检主/后备数据源的连通性与降级状态
+```
+
+会逐项回显：当前谁是主源谁后备、每个源是否可用（附英雄表条数与耗时）、本次运行
+期间有没有发生过降级、最近一次降级的原因。没配 STRATZ Key 时会直接说明「STRATZ
+通道被跳过，全部走 OpenDota」并给出申请入口。
+
+## 数据源：STRATZ 主 + OpenDota 后备
+
+插件默认使用 **双数据源**：以 [STRATZ](https://docs.stratz.com/) 为主数据源、
+OpenDota 作为后备。主源失效时自动切后备，无需人工干预。
+
+为什么用 STRATZ 做主力：
+
+- **经济数据一次拿全**：GPM / XPM / 正补 / 反补 / 英雄伤害 / 塔伤 / 治疗 这些字段
+  单次查询就全带回来。OpenDota 的 `/players/{id}/recentMatches` 只有最近 20 场
+  包含经济数据，所以 `/d2 分析 40` 时常常只有 20 场有 GPM —— 换上 STRATZ 后
+  这个限制消失；
+- 官方 Schema 稳定（GraphQL），字段有文档可查。
+
+### 启用 STRATZ（可选）
+
+不填 Key 也能正常用：插件会检测到 STRATZ 未配置，**所有查询直接落到 OpenDota**，
+行为与升级前完全一致。
+
+想启用 STRATZ：
+
+1. 打开 <https://stratz.com/api>，用 Steam 登录后点 **Generate Token**；
+2. 把令牌填进插件配置的 **「STRATZ API Key」**（`stratz_api_key`）；
+3. 发一次 **`/d2 数据源`** 确认主源已就绪。
+
+免费 Default Token 的额度约为 **20 次/秒、250 次/分、2000 次/时、10000 次/天**，
+远超本插件的实际用量。
+
+### 降级行为
+
+| 主源情况 | 插件的动作 |
+|----------|------------|
+| 未配置（没填 Key） | 直接走后备，不做无谓尝试，**不算降级** |
+| 鉴权失败（401/403） | 切后备，日志记一条 warning |
+| 限流（429） | 先分类重试（指数退避），重试耗尽后切后备 |
+| 网络超时 / 连不上 | 分类重试后切后备 |
+| 找不到玩家 / 昵称歧义 | **不降级** —— 换数据源也查不到，如实报给用户 |
+| 后备也失败 | 如实向上抛错，由指令层给出提示 |
+
+几点注意：
+
+- **STRATZ 令牌绑定出口 IP**：官方把令牌绑定到首次调用的 IP，换网络后会**临时
+  返回 403**（`You cannot use different IP Addresses when using the API.`）。
+  插件能单独识别这个信号并重试（不是永久失败）；持续失败才降级。国内服务器建议
+  配合 `http_proxy` 使用固定出口；
+- **催解析只走 OpenDota**：STRATZ 不支持主动提交解析任务，`/d2 催解析`、
+  单场等待解析流程固定使用 OpenDota，不受主源影响；
+- 在配置里把 **「数据源优先级」** 改成 `opendota`，可以让两者对调
+  （OpenDota 主 / STRATZ 后备）。
+
 ## 用你自己的模型跑报告（可选）
 
 默认情况下，AI 报告用的是 AstrBot 里配置的模型。如果你想让 **Dota2 插件的报告单独走一个通道**
@@ -241,6 +301,9 @@ AstrBot 提供商，并实测一次该通道。
 
 | 配置 | 默认值 | 说明 |
 |------|--------|------|
+| `data_source_priority` | `stratz` | 数据源优先级。`stratz` = STRATZ 主 / OpenDota 后备；`opendota` = 对调 |
+| `stratz_api_key` | 空 | STRATZ API Key。留空则跳过 STRATZ、只用 OpenDota。令牌会绑定出口 IP |
+| `stratz_rate_limit_per_minute` | 240 | 本地限流，保护 STRATZ 配额（官方 Default Token 为 250 次/分） |
 | `opendota_api_key` | 空 | 可选。匿名额度约 60 次/分钟、2000 次/天；填 Key 后可达 1200 次/分钟 |
 | `http_proxy` | 空 | 国内服务器建议配置，例如 `http://127.0.0.1:7890` |
 | `request_timeout` | 30 | 普通接口超时（秒）；单场详情接口自动用 3 倍 |
@@ -298,10 +361,12 @@ AstrBot 提供商，并实测一次该通道。
 - **主动推送依赖平台能力**：比赛结束后的推送需要机器人能主动发消息。QQ 官方机器人等
   通道不支持主动消息，此时添加监听会给出警告，推送也无法送达；这类场景建议改用
   `/d2 单场 <比赛ID>` 手动复盘。
-- 玩家需在 Dota 2 设置中开启「公开比赛数据（Expose Public Match Data）」，否则 OpenDota 查不到比赛。
-- `/players/{id}/matches` 接口只返回 KDA 等基础字段，GPM/XPM/补刀/伤害等字段来自
-  `/players/{id}/recentMatches`，而后者**最多只有 20 场**。因此查询超过 20 场时，
-  超出部分没有经济类字段，聚合统计里会自动标注可用样本数。
+- 玩家需在 Dota 2 设置中开启「公开比赛数据（Expose Public Match Data）」，否则查不到比赛。
+- **经济数据 20 场上限只在 OpenDota 通道存在**：`/players/{id}/matches` 只返回 KDA
+  等基础字段，GPM/XPM/补刀/伤害等字段来自 `/players/{id}/recentMatches`，而后者
+  **最多只有 20 场**。启用 STRATZ 主源后该限制消失（STRATZ 单次查询即带全部经济
+  字段）；仍走 OpenDota 时，超出 20 场的部分没有经济类字段，聚合统计里会自动标注
+  可用样本数。
 - OpenDota 的 `/search`（昵称搜索）偶发响应缓慢，插件为其单独放宽了超时；
   若持续失败，请直接使用账号 ID 绑定。
 - 英雄名使用 OpenDota 提供的英文名（如 `Luna`、`Nature's Prophet`）。
@@ -310,8 +375,9 @@ AstrBot 提供商，并实测一次该通道。
 
 ```
 astrbot_plugin_dota2/
-├── main.py              # 插件入口：指令注册、事件处理、监听后台任务
-├── dota_api.py          # OpenDota 异步客户端（限流 / 重试 / 缓存 / 解析申请）
+├── main.py              # 插件入口：指令注册、事件处理、监听后台任务、数据源组装
+├── dota_api.py          # OpenDota 异步客户端 + FallbackDataSource（主/后备降级）
+├── dota_stratz.py       # STRATZ GraphQL 客户端（字段归一化成 OpenDota 方言）
 ├── dota_parse.py        # 解析状态判断 + 「催解析并等待」轮询
 ├── dota_nlu.py          # 自然语言意图识别（规则优先，可选大模型兜底）
 ├── dota_store.py        # 绑定与监听关系的落盘读写
@@ -325,7 +391,7 @@ astrbot_plugin_dota2/
 ## 开发自测
 
 仓库根目录的 `tests/` 提供一组不依赖真实 AstrBot 的验证脚本（`run_selftest.py`
-会真实访问 OpenDota API，其余使用替身）：
+会真实访问 API，其余使用替身）：
 
 ```bash
 python tests/run_selftest.py         # 端到端跑通全部指令与监听推送链路
@@ -337,11 +403,14 @@ python tests/nlu_check.py            # 自然语言入口：意图识别 + 端�
 python tests/parse_wait_check.py     # 催解析 + 等待解析：成功 / 超时 / 跳过 / 并发
 python tests/watch_deliver_check.py  # 监听推送：标题推进基线、正文回退与逐块收敛
 python tests/llm_channel_check.py    # 专用模型 API Key：地址归一 / 返回体解析 / 回退优先级
+python tests/fallback_check.py       # 主/后备数据源：降级触发、不降级情形、插件组装
+python tests/stratz_client_live.py   # STRATZ 客户端真实 API 验证（需在文件内填 Key）
 python tests/od_data_probe.py        # 真实拉取指定比赛的 od_data，探查解析状态
 ```
 
 ## 相关链接
 
+- STRATZ API 文档：https://docs.stratz.com/
 - OpenDota API 文档：https://docs.opendota.com/
 - AstrBot 插件开发文档：https://docs.astrbot.app/dev/star/plugin-new.html
 - AstrBot 插件配置文档：https://docs.astrbot.app/dev/star/guides/plugin-config.html

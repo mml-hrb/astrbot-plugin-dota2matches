@@ -532,3 +532,214 @@ class OpenDotaClient:
             if isinstance(player, dict) and player.get("gold_t"):
                 return True
         return False
+
+
+# ======================================================================
+# 多数据源：主数据源 + 自动降级
+# ======================================================================
+#: 数据源未配置 / 不可用时的异常。单独成类，便于 :class:`FallbackDataSource`
+#: 判断「该切后备了」。
+class DataSourceUnavailableError(OpenDotaError):
+    """数据源不可用（未配置 / 鉴权失败 / 限流 / 网络异常）。"""
+
+
+#: 各数据源「不可用」的统一信号：这些异常意味着应该切到后备数据源。
+#: 注意 ``TargetNotFoundError`` / ``AmbiguousTargetError`` **不在** 此列 ——
+#: 玩家找不到是业务结果，换数据源也没用，应当直接如实报给用户。
+_FALLBACK_TRIGGER: tuple[type[Exception], ...] = ()
+
+
+def _fallback_trigger_types() -> tuple[type[Exception], ...]:
+    """惰性构造降级触发异常元组（避免模块级循环导入）。"""
+    global _FALLBACK_TRIGGER
+    if _FALLBACK_TRIGGER:
+        return _FALLBACK_TRIGGER
+    types: list[type[Exception]] = [DataSourceUnavailableError]
+    try:
+        from .dota_stratz import StratzUnavailableError
+
+        types.append(StratzUnavailableError)
+    except ImportError:  # pragma: no cover - 模块方式加载时的兜底
+        try:
+            from dota_stratz import StratzUnavailableError  # type: ignore[no-redef]
+
+            types.append(StratzUnavailableError)
+        except ImportError:
+            pass
+    _FALLBACK_TRIGGER = tuple(types)
+    return _FALLBACK_TRIGGER
+
+
+#: 需要被「主数据源优先、失败切后备」包裹的方法名。
+#: 这些方法都是**只读查询**；``request_parse`` 等写操作不做降级（见类文档）。
+_FALLBACK_METHODS: tuple[str, ...] = (
+    "get_heroes",
+    "hero_name",
+    "get_items",
+    "get_player",
+    "search_player",
+    "get_player_matches",
+    "get_recent_matches",
+    "get_player_matches_enriched",
+    "get_player_wl",
+    "get_player_heroes",
+    "get_player_totals",
+    "get_player_peers",
+    "get_match",
+    "get_benchmarks",
+)
+
+
+class FallbackDataSource:
+    """把「主数据源 + 后备数据源」组合成一个对外透明的数据源。
+
+    策略
+    ----
+    - 所有只读查询**先走主数据源**；主数据源抛出「不可用」类异常时，
+      自动切到后备数据源并记录一条 warning。
+    - 主数据源**没配置**（例如 STRATZ 未填 Key）时，直接走后备，不做无谓尝试。
+    - 玩家不存在 / 昵称歧义这类**业务结果**不触发降级 —— 换数据源也查不到，
+      直接如实返回用户。
+    - 一旦主数据源在本进程内失败过，会在 ``_degraded`` 上记一笔；后续请求
+      仍会先试主数据源（因为可能只是瞬时抖动），但日志会带上降级标记。
+
+    之所以用「动态代理」而不是逐个方法手写包装：备选数据源的方法有十几个，
+    手写包装容易漏方法、也容易在新增接口时忘记同步。这里按白名单在
+    ``__init__`` 里统一生成转发函数，新增接口只需往 ``_FALLBACK_METHODS``
+    里加一个名字。
+    """
+
+    #: 对外暴露的数据源名字，供日志与「当前数据源」提示使用
+    name = "fallback"
+    label = "STRATZ（后备 OpenDota）"
+
+    def __init__(
+        self,
+        primary: Any,
+        secondary: Any,
+        *,
+        primary_label: str = "主数据源",
+        secondary_label: str = "后备数据源",
+    ) -> None:
+        self.primary = primary
+        self.secondary = secondary
+        self.primary_label = primary_label
+        self.secondary_label = secondary_label
+        #: 是否曾经降级过（供状态展示）
+        self.degraded = False
+        #: 最近一次降级的原因
+        self.last_error = ""
+
+        for method_name in _FALLBACK_METHODS:
+            setattr(
+                self,
+                method_name,
+                self._make_forwarder(method_name),
+            )
+
+    # ------------------------------------------------------------------
+    def _make_forwarder(self, method_name: str):
+        """为白名单里的方法生成「主优先、失败切后备」的转发函数。"""
+
+        async def forward(*args: Any, **kwargs: Any) -> Any:
+            primary_method = getattr(self.primary, method_name, None)
+            secondary_method = getattr(self.secondary, method_name, None)
+
+            # 主数据源不可用（未配置）→ 直接走后备
+            if primary_method is None or not self._primary_ready():
+                return await self._call_secondary(
+                    method_name, secondary_method, args, kwargs, reason="主数据源未启用"
+                )
+
+            try:
+                return await primary_method(*args, **kwargs)
+            except _fallback_trigger_types() as e:
+                # 主数据源挂了（未配置/鉴权/限流/网络）→ 切后备
+                self.degraded = True
+                self.last_error = f"{type(e).__name__}: {e}"
+                logger.warning(
+                    f"[dota2] {self.primary_label}不可用（{e}），"
+                    f"本次改走{self.secondary_label}：{method_name}"
+                )
+                return await self._call_secondary(
+                    method_name, secondary_method, args, kwargs, reason=str(e)
+                )
+
+        forward.__name__ = method_name
+        forward.__qualname__ = f"FallbackDataSource.{method_name}"
+        return forward
+
+    def _primary_ready(self) -> bool:
+        """主数据源是否处于「可以一试」的状态。"""
+        ready = getattr(self.primary, "configured", None)
+        if ready is None:
+            # 没声明 configured 的数据源默认视为可用
+            return True
+        return bool(ready)
+
+    async def _call_secondary(
+        self,
+        method_name: str,
+        method: Any,
+        args: tuple,
+        kwargs: dict,
+        *,
+        reason: str,
+    ) -> Any:
+        if method is None:
+            raise DataSourceUnavailableError(
+                f"{self.primary_label}与{self.secondary_label}都不支持 {method_name}"
+            )
+        try:
+            return await method(*args, **kwargs)
+        except OpenDotaError:
+            # 后备也失败：如实抛给上层，由各 handler 统一提示
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise DataSourceUnavailableError(
+                f"{self.secondary_label}调用 {method_name} 失败：{e}"
+            ) from e
+
+    # ------------------------------------------------------------------
+    # 不做降级的写操作：直接转发到后备（OpenDota 独占能力）
+    # ------------------------------------------------------------------
+    async def request_parse(self, match_id: int) -> bool:
+        """提交解析申请。
+
+        OpenDota 独占能力，STRATZ 不支持主动提交，因此**固定走后备**
+        （即 OpenDota），避免在 STRATZ 通道下返回 False 让等待流程误判。
+        """
+        method = getattr(self.secondary, "request_parse", None)
+        if method is None:
+            return False
+        try:
+            return await method(match_id)
+        except OpenDotaError:
+            return False
+
+    async def close(self) -> None:
+        """关闭两端数据源。"""
+        for source in (self.primary, self.secondary):
+            closer = getattr(source, "close", None)
+            if closer is None:
+                continue
+            try:
+                await closer()
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"[dota2] 关闭数据源失败: {e}")
+
+    # ------------------------------------------------------------------
+    def describe(self) -> str:
+        """给出一行「当前数据源状态」描述，供查询结果抬头展示。"""
+        if self.degraded:
+            return f"{self.secondary_label}（{self.primary_label}暂时不可用）"
+        return self.primary_label
+
+    def is_parsed(self, match: dict | None) -> bool:
+        """解析状态判定：两端判据一致，直接用主数据源的实现。"""
+        checker = getattr(self.primary, "is_parsed", None)
+        if checker is None:
+            checker = getattr(self.secondary, "is_parsed", None)
+        if checker is None:
+            checker = OpenDotaClient.is_parsed
+        return bool(checker(match))

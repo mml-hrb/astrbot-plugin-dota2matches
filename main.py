@@ -32,12 +32,14 @@ try:  # 插件目录被作为包加载时的相对导入
         resolve_provider,
     )
     from .dota_api import (
+        FallbackDataSource,
         OpenDotaClient,
         OpenDotaError,
         TargetNotFoundError,
         to_account_id,
         to_steam_id64,
     )
+    from .dota_stratz import StratzClient
     from .dota_format import (
         build_match_data_text,
         fmt_ago,
@@ -71,12 +73,14 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
         resolve_provider,
     )
     from dota_api import (  # type: ignore[no-redef]
+        FallbackDataSource,
         OpenDotaClient,
         OpenDotaError,
         TargetNotFoundError,
         to_account_id,
         to_steam_id64,
     )
+    from dota_stratz import StratzClient  # type: ignore[no-redef]
     from dota_format import (  # type: ignore[no-redef]
         build_match_data_text,
         fmt_ago,
@@ -194,7 +198,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "6. 点评选手时对事不对人，指出具体该做而没做的事。"
 )
 
-HELP_TEXT = """🎮 Dota2 数据查询助手（数据来源：OpenDota）
+HELP_TEXT = """🎮 Dota2 数据查询助手（数据来源：STRATZ / OpenDota 双源）
 
 【账号】
 /d2 绑定 <昵称 | 32位账号ID | 64位SteamID>　绑定你的账号
@@ -219,12 +223,27 @@ HELP_TEXT = """🎮 Dota2 数据查询助手（数据来源：OpenDota）
 【模型】
 /d2 模型测试　　　　　　　　　自检插件专用的大模型 Key 是否可用
 
+【数据源】
+/d2 数据源　　　　　　　　　　自检主/后备数据源的连通性与降级状态
+
 说明：
 · 「目标」可以填昵称、32 位账号 ID 或 64 位 SteamID；
 · 不填「目标」时，默认使用你在当前会话绑定的账号；
 · 一局比赛只分析一次：若这场比赛里有多位被监听的玩家，报告会对他们逐一深入点评；
 · 「绑定列表」中他人的账号与用户 ID 默认打码，保护群聊隐私；
 · 想让查询结果更好看，可以在配置中调整「长报告转为图片发送」。
+
+关于数据源（STRATZ 主 / OpenDota 后备）：
+· 默认以 STRATZ 为主数据源，OpenDota 作为后备；主源失效（未配置、鉴权失败、
+  限流、网络异常）时会自动切到后备，不需要人工干预；
+· STRATZ 的优势是经济数据（GPM/XPM/正补/伤害）一次查询就全带回来，
+  没有 OpenDota「最近比赛里只有 20 场有经济数据」的限制；
+· 想启用 STRATZ，去 https://stratz.com/api 生成令牌，填进插件配置的
+  「STRATZ API Key」。留空则完全跳过 STRATZ、只用 OpenDota，功能不受影响；
+· 注意 STRATZ 令牌会绑定首次调用的出口 IP，换网络后可能临时 403，
+  插件会自动重试；持续失败会降级到 OpenDota；
+· 在配置里把「数据源优先级」改成 opendota，可以两者对调（OpenDota 主 / STRATZ 后备）；
+· 随时用 `/d2 数据源` 查看当前主子源、连通性与是否发生过降级。
 
 关于 AI 模型（可选，不影响其他功能）：
 · 默认用 AstrBot 里配置的模型来写分析报告；
@@ -294,13 +313,7 @@ class Dota2Plugin(Star):
         self.data_dir = self._resolve_data_dir()
         self.store = DotaStore(self.data_dir)
         self.store.load()
-        self.api = OpenDotaClient(
-            api_key=self.cfg("opendota_api_key", ""),
-            timeout=self.cfg("request_timeout", 30),
-            max_retries=self.cfg("max_retries", 3),
-            rate_limit_per_minute=self.cfg("rate_limit_per_minute", 55),
-            proxy=self.cfg("http_proxy", ""),
-        )
+        self.api = self._build_data_source()
         #: 等待解析 / 等待推送的比赛：``{match_id: pending_item}``
         #:
         #: 键就是 ``match_id``：**一局比赛只分析一次**。同一局里可能有多位被
@@ -667,6 +680,68 @@ class Dota2Plugin(Star):
             fallback.mkdir(parents=True, exist_ok=True)
             return fallback
 
+    # ==================================================================
+    # 数据源组装（主 STRATZ + 后备 OpenDota，自动降级）
+    # ==================================================================
+    #: 数据源优先级取值 → (主源名, 说明)。``stratz`` 为默认。
+    DATA_SOURCE_CHOICES = ("stratz", "opendota")
+
+    def _stratz_api_key(self) -> str:
+        """读取 STRATZ API Key（去空白，兼容误粘贴换行）。"""
+        return str(self.cfg("stratz_api_key", "") or "").strip()
+
+    def _data_source_choice(self) -> str:
+        """读取配置里的「数据源优先级」，非法值一律回落到 ``stratz``。"""
+        choice = str(self.cfg("data_source_priority", "stratz") or "").strip().lower()
+        return choice if choice in self.DATA_SOURCE_CHOICES else "stratz"
+
+    def _build_data_source(self):
+        """按配置组装数据源。
+
+        默认策略：**STRATZ 为主、OpenDota 为后备**。
+
+        - ``stratz_api_key`` 没填时，STRATZ 会被视为「未配置」，
+          所有请求直接落到 OpenDota（行为与升级前完全一致）。
+        - ``data_source_priority`` 选 ``opendota`` 时，两者对调：
+          OpenDota 为主、STRATZ 为后备。
+        - 任一主源抛「不可用」类异常（未配置/鉴权/限流/网络）时，
+          :class:`FallbackDataSource` 会自动切到后备并记一条 warning。
+        """
+        opendota = OpenDotaClient(
+            api_key=self.cfg("opendota_api_key", ""),
+            timeout=self.cfg("request_timeout", 30),
+            max_retries=self.cfg("max_retries", 3),
+            rate_limit_per_minute=self.cfg("rate_limit_per_minute", 55),
+            proxy=self.cfg("http_proxy", ""),
+        )
+        stratz = StratzClient(
+            api_key=self._stratz_api_key(),
+            timeout=self.cfg("request_timeout", 30),
+            max_retries=self.cfg("max_retries", 3),
+            rate_limit_per_minute=self.cfg("stratz_rate_limit_per_minute", 240),
+            proxy=self.cfg("http_proxy", ""),
+        )
+
+        if self._data_source_choice() == "opendota":
+            primary, secondary = opendota, stratz
+            primary_label, secondary_label = "OpenDota", "STRATZ"
+        else:
+            primary, secondary = stratz, opendota
+            primary_label, secondary_label = "STRATZ", "OpenDota"
+
+        source = FallbackDataSource(
+            primary=primary,
+            secondary=secondary,
+            primary_label=primary_label,
+            secondary_label=secondary_label,
+        )
+        if primary_label == "STRATZ" and not stratz.configured:
+            logger.info(
+                "[dota2] 未配置 STRATZ API Key，数据源将直接使用 OpenDota；"
+                "填写「STRATZ API Key」后即可启用 STRATZ 主数据源。"
+            )
+        return source
+
     @staticmethod
     def _split_count_target(args: str) -> tuple[int | None, str]:
         """把 `20 天鸽` 拆成 ``(20, "天鸽")``；没有数量时返回 ``(None, args)``。"""
@@ -918,6 +993,7 @@ class Dota2Plugin(Star):
         "unwatch": "d2_unwatch",
         "watchlist": "d2_watchlist",
         "llmtest": "d2_llmtest",
+        "datasource": "d2_datasource",
     }
 
     #: 单场复盘的指令别名 → handler。
@@ -2040,6 +2116,85 @@ class Dota2Plugin(Star):
         )
 
     # ==================================================================
+    # 指令：数据源自检
+    # ==================================================================
+    @d2.command("datasource", alias={"数据源", "数据源测试", "源测试", "源"})
+    @take_over_event
+    async def d2_datasource(self, event: AstrMessageEvent):
+        """检查主/后备数据源的连通性与降级状态"""
+        yield event.plain_result("⏳ 正在测试数据源，请稍候…")
+        yield event.plain_result(await self._data_source_selftest())
+
+    async def _data_source_selftest(self) -> str:
+        """实测主/后备数据源连通性，并回显降级状态。
+
+        与「模型自检」对称：把「当前谁是主源、主源能不能用、有没有降级过」
+        一次性讲清楚，省得用户翻日志。
+        """
+        api = self.api
+        primary = getattr(api, "primary", None)
+        secondary = getattr(api, "secondary", None)
+        primary_label = getattr(api, "primary_label", "主数据源")
+        secondary_label = getattr(api, "secondary_label", "后备数据源")
+
+        lines = [f"📡 数据源状态（当前优先级：{primary_label} → {secondary_label}）", ""]
+
+        # ---- 主数据源 ----
+        if primary is None:
+            lines.append(f"· {primary_label}：未接入")
+        else:
+            lines.append(f"· {primary_label}：{await self._probe_source(primary)}")
+
+        # ---- 后备数据源 ----
+        if secondary is None:
+            lines.append(f"· {secondary_label}：未接入")
+        else:
+            lines.append(f"· {secondary_label}：{await self._probe_source(secondary)}")
+
+        # ---- 降级记录 ----
+        lines.append("")
+        if getattr(api, "degraded", False):
+            lines.append(
+                "⚠️ 本进程内出现过降级：主数据源调用失败，已自动改走后备。\n"
+                f"　最近原因：{getattr(api, 'last_error', '') or '未知'}"
+            )
+        else:
+            lines.append("✅ 本次运行期间尚未发生降级。")
+
+        # ---- STRATZ 专属提示 ----
+        if primary_label == "STRATZ" and not getattr(primary, "configured", False):
+            lines.append(
+                "\nℹ️ 未配置「STRATZ API Key」，STRATZ 通道被跳过，"
+                "所有查询直接使用 OpenDota。\n"
+                "　去 https://stratz.com/api 登录后可生成令牌，填进插件配置即可启用。"
+            )
+        return "\n".join(lines)
+
+    async def _probe_source(self, source: Any) -> str:
+        """探测单个数据源的可用性，返回一行带耗时的描述。"""
+        label = getattr(source, "label", None) or getattr(source, "name", "数据源")
+        configured = getattr(source, "configured", None)
+        if configured is False:
+            return "未配置（跳过）"
+
+        started = time.monotonic()
+        try:
+            heroes = await source.get_heroes()
+        except OpenDotaError as e:
+            elapsed = time.monotonic() - started
+            return f"❌ 不可用（耗时 {elapsed:.1f} 秒）：{e}"
+        except Exception as e:  # noqa: BLE001
+            elapsed = time.monotonic() - started
+            logger.error(f"[dota2] {label} 自检异常：{e}", exc_info=True)
+            return f"❌ 异常（耗时 {elapsed:.1f} 秒）：{e}"
+
+        elapsed = time.monotonic() - started
+        count = len(heroes) if heroes else 0
+        if count == 0:
+            return f"⚠️ 连接成功但英雄表为空（耗时 {elapsed:.1f} 秒）"
+        return f"✅ 可用（英雄 {count} 个，耗时 {elapsed:.1f} 秒）"
+
+    # ==================================================================
     # 大模型调用
     # ==================================================================
     def _llm_api_key(self) -> str:
@@ -2428,7 +2583,7 @@ class Dota2Plugin(Star):
             )
             return
 
-        parsed = OpenDotaClient.is_parsed(match)
+        parsed = self.api.is_parsed(match)
 
         # ---- 情况二：已收录，但还没有逐分钟级别的解析数据 ----
         if require_parsed and not parsed:

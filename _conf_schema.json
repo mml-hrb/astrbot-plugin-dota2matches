@@ -1,4 +1,26 @@
 {
+  "data_source_priority": {
+    "description": "数据源优先级",
+    "type": "string",
+    "default": "stratz",
+    "options": ["stratz", "opendota"],
+    "hint": "stratz = STRATZ 为主、OpenDota 为后备（推荐，经济数据一次拿全，没有 20 场上限）；opendota = OpenDota 为主、STRATZ 为后备。主数据源失效（未配置 / 鉴权失败 / 限流 / 网络异常）时会自动切到后备，无需人工干预。",
+    "obvious_hint": true
+  },
+  "stratz_api_key": {
+    "description": "STRATZ API Key",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "在 https://stratz.com/api 申请（登录后点 Generate Token）。留空则自动跳过 STRATZ、直接使用 OpenDota。注意：STRATZ 令牌会绑定首次调用的出口 IP，换网络后可能临时 403（插件会自动重试并降级）。默认额度约 20 次/秒、2000 次/小时。",
+    "obvious_hint": true
+  },
+  "stratz_rate_limit_per_minute": {
+    "description": "STRATZ 每分钟最大请求数",
+    "type": "int",
+    "default": 240,
+    "hint": "用于保护 STRATZ 配额。官方 Default Token 为 250 次/分，默认取 240 留一点余量。"
+  },
   "opendota_api_key": {
     "description": "OpenDota API Key（可选）",
     "type": "string",
