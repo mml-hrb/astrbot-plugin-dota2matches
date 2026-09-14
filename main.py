@@ -280,8 +280,8 @@ HELP_TEXT = """🎮 Dota2 数据查询助手（数据来源：STRATZ / OpenDota 
 · 确认 / 取消可以直接回「确认」「取消」，不需要再带唤醒词。"""
 
 
-def take_over_event(func):
-    """接管事件：直发回复 + 结束后终止事件传播。
+def take_over_event(func=None, *, declinable: bool = False):
+    """接管事件：直发回复 + （确实接管时）终止事件传播。
 
     AstrBot 的流水线是「洋葱模型」：handler 每 ``yield`` 一条结果，后续
     阶段（含默认大模型的请求阶段）就会被执行一次。本插件的指令往往要先
@@ -294,26 +294,76 @@ def take_over_event(func):
     1. **直发**：把 handler yield 出来的结果通过 ``event.send()`` 直接投递
        （这正是 AstrBot 自己的 RespondStage 使用的通道），不再回灌流水线。
        这样插件执行期间流水线里不会产生任何额外的执行机会。
-    2. **终止传播**：handler 结束后调用 ``event.stop_event()``，阻止流水线
+    2. **终止传播**：handler 接管成功后调用 ``event.stop_event()``，阻止流水线
        继续走到默认大模型阶段。
 
     两步都做了降级：运行时没有 ``event.send`` 或结果上没有 ``chain`` 时，
     自动退回为正常 ``yield``，保证在老版本 / 自定义 Event 上也能出消息。
+
+    Args:
+        declinable: handler 是否**可能主动放弃**某条消息。
+
+            * ``False``（默认）：handler 一旦被调用就必然要接管。适用于
+              ``@filter.command`` 这类「只有匹配上才会被调用」的 handler，
+              它们无论有没有产出结果，都不该让默认大模型再来插一句。
+            * ``True``：handler 可能看一眼后判断「这条不是给我的」而直接
+              ``return``。此时**只有真的产出过结果才算接管**；一条都没产出
+              就**绝不能** ``stop_event()``。
+
+    为什么 ``declinable`` 必须存在（这是踩过的坑）：AstrBot 的
+    ``StarRequestSubStage`` 派发 handler 时是这样的 ——
+
+    .. code-block:: python
+
+        for handler in activated_handlers:
+            if event.is_stopped():
+                break          # ← 循环直接结束
+            async for ret in call_handler(event, handler.handler, **params):
+                yield ret
+            if event.is_stopped():
+                break
+
+    也就是说，**任何一个** handler 调用了 ``stop_event()``，排在它后面的
+    handler 全部被跳过；同时 ``ProcessStage`` 里的
+    ``event.get_result() and not event.is_stopped()`` 也会变成假，
+    默认大模型同样不会被请求。
+
+    对一个挂在 ``EventMessageType.ALL`` 上、**每条消息都会跑一遍**的监听器
+    （如 :meth:`Dota2Plugin.d2_natural`）来说，无条件 ``stop_event()``
+    等于「只要插件开着，别人说什么都别想被回复」—— 既掐掉其他插件，
+    也掐掉正常闲聊。所以这类 handler 必须声明 ``declinable=True``。
     """
 
-    @functools.wraps(func)
-    async def wrapper(self, event: AstrMessageEvent, *args, **kwargs):
-        try:
-            async for result in func(self, event, *args, **kwargs):
-                if not await self._deliver_now(event, result):
-                    yield result
-        finally:
+    def decorate(func):
+        @functools.wraps(func)
+        async def wrapper(self, event: AstrMessageEvent, *args, **kwargs):
+            #: 是否真的接管了这条消息（产出过至少一条结果）。
+            handled = False
             try:
-                event.stop_event()
-            except Exception as e:  # noqa: BLE001 - 老版本没有该 API
-                logger.debug(f"[dota2] 终止事件传播失败（可忽略）: {e}")
+                async for result in func(self, event, *args, **kwargs):
+                    handled = True
+                    if not await self._deliver_now(event, result):
+                        yield result
+            finally:
+                # 三种情况说明「这条消息归我管」，必须终止传播：
+                #   1. 我产出过结果（``handled``，含直发成功的那些）；
+                #   2. 我不是可放弃的 handler —— 被调用就意味着接管；
+                #   3. 事件在我收尾时已经是停止态 —— 说明我**委托**出去的
+                #      内部指令 handler 已经接管并终止了传播。
+                # 只有「可放弃 + 什么都没产出 + 事件仍在传播」才是真的放弃，
+                # 此时必须原样放行，否则会连带掐死其他插件与默认大模型。
+                if handled or not declinable or event.is_stopped():
+                    try:
+                        event.stop_event()
+                    except Exception as e:  # noqa: BLE001 - 老版本没有该 API
+                        logger.debug(f"[dota2] 终止事件传播失败（可忽略）: {e}")
 
-    return wrapper
+        return wrapper
+
+    # 兼容两种写法：``@take_over_event`` 与 ``@take_over_event(declinable=True)``
+    if func is not None:
+        return decorate(func)
+    return decorate
 
 
 class Dota2Plugin(Star):
@@ -827,14 +877,32 @@ class Dota2Plugin(Star):
         RespondStage 也是走这个通道）。这样插件在执行期间不会给流水线
         制造新的执行机会，默认大模型也就没有插嘴的时机。
 
+        ``event.send()`` 要的是 ``MessageChain``，也就是 ``result`` **本身**
+        —— ``MessageEventResult`` 就是 ``MessageChain`` 的子类。它要的
+        **不是** ``result.chain``：那是个普通 ``list``，交给平台适配器会以
+        ``'list' object has no attribute 'chain'`` 失败。旧实现正是传了
+        ``result.chain``，于是直发在 AstrBot v4.x 上从来没成功过，每次投递
+        都退回流水线、还各刷一条 warning。
+
         当前运行时不支持直发时返回 False，由调用方回退为 ``yield``。
         """
         send = getattr(event, "send", None)
-        chain = getattr(result, "chain", None)
-        if not callable(send) or chain is None:
+        if not callable(send):
             return False
+
+        # send() 需要「带 chain 属性的消息链对象」，且 chain 不能为空
+        # （空 chain 发出去也没有意义）。优先用 result 本身；老版本把
+        # result.chain 也做成消息链时再退一步用它。
+        target = None
+        if getattr(result, "chain", None):
+            target = result
+        elif hasattr(getattr(result, "chain", None), "chain"):
+            target = result.chain
+        if target is None:
+            return False
+
         try:
-            await send(chain)
+            await send(target)
         except Exception as e:  # noqa: BLE001 - 直发不可用时回退为流水线发送
             logger.warning(f"[dota2] 直接发送失败，回退为流水线发送: {e}")
             return False
@@ -1161,9 +1229,20 @@ class Dota2Plugin(Star):
         return item
 
     @filter.event_message_type(filter.EventMessageType.ALL)
-    @take_over_event
+    @take_over_event(declinable=True)
     async def d2_natural(self, event: AstrMessageEvent):
-        """自然语言入口：把「帮我看看我的战绩」这类人话转成对应功能。"""
+        """自然语言入口：把「帮我看看我的战绩」这类人话转成对应功能。
+
+        .. important::
+
+           这是挂在 ``EventMessageType.ALL`` 上的**全局监听**：每条消息
+           都会进来跑一遍，其中绝大多数会被闸门挡下并 ``return``。
+           因此必须用 ``@take_over_event(declinable=True)`` —— 只有真的
+           处理了消息才终止传播。改成无条件的 ``take_over_event`` 会让
+           插件一开启就掐掉同一事件上**其他插件的 handler 和默认大模型**
+           （AstrBot 的 ``StarRequestSubStage`` 遇到 ``is_stopped()``
+           会直接 ``break``），表现为「正常对话和其他插件全都没反应」。
+        """
         text = dota_nlu.normalize(getattr(event, "message_str", "") or "")
         umo = event.unified_msg_origin
         uid = str(event.get_sender_id())
