@@ -24,6 +24,8 @@ from astrbot.api.star import Context, Star, StarTools
 
 try:  # 插件目录被作为包加载时的相对导入
     from .dota_analyzer import (
+        LLMRequestError,
+        OpenAICompatibleClient,
         build_recent_analysis_prompt,
         build_single_match_analysis_prompt,
         call_llm,
@@ -61,6 +63,8 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from dota_analyzer import (  # type: ignore[no-redef]
+        LLMRequestError,
+        OpenAICompatibleClient,
         build_recent_analysis_prompt,
         build_single_match_analysis_prompt,
         call_llm,
@@ -212,12 +216,23 @@ HELP_TEXT = """🎮 Dota2 数据查询助手（数据来源：OpenDota）
 /d2 取消监听 <目标 | 全部>　　取消你自己添加的监听
 /d2 监听列表　　　　　　　　　查看本会话的监听
 
+【模型】
+/d2 模型测试　　　　　　　　　自检插件专用的大模型 Key 是否可用
+
 说明：
 · 「目标」可以填昵称、32 位账号 ID 或 64 位 SteamID；
 · 不填「目标」时，默认使用你在当前会话绑定的账号；
 · 一局比赛只分析一次：若这场比赛里有多位被监听的玩家，报告会对他们逐一深入点评；
 · 「绑定列表」中他人的账号与用户 ID 默认打码，保护群聊隐私；
 · 想让查询结果更好看，可以在配置中调整「长报告转为图片发送」。
+
+关于 AI 模型（可选，不影响其他功能）：
+· 默认用 AstrBot 里配置的模型来写分析报告；
+· 也可以在插件配置里填「专用 API Key」，让本插件的报告单独走一个通道
+  （比如用更便宜的模型）。只填 Key 也能用——「接口地址」直接填服务商名
+  （deepseek / kimi / qwen / zhipu / siliconflow / openrouter）会自动补全；
+· 填完用 `/d2 模型测试` 自检一次，会回显接口地址、模型名、耗时和具体错误；
+· 配了专用 Key 但调用失败时，默认会自动回退到 AstrBot 的模型。
 
 关于解析（AI 复盘质量的关键）：
 · OpenDota 收录一场比赛 ≠ 解析完这场比赛的录像。只有解析完成才有逐分钟
@@ -579,21 +594,7 @@ class Dota2Plugin(Star):
 
     async def _generate_report_for_umo(self, umo: str, prompt: str) -> str | None:
         """在指定会话下调用大模型生成报告（供后台任务使用）。"""
-        if not self.cfg("enable_llm_analysis", True):
-            return None
-        provider = await resolve_provider(
-            self.context, umo, str(self.cfg("llm_provider_id", "") or "")
-        )
-        if provider is None:
-            return None
-        system_prompt = str(self.cfg("analysis_system_prompt", "") or "").strip() or (
-            DEFAULT_SYSTEM_PROMPT
-        )
-        try:
-            return await call_llm(provider, system_prompt, prompt)
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"[dota2] 生成复盘报告失败：{e}")
-            return None
+        return await self._call_report_llm(prompt, umo=umo)
 
     async def _build_recent_context(
         self,
@@ -916,6 +917,7 @@ class Dota2Plugin(Star):
         "watch": "d2_watch",
         "unwatch": "d2_unwatch",
         "watchlist": "d2_watchlist",
+        "llmtest": "d2_llmtest",
     }
 
     #: 单场复盘的指令别名 → handler。
@@ -1788,7 +1790,7 @@ class Dota2Plugin(Star):
             + platform_note
         )
 
-    @d2.command("unwatch", alias={"取消监听", "取消订阅"})
+    @d2.command("unwatch", alias={"取消监听", "取消订阅", "停止监听", "关闭监听", "取消关注"})
     @take_over_event
     async def d2_unwatch(self, event: AstrMessageEvent, args: GreedyStr):
         """取消监听：/d2 取消监听 <昵称|账号ID|全部>"""
@@ -1801,7 +1803,8 @@ class Dota2Plugin(Star):
             yield event.plain_result(
                 "用法：`/d2 取消监听 <昵称|账号ID|全部>`\n"
                 "· `/d2 取消监听 86745912`\n"
-                "· `/d2 取消监听 全部` 取消你添加的所有监听"
+                "· `/d2 取消监听 全部` 取消你添加的所有监听\n"
+                "（也支持「停止监听」「关闭监听」等说法，与「取消监听」等价）"
             )
             return
 
@@ -1923,30 +1926,197 @@ class Dota2Plugin(Star):
         yield event.plain_result("\n".join(lines))
 
     # ==================================================================
+    # 指令：模型自检
+    # ==================================================================
+    @d2.command("llmtest", alias={"模型测试", "模型自检", "测试模型", "llm"})
+    @take_over_event
+    async def d2_llmtest(self, event: AstrMessageEvent):
+        """检查插件专用的模型 API Key 是否可用"""
+        yield event.plain_result("⏳ 正在测试模型通道，请稍候…")
+        yield event.plain_result(await self._llm_selftest(event.unified_msg_origin))
+
+    async def _llm_selftest(self, umo: str) -> str:
+        """用极短请求探一次模型通道，回显配置与耗时，便于用户排查。
+
+        分三种情况：
+        * 配了专用 Key → 只测专用通道，成功/失败都给细节；
+        * 没配专用 Key → 说明当前回退 AstrBot 提供商，并实测一次回退通道；
+        * 连回退通道都拿不到 → 提示去补配置。
+        """
+        if not self.cfg("enable_llm_analysis", True):
+            return (
+                "⚠️ AI 分析功能当前是关闭的（配置项「启用 AI 分析」）。\n"
+                "把它打开后 `/d2 分析`、`/d2 单场` 才会有 AI 报告。"
+            )
+
+        client = self._dedicated_client()
+        if client is None:
+            return await self._llm_selftest_fallback(
+                umo,
+                "ℹ️ 你没有配置专用的模型 API Key，当前走 AstrBot 自带的模型提供商。\n"
+                "如果想让本插件用独立的 Key（比如填 DeepSeek 的 key 省钱），"
+                "在插件配置里填「专用 API Key」即可。\n\n",
+            )
+
+        configured = [
+            f"　接口地址：{client.endpoint}",
+            f"　模型名称：{client.model or '（未配置，会直接报错）'}",
+            f"　超时：{client.timeout:g} 秒",
+            f"　代理：{client.proxy or '不使用'}",
+        ]
+        if not client.model:
+            return (
+                "❌ 专用模型通道配置不完整：填了 API Key，但没填模型名称。\n"
+                + "\n".join(configured)
+                + "\n\n请在插件配置里补上「模型名称」，例如 `deepseek-chat`。"
+            )
+
+        started = time.monotonic()
+        try:
+            reply = await client.chat(
+                "你是一个连通性测试助手，只回答用户要求的内容，不要添加任何多余的话。",
+                "请只回复两个字：可用",
+                temperature=0.0,
+                max_tokens=32,
+            )
+        except LLMRequestError as e:
+            elapsed = time.monotonic() - started
+            return (
+                f"❌ 专用模型通道测试失败（耗时 {elapsed:.1f} 秒）\n"
+                + "\n".join(configured)
+                + f"\n\n错误信息：\n{e}\n\n"
+                "排查建议：\n"
+                "· 401/403：API Key 填错或已失效；\n"
+                "· 404：接口地址不对（中转站一般要到 `/v1` 为止，不要带 `/chat/completions`）；\n"
+                "· 超时 / 无法连接：网络不通，或在墙外需要填「代理」；\n"
+                "· 模型名不存在：确认模型名称与服务商匹配（如 `deepseek-chat`、`gpt-4o-mini`）。"
+            )
+        except Exception as e:  # noqa: BLE001
+            elapsed = time.monotonic() - started
+            logger.error(f"[dota2] 模型自检出现异常：{e}", exc_info=True)
+            return (
+                f"❌ 专用模型通道测试异常（耗时 {elapsed:.1f} 秒）\n"
+                + "\n".join(configured)
+                + f"\n\n异常信息：{e}"
+            )
+
+        elapsed = time.monotonic() - started
+        return (
+            f"✅ 专用模型通道可用（耗时 {elapsed:.1f} 秒）\n"
+            + "\n".join(configured)
+            + f"\n\n模型回显：{reply}"
+        )
+
+    async def _llm_selftest_fallback(self, umo: str, prefix: str) -> str:
+        """在未配置专用 Key 时，实测一次 AstrBot 提供商通道。"""
+        provider = await resolve_provider(
+            self.context, umo, str(self.cfg("llm_provider_id", "") or "")
+        )
+        if provider is None:
+            return (
+                prefix
+                + "❌ 但当前也没有可用的 AstrBot 模型提供商，`/d2 分析` 会拿不到报告。\n"
+                "请先在 AstrBot 里配置一个模型提供商，或填上本插件的专用 API Key。"
+            )
+        started = time.monotonic()
+        try:
+            reply = await call_llm(
+                provider,
+                "你是一个连通性测试助手，只回答用户要求的内容，不要添加任何多余的话。",
+                "请只回复两个字：可用",
+            )
+        except Exception as e:  # noqa: BLE001
+            elapsed = time.monotonic() - started
+            return (
+                prefix
+                + f"❌ 用 AstrBot 提供商测试失败（耗时 {elapsed:.1f} 秒）：{e}\n"
+                "建议检查 AstrBot 里该提供商的配置，或改用插件专用 API Key。"
+            )
+        elapsed = time.monotonic() - started
+        return (
+            prefix
+            + f"✅ AstrBot 提供商通道可用（耗时 {elapsed:.1f} 秒）\n"
+            + f"　模型回显：{reply}"
+        )
+
+    # ==================================================================
     # 大模型调用
     # ==================================================================
-    async def _generate_report(
-        self, event: AstrMessageEvent, prompt: str
-    ) -> str | None:
-        """调用大模型生成报告。失败或未启用时返回 None。"""
+    def _llm_api_key(self) -> str:
+        """读取插件专用 API Key（空字符串表示未配置）。"""
+        return str(self.cfg("llm_api_key", "") or "").strip()
+
+    def _dedicated_client(self) -> OpenAICompatibleClient | None:
+        """按配置构造专用模型客户端；未配置 key 时返回 None。"""
+        api_key = self._llm_api_key()
+        if not api_key:
+            return None
+        return OpenAICompatibleClient(
+            api_key=api_key,
+            base_url=str(self.cfg("llm_base_url", "") or ""),
+            model=str(self.cfg("llm_model", "") or ""),
+            timeout=float(self.cfg("llm_timeout", 120) or 120),
+            proxy=str(self.cfg("llm_proxy", "") or ""),
+        )
+
+    async def _call_report_llm(self, prompt: str, *, umo: str = "") -> str | None:
+        """生成报告用的大模型调用：专用 Key 优先，失败按配置回退 AstrBot。
+
+        Args:
+            prompt: 用户提示词。
+            umo: 会话来源，回退到 AstrBot 提供商时用来解析会话默认模型。
+
+        Returns:
+            报告正文；失败或未启用时返回 None（并在日志里说明原因）。
+        """
         if not self.cfg("enable_llm_analysis", True):
             return None
+
+        system_prompt = str(self.cfg("analysis_system_prompt", "") or "").strip()
+        if not system_prompt:
+            system_prompt = DEFAULT_SYSTEM_PROMPT
+
+        client = self._dedicated_client()
+        if client is not None:
+            try:
+                max_tokens = int(self.cfg("llm_max_tokens", 0) or 0)
+                return await client.chat(
+                    system_prompt,
+                    prompt,
+                    temperature=float(self.cfg("llm_temperature", 0.7) or 0),
+                    max_tokens=max_tokens or None,
+                )
+            except LLMRequestError as e:
+                logger.error(f"[dota2] 专用模型调用失败（{client.endpoint}）：{e}")
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"[dota2] 专用模型调用出现异常：{e}", exc_info=True)
+
+            if not self.cfg("llm_fallback_on_error", True):
+                logger.warning("[dota2] 已关闭回退，本次不做 AI 分析")
+                return None
+            logger.warning("[dota2] 回退到 AstrBot 的模型提供商重试")
+
         provider = await resolve_provider(
             self.context,
-            event.unified_msg_origin,
+            umo,
             str(self.cfg("llm_provider_id", "") or ""),
         )
         if provider is None:
             logger.warning("[dota2] 没有可用的模型提供商，跳过 AI 分析")
             return None
-        system_prompt = str(self.cfg("analysis_system_prompt", "") or "").strip()
-        if not system_prompt:
-            system_prompt = DEFAULT_SYSTEM_PROMPT
         try:
             return await call_llm(provider, system_prompt, prompt)
         except Exception as e:  # noqa: BLE001
             logger.error(f"[dota2] 调用大模型失败: {e}", exc_info=True)
             return None
+
+    async def _generate_report(
+        self, event: AstrMessageEvent, prompt: str
+    ) -> str | None:
+        """调用大模型生成报告。失败或未启用时返回 None。"""
+        return await self._call_report_llm(
+            prompt, umo=event.unified_msg_origin
+        )
 
     # ==================================================================
     # 监听后台任务
@@ -2133,6 +2303,9 @@ class Dota2Plugin(Star):
                 "wait_attempts": 0,
                 #: 已收录但还没有逐分钟解析数据的次数
                 "parse_attempts": 0,
+                #: 投递尝试次数。数据都就绪、但标题始终发不出去时（例如平台侧一直
+                #: 报错），超过上限就放弃这场比赛，避免无限重试刷屏。
+                "deliver_attempts": 0,
                 "first_seen": time.time(),
                 "next_try_at": 0.0,
                 #: 是否正在处理中（防止并发投递同一场比赛）
@@ -2291,6 +2464,20 @@ class Dota2Plugin(Star):
             logger.info(f"[dota2] 比赛 {match_id} 等待解析超时，改用基础数据推送")
 
         delivered = await self._deliver(item, match, parsed)
+
+        # 数据已就绪但一条都没送出去：计数并在超过上限后放弃，避免无限重试。
+        # 注意这里只在「完全没送出去」时计数，正文失败不影响 delivered（见 _deliver）。
+        if not delivered:
+            item["deliver_attempts"] = int(item.get("deliver_attempts", 0)) + 1
+            max_deliver = max(1, int(self.cfg("watch_max_deliver_attempts", 10)))
+            if item["deliver_attempts"] > max_deliver:
+                logger.warning(
+                    f"[dota2] 比赛 {match_id} 连续 {item['deliver_attempts']} 次推送失败，"
+                    f"放弃该场（数据已就绪，可能是平台发送通道问题）"
+                )
+                await self._finish(item, delivered_umos=set(), force_advance=True)
+                return
+
         await self._finish(item, delivered_umos=delivered)
 
     async def _finish(
@@ -2478,58 +2665,133 @@ class Dota2Plugin(Star):
 
         headline = self.match_headline(match, heroes, focus_ids, parsed)
 
-        # 大模型报告只生成一次，多个会话复用（避免重复消耗配额）
-        report: str | None = None
+        # 大模型报告只生成一次，多个会话复用（避免重复消耗配额）。
+        # 走 `_call_report_llm`：专用 API Key 优先，未配置时回退 AstrBot 提供商。
         first_umo = targets[0]["umo"]
-        if self.cfg("enable_llm_analysis", True):
-            provider = await resolve_provider(
-                self.context, first_umo, str(self.cfg("llm_provider_id", "") or "")
-            )
-            if provider is not None:
-                system_prompt = str(
-                    self.cfg("analysis_system_prompt", "") or ""
-                ).strip() or DEFAULT_SYSTEM_PROMPT
-                try:
-                    report = await call_llm(provider, system_prompt, prompt)
-                except Exception as e:  # noqa: BLE001
-                    logger.error(f"[dota2] 监听推送生成分析失败：{e}")
+        report = await self._call_report_llm(prompt, umo=first_umo)
 
         delivered: set[str] = set()
         for target in targets:
             umo = target["umo"]
             try:
-                ok = await self._send_to_session(umo, target, headline)
-                if report:
-                    image_url = await self._render_image(report)
-                    if image_url:
-                        if await self._send(umo, MessageChain().file_image(image_url)) is False:
-                            ok = False
-                    else:
-                        for chunk in self._chunk_text(report):
-                            if (
-                                await self._send(umo, MessageChain().message(chunk))
-                                is False
-                            ):
-                                ok = False
-                else:
-                    if await self._send(
-                        umo,
-                        MessageChain().message(
-                            "⚠️ 未启用大模型分析或模型不可用，仅提供上述比赛概览。"
-                        ),
-                    ) is False:
-                        ok = False
-
-                if ok:
-                    delivered.add(umo)
-                    logger.info(f"[dota2] 比赛 {match_id} 分析已推送到 {umo}")
-                else:
+                # 「送达」的判定点是**标题发出去**：标题一进群，用户就已经看到这条
+                # 推送了，此时若再因为正文二次发送失败而回退基线，下一轮会把同一场
+                # 比赛重新发现并再推一遍标题 —— 群里就会无限复读那一行标题。
+                #
+                # 这不是假想：线上日志里「🏁 比赛回顾 · 8996928421」从 20:21 一路
+                # 复读到 20:39（7 次、间隔 2~3.5 分钟）。用 v1.2.1 原始代码在
+                # 「analysis_as_image=True 且图片发送失败」的场景下可以 1:1 复现：
+                # 图片失败 → ok=False → 基线不推进 → 每轮重推标题。
+                # （详见 tests/old_code_repro.py 的对照输出。）
+                #
+                # 因此正文发送失败只记日志、不回退，绝不影响 delivered。
+                headline_ok = await self._send_to_session(umo, target, headline)
+                if not headline_ok:
                     logger.warning(
-                        f"[dota2] 向 {umo} 推送比赛 {match_id} 未成功送达，稍后重试"
+                        f"[dota2] 向 {umo} 推送比赛 {match_id} 的标题未送达，稍后重试"
                     )
+                    continue
+
+                delivered.add(umo)
+                logger.info(f"[dota2] 比赛 {match_id} 分析已推送到 {umo}")
+
+                # 正文属于「尽力而为」：失败不影响送达判定，只提示用户去看概览。
+                # `_send_report_body` 内部已逐块收敛异常，这里的 try 是最后一道保险。
+                try:
+                    body_ok = await self._send_report_body(umo, report)
+                except Exception as e:  # noqa: BLE001
+                    logger.error(f"[dota2] 向 {umo} 推送比赛 {match_id} 的正文失败：{e}")
+                    body_ok = False
+                if not body_ok:
+                    logger.warning(
+                        f"[dota2] 比赛 {match_id} 的复盘正文未能送达 {umo}，"
+                        f"标题已发出，不再重复推送"
+                    )
+                    await self._notify_body_failed(umo, match_id)
             except Exception as e:  # noqa: BLE001
-                logger.error(f"[dota2] 向 {umo} 推送比赛 {match_id} 失败：{e}")
+                # 兜底：`_send_to_session` / `_send_report_body` 内部已各自收敛异常，
+                # 走到这里说明出了预期外的问题（例如常量或格式化代码抛错）。
+                # 此时该会话本轮只发出去一部分，补一条提示让失败可感知——
+                # 否则用户会看到「只有标题、后面什么都没有」而不知道为什么。
+                logger.exception(f"[dota2] 向 {umo} 推送比赛 {match_id} 时出现预期外异常")
+                if umo in delivered:
+                    await self._notify_body_failed(umo, match_id)
         return delivered
+
+    async def _send_report_body(self, umo: str, report: str | None) -> bool:
+        """发送复盘正文（图片优先，失败或未启用时按长度拆分文本）。
+
+        返回是否成功送达。**调用方不应据此回退监听进度**：正文只是标题的补充，
+        用户已经通过标题知道这场比赛打完了。
+
+        每一块的发送都是独立的：某一块抛异常或返回 False 只会让这一块失败，
+        后续分块仍会继续尝试。早期实现里任何一块出错就直接冒泡出函数，
+        导致「第 2 块失败 → 第 3 块起全部丢失」，群里只剩半篇报告。
+        """
+        if not report:
+            return await self._send_quiet(
+                umo,
+                "⚠️ 未启用大模型分析或模型不可用，仅提供上述比赛概览。",
+                match_id=None,
+            )
+
+        image_url = await self._render_image(report)
+        if image_url:
+            if await self._send_quiet(umo, None, image_url=image_url):
+                return True
+            logger.warning(
+                f"[dota2] 复盘图片发送失败，回退为文本发送：{umo}"
+            )
+
+        ok = True
+        chunks = self._chunk_text(report)
+        for index, chunk in enumerate(chunks, start=1):
+            # 逐块 try/except：单块失败不能拖垮后面的分块。
+            if not await self._send_quiet(umo, chunk):
+                logger.warning(
+                    f"[dota2] 复盘正文第 {index}/{len(chunks)} 块发送失败：{umo}"
+                )
+                ok = False
+        return ok
+
+    async def _send_quiet(
+        self,
+        umo: str,
+        text: str | None,
+        *,
+        image_url: str | None = None,
+        match_id: int | None = None,
+    ) -> bool:
+        """发送一条消息并把异常收敛成 ``False``。
+
+        统一入口，避免每个调用点各写一遍 try/except——前面就是因为漏了一处，
+        让正文异常直接冒泡到 ``_deliver`` 的外层 except，最后只留在日志里，
+        用户侧完全无感。
+        """
+        try:
+            chain = (
+                MessageChain().file_image(image_url)
+                if image_url
+                else MessageChain().message(text or "")
+            )
+            return await self._send(umo, chain) is not False
+        except Exception as e:  # noqa: BLE001
+            label = f"比赛 {match_id} 的" if match_id is not None else ""
+            logger.error(f"[dota2] 发送{label}消息到 {umo} 失败：{e}")
+            return False
+
+    async def _notify_body_failed(self, umo: str, match_id: int) -> None:
+        """正文发送失败时给一条轻量提示，避免用户以为「只有标题、没有分析」。
+
+        提示本身也走 :meth:`_send_quiet`：连提示都发不出去时只记日志，
+        绝不能再往上报——否则会把「正文失败」升级成「整轮推送失败」。
+        """
+        await self._send_quiet(
+            umo,
+            f"⚠️ 比赛 {match_id} 的复盘正文未能发出（平台发送通道异常），"
+            f"上方为比赛概览。可用 `/d2 单场 {match_id}` 重新获取完整报告。",
+            match_id=match_id,
+        )
 
     async def _send(self, umo: str, chain: MessageChain) -> bool | None:
         """发送单条消息并归一化返回值（不同版本 AstrBot 的返回契约不一致）。"""
@@ -2570,8 +2832,13 @@ class Dota2Plugin(Star):
                 logger.debug(f"[dota2] 构造 At 消息失败，回退为纯文本：{e}")
 
         ok = True
-        for chunk in self._chunk_text(text):
-            if await self._send(umo, MessageChain().message(chunk)) is False:
+        chunks = self._chunk_text(text)
+        for index, chunk in enumerate(chunks, start=1):
+            # 与正文一致：单块失败（含抛异常）不拖垮后续分块。
+            if not await self._send_quiet(umo, chunk):
+                logger.warning(
+                    f"[dota2] 概览第 {index}/{len(chunks)} 块发送失败：{umo}"
+                )
                 ok = False
         return ok
 

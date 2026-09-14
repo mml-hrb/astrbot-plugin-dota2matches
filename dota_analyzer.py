@@ -2,13 +2,17 @@
 
 职责：
 1. 把 OpenDota 的数据拼装成结构化的提示词（Prompt）；
-2. 通过 AstrBot 的 Provider 接口拿到模型回复。
+2. 通过 AstrBot 的 Provider 接口，或插件自带的 OpenAI 兼容通道拿到模型回复。
 
 本模块不直接依赖具体平台，只依赖 AstrBot 的 ``Context``。
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
+import urllib.error
+import urllib.request
 from typing import Any
 
 from astrbot.api import logger
@@ -267,3 +271,236 @@ async def call_llm(provider: Any, system_prompt: str, user_prompt: str) -> str:
     if not text:
         raise RuntimeError("模型返回了空结果")
     return text
+
+
+# ======================================================================
+# 插件自带的 OpenAI 兼容通道
+# ======================================================================
+#: 常见服务商的默认接口地址，方便用户在配置里只填 key
+PROVIDER_PRESETS: dict[str, str] = {
+    "openai": "https://api.openai.com/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "moonshot": "https://api.moonshot.cn/v1",
+    "dashscope": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "zhipu": "https://open.bigmodel.cn/api/paas/v4",
+    "siliconflow": "https://api.siliconflow.cn/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "ollama": "http://127.0.0.1:11434/v1",
+}
+
+#: 归一化 provider 名 → 预设 key 的别名表。
+#: 用户可能写成「DeepSeek」「deep_seek」「深度求索」等，这里都收敛到 canonical 名。
+PRESET_ALIASES: dict[str, str] = {
+    "openai": "openai",
+    "azure": "openai",
+    "deepseek": "deepseek",
+    "deep_seek": "deepseek",
+    "深度求索": "deepseek",
+    "moonshot": "moonshot",
+    "kimi": "moonshot",
+    "月之暗面": "moonshot",
+    "dashscope": "dashscope",
+    "qwen": "dashscope",
+    "通义": "dashscope",
+    "阿里": "dashscope",
+    "zhipu": "zhipu",
+    "glm": "zhipu",
+    "智谱": "zhipu",
+    "siliconflow": "siliconflow",
+    "硅基流动": "siliconflow",
+    "openrouter": "openrouter",
+    "ollama": "ollama",
+}
+
+
+class LLMRequestError(RuntimeError):
+    """自建通道调用失败（网络、鉴权、限流、返回体异常等）。"""
+
+
+def normalize_base_url(raw: str, provider_hint: str = "") -> str:
+    """把用户填的地址或服务商名归一成可用的 base_url。
+
+    允许三种写法：
+    * 完整地址（``https://api.deepseek.com/v1``）→ 原样去尾斜杠；
+    * 只写服务商名（``deepseek`` / ``kimi``）→ 查 :data:`PROVIDER_PRESETS`；
+    * 留空 → 结合 ``provider_hint`` 再查一次，仍无则回退 OpenAI 官方。
+
+    末尾的 ``/chat/completions`` 会被剥掉，避免用户误把完整端点填进来。
+    """
+    value = (raw or "").strip()
+    if value and "://" not in value:
+        key = PRESET_ALIASES.get(value.lower().replace("-", "_").replace(" ", ""))
+        key = key or PRESET_ALIASES.get((provider_hint or "").strip().lower())
+        if key:
+            return PROVIDER_PRESETS[key]
+
+    if not value:
+        key = PRESET_ALIASES.get((provider_hint or "").strip().lower())
+        return PROVIDER_PRESETS.get(key, PROVIDER_PRESETS["openai"])
+
+    value = value.rstrip("/")
+    for suffix in ("/chat/completions", "/completions"):
+        if value.endswith(suffix):
+            value = value[: -len(suffix)]
+            break
+    return value.rstrip("/")
+
+
+class OpenAICompatibleClient:
+    """极简的 OpenAI 兼容 ``/chat/completions`` 客户端。
+
+    只依赖标准库：插件因此不必新增 ``openai`` / ``aiohttp`` 之类的依赖，
+    也不会和 AstrBot 自带的 HTTP 栈产生版本冲突。请求放在线程里跑，
+    不阻塞事件循环。
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str = "",
+        model: str = "",
+        *,
+        timeout: float = 120.0,
+        provider_hint: str = "",
+        proxy: str = "",
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
+        self.api_key = (api_key or "").strip()
+        self.base_url = normalize_base_url(base_url, provider_hint)
+        self.model = (model or "").strip()
+        self.timeout = max(5.0, float(timeout))
+        self.proxy = (proxy or "").strip()
+        self.extra_headers = dict(extra_headers or {})
+
+    @property
+    def endpoint(self) -> str:
+        return f"{self.base_url}/chat/completions"
+
+    def build_payload(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> dict:
+        """组装请求体。"""
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt or ""},
+                {"role": "user", "content": user_prompt or ""},
+            ],
+            "stream": False,
+        }
+        if temperature is not None:
+            payload["temperature"] = float(temperature)
+        if max_tokens:
+            payload["max_tokens"] = int(max_tokens)
+        return payload
+
+    def _request_sync(self, payload: dict) -> str:
+        """同步发一次请求（由 :meth:`chat` 放进线程池执行）。"""
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+            "Accept": "application/json",
+            # 部分中转站会校验 UA，这里给一个常规值
+            "User-Agent": "astrbot-plugin-dota2/1.4",
+        }
+        headers.update(self.extra_headers)
+
+        request = urllib.request.Request(
+            self.endpoint, data=body, headers=headers, method="POST"
+        )
+        # 按需挂代理：走 handler 而不是全局 ``urlopen``，避免影响其他插件的请求
+        opener = None
+        if self.proxy:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler(
+                    {"http": self.proxy, "https": self.proxy}
+                )
+            )
+        send = opener.open if opener is not None else urllib.request.urlopen
+        try:
+            with send(request, timeout=self.timeout) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", "replace")[:400]
+            except Exception:  # noqa: BLE001
+                detail = ""
+            raise LLMRequestError(
+                f"HTTP {e.code} {e.reason}"
+                + (f"：{detail}" if detail else "")
+            ) from e
+        except urllib.error.URLError as e:
+            raise LLMRequestError(f"无法连接 {self.endpoint}：{e.reason}") from e
+        except asyncio.TimeoutError as e:  # pragma: no cover - 由线程内抛出
+            raise LLMRequestError(f"请求超时（{self.timeout:g}s）") from e
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise LLMRequestError(f"返回体不是合法 JSON：{raw[:200]}") from e
+
+        return self.parse_response(data)
+
+    @staticmethod
+    def parse_response(data: dict) -> str:
+        """从返回体里取出正文，兼容几种常见的字段布局。"""
+        # 有些服务在 200 里塞 error
+        if isinstance(data, dict) and data.get("error"):
+            err = data["error"]
+            msg = err.get("message") if isinstance(err, dict) else str(err)
+            raise LLMRequestError(f"接口返回错误：{msg}")
+
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not choices:
+            raise LLMRequestError(f"返回体里没有 choices：{str(data)[:200]}")
+
+        first = choices[0] or {}
+        message = first.get("message") or {}
+        text = message.get("content")
+        if text is None:
+            # 少数实现把结果放在 text / delta 里
+            text = first.get("text") or (first.get("delta") or {}).get("content")
+        if isinstance(text, list):
+            # 多模态返回：拼接其中的文本片段
+            text = "".join(
+                part.get("text", "")
+                for part in text
+                if isinstance(part, dict)
+            )
+        text = (text or "").strip()
+        if not text:
+            raise LLMRequestError("模型返回了空内容")
+        return text
+
+    async def chat(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
+        """调用模型并返回正文。
+
+        Raises:
+            LLMRequestError: 缺少 key/model、网络异常或返回体不可解析。
+        """
+        if not self.api_key:
+            raise LLMRequestError("未配置 API Key")
+        if not self.model:
+            raise LLMRequestError("未配置模型名称")
+
+        payload = self.build_payload(
+            system_prompt,
+            user_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return await asyncio.to_thread(self._request_sync, payload)

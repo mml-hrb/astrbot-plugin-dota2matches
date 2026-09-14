@@ -78,7 +78,57 @@
     "type": "string",
     "default": "",
     "_special": "select_provider",
-    "hint": "留空则使用当前会话默认的模型提供商。"
+    "hint": "留空则使用当前会话默认的模型提供商。若配置了下面的「专用 API Key」，本项仅在专用通道不可用时作回退。"
+  },
+  "llm_api_key": {
+    "description": "插件专用 API Key",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "obvious_hint": true,
+    "hint": "供「分析 / 单场 / 监听推送」的报告生成使用。填写后优先走此通道，不再依赖 AstrBot 的模型配置；留空则回退到上面的提供商。仅支持 OpenAI 兼容接口。填完可用「/d2 模型测试」自检连通性。"
+  },
+  "llm_base_url": {
+    "description": "专用模型接口地址",
+    "type": "string",
+    "default": "",
+    "hint": "OpenAI 兼容的 base_url，例如 https://api.deepseek.com/v1 。也可只填服务商名（deepseek / kimi / qwen / zhipu / siliconflow / openrouter / ollama），会自动补全。留空则用 OpenAI 官方地址。"
+  },
+  "llm_model": {
+    "description": "专用模型名称",
+    "type": "string",
+    "default": "",
+    "hint": "例如 deepseek-chat 、gpt-4o-mini 、qwen-plus 。使用专用 API Key 时必填。"
+  },
+  "llm_temperature": {
+    "description": "专用模型采样温度",
+    "type": "float",
+    "default": 0.7,
+    "hint": "0~2，越低越稳定。复盘类分析建议 0.3~0.7。仅对专用 API Key 通道生效。"
+  },
+  "llm_max_tokens": {
+    "description": "专用模型最大输出长度",
+    "type": "int",
+    "default": 0,
+    "hint": "0 表示不限制（由服务商默认值决定）。报告被截断时可调大，例如 4096。仅对专用 API Key 通道生效。"
+  },
+  "llm_timeout": {
+    "description": "专用模型请求超时（秒）",
+    "type": "int",
+    "default": 120,
+    "hint": "长报告生成较慢，建议不低于 60 秒。仅对专用 API Key 通道生效。"
+  },
+  "llm_proxy": {
+    "description": "专用模型 HTTP 代理",
+    "type": "string",
+    "default": "",
+    "hint": "例如 http://127.0.0.1:7890 。留空表示不使用代理（不跟随上面的 http_proxy）。"
+  },
+  "llm_fallback_on_error": {
+    "description": "专用通道失败时回退 AstrBot 模型",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，专用 API Key 调用失败（网络/鉴权/限流）会自动改用 AstrBot 的提供商重试一次；关闭则直接报错不做分析。"
   },
   "analysis_system_prompt": {
     "description": "分析报告系统提示词",
@@ -201,6 +251,12 @@
     "type": "int",
     "default": 20,
     "hint": "同时等待解析的「比赛 + 焦点玩家」条目上限。超出后会暂时让出最旧的条目，下一轮重新入队，不会漏推。"
+  },
+  "watch_max_deliver_attempts": {
+    "description": "同一场比赛最大推送尝试次数",
+    "type": "int",
+    "default": 10,
+    "hint": "数据已就绪但消息始终发不出去时（例如平台发送通道异常），连续失败超过该次数就放弃这场比赛，避免反复重试。注意：复盘正文发送失败不会触发重试，只有标题都发不出去才计数。"
   },
   "watch_max_per_session": {
     "description": "单会话监听数量上限",

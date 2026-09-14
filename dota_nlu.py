@@ -197,6 +197,12 @@ INTENT_KEYWORDS: dict[str, dict[str, int]] = {
         "订阅列表": 5,
         "都在监听谁": 5,
     },
+    "llmtest": {
+        "模型测试": 5,
+        "模型自检": 5,
+        "测试模型": 5,
+        "检查模型": 4,
+    },
 }
 
 #: 否定词：出现时把「绑定 / 监听」翻成对应的取消动作。
@@ -236,6 +242,7 @@ INTENT_LABELS: dict[str, str] = {
     "watch": "监听玩家，比赛结束后自动推送分析（需要昵称或账号 ID）",
     "unwatch": "取消监听（需要昵称、账号 ID，或「全部」）",
     "watchlist": "查看本会话的监听列表",
+    "llmtest": "测试插件专用的大模型 API Key 是否配置正确（连通性自检）",
 }
 
 
@@ -641,7 +648,7 @@ def _build_intent(
     if name == "forceparse":
         # 催解析只关心比赛 ID，没有 ID 就没有意义（由入口提示怎么补）
         return Intent(name, str(match_id) if match_id else "", score, "rule", detail)
-    if name in {"help", "my", "bindings", "unbind", "watchlist"}:
+    if name in {"help", "my", "bindings", "unbind", "watchlist", "llmtest"}:
         # 取消监听 / 解绑支持「全部」
         if name == "unwatch" and re.search(r"全部|所有|都取消|清掉|清空", text):
             return Intent(name, "全部", score, "rule", detail)
@@ -718,7 +725,7 @@ def parse_classifier_reply(reply: str) -> Intent | None:
     matched = re.search(r"\d{6,20}", target)
     if name == "match":
         args = str(match_id) if match_id else (matched.group(0) if matched else "")
-    elif name in {"help", "my", "bindings", "unbind", "watchlist"}:
+    elif name in {"help", "my", "bindings", "unbind", "watchlist", "llmtest"}:
         args = ""
     elif name in {"matches", "analyze"}:
         parts = []

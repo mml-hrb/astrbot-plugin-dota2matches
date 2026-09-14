@@ -191,6 +191,50 @@
 数据会落盘在 `AstrBot/data/plugin_data/astrbot_plugin_dota2/bindings.json`，
 重启后监听关系依然有效。
 
+### 模型自检
+
+```
+/d2 模型测试                     # 自检专用 API Key 通道是否可用
+```
+
+用一次极短请求探通模型通道，回显接口地址、模型名、耗时；失败时给出具体错误
+（HTTP 状态码 / 连接情况）和对应的排查建议。没配专用 Key 时会说明当前走的是
+AstrBot 提供商，并实测一次该通道。
+
+## 用你自己的模型跑报告（可选）
+
+默认情况下，AI 报告用的是 AstrBot 里配置的模型。如果你想让 **Dota2 插件的报告单独走一个通道**
+（例如换成更便宜的 `deepseek-chat`，而机器人闲聊仍用原来的模型），在插件配置里填
+「插件专用 API Key」即可。
+
+三步搞定：
+
+1. **填 Key**：`llm_api_key` = 你的 API Key；
+2. **填地址**：`llm_base_url` 可以直接填服务商名（会自动补全），也可以填完整 base_url：
+
+   | 服务商名 | 实际地址 |
+   |----------|----------|
+   | `deepseek` | `https://api.deepseek.com/v1` |
+   | `kimi` / `moonshot` | `https://api.moonshot.cn/v1` |
+   | `qwen` / `dashscope` | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+   | `zhipu` / `glm` | `https://open.bigmodel.cn/api/paas/v4` |
+   | `siliconflow` | `https://api.siliconflow.cn/v1` |
+   | `openrouter` | `https://openrouter.ai/api/v1` |
+   | `ollama` | `http://127.0.0.1:11434/v1` |
+
+   中转站 / 自建网关直接填完整地址（到 `/v1` 为止，不要带 `/chat/completions`）。
+3. **填模型名**：`llm_model`，例如 `deepseek-chat`、`gpt-4o-mini`、`qwen-plus`。
+
+填完在群里发 **`/d2 模型测试`** 自检一次，会回显接口地址、模型名、耗时，失败时给出具体错误和排查建议。
+
+行为约定：
+
+- 只对「分析 / 单场 / 监听推送」的报告生效；自然语言的意图识别仍用 AstrBot 默认模型；
+- 配了专用 Key 但调用失败时，默认自动回退到 AstrBot 的模型重试一次（可用
+  `llm_fallback_on_error` 关闭）；
+- 不填专用 Key 时行为与以前完全一致，不影响现有部署；
+- 只依赖 Python 标准库实现，不新增第三方依赖。
+
 ## 配置项
 
 在 AstrBot 管理面板的插件配置页可视化修改。
@@ -205,7 +249,15 @@
 | `default_match_count` | 20 | 默认查询/分析场次 |
 | `max_match_count` | 50 | 允许的最大场次 |
 | `enable_llm_analysis` | true | 关闭后只输出整理好的原始数据 |
-| `llm_provider_id` | 空 | 指定用于分析的模型，留空用会话默认模型 |
+| `llm_provider_id` | 空 | 指定用于分析的模型，留空用会话默认模型。配了专用 API Key 后，本项仅作回退 |
+| `llm_api_key` | 空 | 插件专用 API Key（OpenAI 兼容）。填了就优先走自己的通道，留空回退 AstrBot |
+| `llm_base_url` | 空 | 专用通道接口地址；也可只填服务商名（`deepseek`/`kimi`/`qwen`/`zhipu`/`siliconflow`/`openrouter`/`ollama`）自动补全 |
+| `llm_model` | 空 | 专用通道模型名，如 `deepseek-chat`。使用专用 Key 时必填 |
+| `llm_temperature` | 0.7 | 专用通道采样温度，复盘建议 0.3~0.7 |
+| `llm_max_tokens` | 0 | 专用通道最大输出长度，0 = 不限制。报告被截断时可调大 |
+| `llm_timeout` | 120 | 专用通道请求超时（秒），建议不低于 60 |
+| `llm_proxy` | 空 | 专用通道专用代理，留空不跟随 `http_proxy` |
+| `llm_fallback_on_error` | true | 专用通道失败时是否自动回退 AstrBot 提供商重试一次 |
 | `analysis_system_prompt` | 内置 | 分析报告的系统提示词，可自定义人设与输出规范 |
 | `analysis_as_image` | true | 长报告转图片发送；t2i 不可用时自动回退为文本 |
 | `max_message_length` | 1500 | 单条消息字符上限，超出自动拆分 |
@@ -283,6 +335,8 @@ python tests/focus_check.py          # 单场「焦点玩家深入数据」（�
 python tests/event_takeover_check.py # 事件接管（直发 + 终止传播）的行为校验
 python tests/nlu_check.py            # 自然语言入口：意图识别 + 端到端分发
 python tests/parse_wait_check.py     # 催解析 + 等待解析：成功 / 超时 / 跳过 / 并发
+python tests/watch_deliver_check.py  # 监听推送：标题推进基线、正文回退与逐块收敛
+python tests/llm_channel_check.py    # 专用模型 API Key：地址归一 / 返回体解析 / 回退优先级
 python tests/od_data_probe.py        # 真实拉取指定比赛的 od_data，探查解析状态
 ```
 
