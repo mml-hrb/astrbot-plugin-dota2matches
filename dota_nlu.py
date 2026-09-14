@@ -10,9 +10,12 @@
    ``XX 的战绩`` 这类明确句式时才抽取；其余情况一律不指定目标，让插件
    回落到「当前会话的绑定」，这既安全也符合大多数真实用法。
 
-对外只暴露三个入口：
+对外只暴露四个入口：
 
 * :func:`parse` —— 规则解析，返回 :class:`Intent` 或 ``None``；
+* :func:`normalize` —— 文本归一化（去 @、压空白）；
+* :func:`strip_wake_keyword` —— 检测并剥离唤醒词（如「dota2助手」），
+  让插件只在被明确点名时才抢答；
 * :func:`build_classifier_prompt` / :func:`parse_classifier_reply`
   —— 可选的大模型兜底分类（规则没把握时才用）。
 """
@@ -289,24 +292,39 @@ COUNT_RE = re.compile(
     r"(?:最近|近|看|查|分析|拉|给|取|来|最近)?\s*"
     r"(\d{1,3}|[一二两三四五六七八九十]{1,3})\s*(?:场|把|局|盘|条)"
 )
+
+#: 场次描述（「最近 20 把」「近 10 场」）出现在目标片段里一定是误抓 ——
+#: 昵称不会长成「20把」。清洗目标时直接把这部分剃掉，避免把场次当昵称
+#: 去搜索（搜不到还会白耗一次接口调用）。
+COUNT_TOKEN_RE = re.compile(r"(?:最近|近|前)?\s*\d{1,3}\s*(?:场|把|局|盘|条)")
 CN_NUM = {
     "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
     "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
 }
 
-#: 目标抽取时的前置动词（吃掉它们，剩下的才是昵称）
+#: 目标抽取时的前置动词（吃掉它们，剩下的才是昵称）。
+#:
+#: 注意：正则的备选是**先匹配先赢**，所以长词必须排在短词前面。早期把
+#: ``分析`` 排在 ``分析一下`` 前面，导致「分析一下天鸽的打法」只被吃掉
+#: 「分析」，剩下「一下天鸽的打法」，「一下」于是被当成昵称的一部分——
+#: 这类错位很难从代码看出来，只能靠用例兜住。
 TARGET_PREFIX_RE = re.compile(
     r"^\s*(?:帮我|给我|我想|我想要|麻烦|请|能不能|可以)?\s*"
-    r"(?:查|查询|查一下|查查|查下|看看|看下|看一下|看一看|看|分析|分析下|分析一下|"
-    r"复盘|复盘下|搜|搜一下|搜索|来个|来一下|整个|搞个|发|发一下|给个|拉一下|拉|"
-    r"统计|统计下|总结|总结下)?\s*"
+    r"(?:分析一下|分析下|分析|"
+    r"查一下|查查|查下|查询|查|"
+    r"看一下|看一看|看看|看下|看|"
+    r"复盘一下|复盘下|复盘|"
+    r"总结一下|总结下|总结|统计一下|统计下|统计|"
+    r"搜一下|搜搜|搜下|搜索|搜|"
+    r"来一下|来个|整个|搞个|发一下|发|给个|拉一下|拉)?\s*"
 )
 
 #: 「XX 的战绩 / 表现 / 英雄池…」句式
 TARGET_OF_RE = re.compile(
     r"([^\s，。!！?？、,]{1,28}?)\s*(?:的|de)?\s*"
     r"(?:战绩|战况|比赛记录|对局记录|数据|资料|个人信息|玩家信息|英雄池|英雄数据|"
-    r"常用英雄|表现|发挥|状态|水平|情况|信息|近期|最近|段位|天梯)"
+    r"常用英雄|表现|发挥|状态|水平|情况|信息|近期|最近|段位|天梯|"
+    r"打法|打法风格|风格|特点)"
 )
 
 #: 「绑定 XX」「监听 XX」这类后面直接跟目标的句式
@@ -396,6 +414,7 @@ NOMINAL_HEAD_WORDS = (
     "战绩", "战况", "比赛记录", "对局记录", "资料", "个人信息", "玩家信息",
     "英雄池", "英雄数据", "常用英雄", "表现", "发挥", "状态", "水平",
     "数据", "信息", "情况", "段位", "天梯", "胜率", "单场", "复盘",
+    "打法", "打法风格", "风格", "特点",
 )
 
 
@@ -468,6 +487,8 @@ def _clean_target(raw: str) -> str:
     """
     target = (raw or "").strip()
     target = TARGET_STRIP_HEAD_RE.sub("", target)
+    # 顺手剃掉「最近20把」这类场次描述：它绝不会是昵称的一部分
+    target = COUNT_TOKEN_RE.sub("", target).strip(" \t的了地得,，。.、!！?？~～")
     target = TRAILING_QUESTION_RE.sub("", target)
     target = target.strip(" \t的了地得,，。.、!！?？~～")
     # 「天鸽的战绩」→ 剪掉尾巴上的名词修饰，并重做一次人称/语气清洗
@@ -577,6 +598,73 @@ def normalize(text: str) -> str:
     text = AT_RE.sub(" ", text)
     text = SPACE_RE.sub(" ", text)
     return text.strip()
+
+
+# ======================================================================
+# 唤醒词（触发关键词）
+# ======================================================================
+#: 唤醒词两侧需要一并清掉的**软分隔符**：空白，以及中文「。！~」这类
+#: 既可能是标点、也可能是别的插件命令前缀的字符。
+#: 刻意**不含** ``/`` ``!`` ``#`` —— 那些一旦被吃掉，就会绕过上层
+#: 「不截胡指令」的判断（见 :data:`NLU_STRIP_CMD_PREFIXES`）。
+WAKE_TRIM_CHARS = " \t\r\n，,。.、:：;；！!~～-—+*|"
+
+#: 剥离唤醒词后**仍然**以这些字符开头的，视为「给别的插件 / 本插件指令的
+#: 消息」，不截胡。只保留语义明确、基本不会被当标点用的几个前缀
+#: （``！`` ``。`` ``~`` 已归入上面的软分隔符，不在此列）。
+NLU_STRIP_CMD_PREFIXES = ("/", "／", "#")
+
+#: 关键词正则缓存。编译一次即可复用，避免每来一条消息都重新编译。
+#:
+#: 连写关键词时允许插入空白的位置仅限英文/数字与中日韩字符的交界处：
+#: 覆盖「dota2 助手」这类中间多打一个空格的手滑，又不至于把关键词拆成
+#: 一堆单字匹配（那样任何含这些字的句子都会命中，闸门就失效了）。
+_WAKE_CACHE: dict[str, re.Pattern[str]] = {}
+
+
+def _wake_pattern(keyword: str) -> re.Pattern[str]:
+    """把唤醒词编译成正则：忽略大小写，且允许中英文交界处多打空格。"""
+    cached = _WAKE_CACHE.get(keyword)
+    if cached is not None:
+        return cached
+    parts: list[str] = []
+    prev = ""
+    for ch in keyword:
+        if ch.isspace():
+            parts.append(r"\s*")
+            prev = ""
+            continue
+        is_cjk = not ch.isascii()
+        prev_is_cjk = bool(prev) and not prev.isascii()
+        if prev and is_cjk != prev_is_cjk:
+            parts.append(r"\s*")
+        parts.append(re.escape(ch))
+        prev = ch
+    pattern = re.compile("".join(parts), re.IGNORECASE) if parts else re.compile(r"(?!)")
+    _WAKE_CACHE[keyword] = pattern
+    return pattern
+
+
+def strip_wake_keyword(text: str, keyword: str) -> tuple[bool, str]:
+    """检测并剥离唤醒词。
+
+    返回 ``(是否命中, 剥离后的正文)``。关键词为空时视为「未启用唤醒词」，
+    直接返回 ``(False, 原文)``，这样配置里留空也不会把功能整个堵死。
+
+    会一并清掉关键词两侧残留的标点与空白，例如
+    ``「dota2助手，帮我看看战绩」`` → ``(True, "帮我看看战绩")``。
+    """
+    src = text or ""
+    kw = (keyword or "").strip()
+    if not kw or not src:
+        return False, src
+    pattern = _wake_pattern(kw)
+    if not pattern.search(src):
+        return False, src
+    rest = pattern.sub(" ", src)
+    # 关键词在句首/句尾时，剥离后常留下一个连接用的标点，一并去掉
+    rest = rest.strip(WAKE_TRIM_CHARS)
+    return True, rest
 
 
 def _score_all(text: str) -> dict[str, int]:

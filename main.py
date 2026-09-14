@@ -186,6 +186,10 @@ NLU_CONFIRM_TTL = 120
 #: 看到这些开头的消息一律跳过：那是别的插件 / 本插件的指令，不该被截胡。
 NLU_SKIP_PREFIXES = ("/", "／", "!", "！", "#", "。", "~", "～")
 
+#: 唤醒词默认值。自然语言入口是个「全局监听器」，不加约束会抢答别的插件的
+#: 对话（尤其群里），因此默认要求消息里出现这个词才认。
+NLU_DEFAULT_KEYWORD = "dota2助手"
+
 #: 配置中未填写系统提示词时的兜底内容
 DEFAULT_SYSTEM_PROMPT = (
     "你是一位资深的 Dota 2 分析师与教练，擅长从 OpenDota 的对局数据中读出比赛的"
@@ -264,10 +268,16 @@ HELP_TEXT = """🎮 Dota2 数据查询助手（数据来源：STRATZ / OpenDota 
 · 想先排上队、晚点再看，用 `/d2 催解析 <比赛ID>`。
 
 自然语言（不用记指令）：
-· 直接说人话也能用，例如「帮我看看我的战绩」「分析一下天鸽最近的发挥」
-  「这局 8993438099 复盘一下」「催一下 8993438099 的解析」「最近 20 把打得怎么样」；
-· 群聊里需要 @ 机器人 才会响应（可在配置中关闭这个限制）；
-· 群里说「绑定 86745912」这类闲聊式指令时，插件会先确认再执行，避免误触。"""
+· 直接说人话也能用，但**开头要带上唤醒词「dota2助手」**，例如
+  「dota2助手 帮我看看我的战绩」「dota2助手 分析一下天鸽最近的发挥」
+  「dota2助手 这局 8993438099 复盘一下」「dota2助手 最近 20 把打得怎么样」；
+· 唤醒词是为了避免抢答其他插件和群里的闲聊：消息里没有这个词，插件一律不响应
+  （可在配置中改词或关掉这个限制）；
+· 忽略大小写，中间多打空格也认（「Dota2 助手」）；
+· 少了唤醒词也不会打断你——插件什么都不做，消息照常交给默认大模型；
+· 群聊里不写唤醒词时，仍需 @ 机器人 才会响应（可在配置中关闭这个限制）；
+· 群里说「dota2助手 绑定 86745912」这类会改动数据的操作时，插件会先确认再执行；
+· 确认 / 取消可以直接回「确认」「取消」，不需要再带唤醒词。"""
 
 
 def take_over_event(func):
@@ -1045,16 +1055,63 @@ class Dota2Plugin(Star):
             return handler(event, args)
         return handler(event)
 
-    def _nlu_should_handle(self, event: AstrMessageEvent, text: str) -> bool:
-        """判断这条消息要不要交给自然语言入口处理。"""
+    def _nlu_keyword(self) -> str:
+        """当前生效的唤醒词（配置留空则回落到默认值）。"""
+        raw = self.cfg("nlu_keyword", NLU_DEFAULT_KEYWORD)
+        text = str(raw or "").strip()
+        return text or NLU_DEFAULT_KEYWORD
+
+    def _nlu_head_text(self, text: str) -> str:
+        """剥离唤醒词后的正文；没写唤醒词时**原样返回**。
+
+        确认 / 取消这类短回复既可能裸写（「确认」），也可能带着唤醒词
+        （「dota2助手 确认」），用这个函数统一成同一种形态再比较。
+        """
+        _matched, rest = dota_nlu.strip_wake_keyword(text, self._nlu_keyword())
+        return rest
+
+    def _nlu_should_handle(self, event: AstrMessageEvent, text: str) -> str | None:
+        """判断这条消息要不要交给自然语言入口处理。
+
+        返回**真正送去解析的文本**（已剥掉唤醒词），返回 ``None`` 表示不处理。
+
+        自然语言入口是 ``EventMessageType.ALL`` 上的全局监听，不设闸门就会
+        抢答别的插件（以及群里其他人的闲聊）的对话。闸门依次是：
+
+        1. 总开关 ``nlu_enabled``；
+        2. 指令类消息（``/`` 开头等）让给命令 handler；
+        3. 唤醒词：默认要求消息里出现「dota2助手」，命中即剥掉再解析；
+        4. 群聊里没写唤醒词时，仍要求 @ 机器人（``nlu_group_require_at``）。
+
+        第 3 与第 4 步的关系：**唤醒词本身就是一次明确点名**，命中它就等于
+        已经 @ 过机器人，因此不再重复要求 @，避免「又写唤醒词又 @」的双重
+        门槛。反过来，只有 @ 而没写唤醒词的消息会被第 3 步挡掉。
+        """
         if not self.cfg("nlu_enabled", True):
-            return False
+            return None
         text = (text or "").strip()
         if not text:
-            return False
+            return None
         # 指令类消息交给命令 handler，这里不截胡
         if text.startswith(NLU_SKIP_PREFIXES):
-            return False
+            return None
+
+        # ---- 唤醒词闸门 ----
+        keyword_matched = False
+        effective = text
+        if self.cfg("nlu_require_keyword", True):
+            keyword_matched, effective = dota_nlu.strip_wake_keyword(
+                text, self._nlu_keyword()
+            )
+            if not keyword_matched:
+                return None
+            if not effective:
+                # 只发了个唤醒词、没说要求什么：不猜，留给默认大模型
+                return None
+            # 剥掉唤醒词后如果露出的是别的插件/本插件的指令（「dota2助手 /help」），
+            # 同样不截胡 —— 那条消息该由对应的命令 handler 处理。
+            if effective.startswith(dota_nlu.NLU_STRIP_CMD_PREFIXES):
+                return None
 
         # 群聊 / 私聊判断：用消息类型与 umo 双重判断，兼容各适配器。
         # get_message_type 在少数自定义 Event 上可能不存在，因此做了容错。
@@ -1064,15 +1121,15 @@ class Dota2Plugin(Star):
         except Exception:  # noqa: BLE001
             message_type = ""
         is_group = "GROUP_MESSAGE" in message_type or "GroupMessage" in umo
-        if is_group and self.cfg("nlu_group_require_at", True):
+        if is_group and self.cfg("nlu_group_require_at", True) and not keyword_matched:
             # 群里必须 @ 机器人（或使用唤醒前缀，此时 message_str 里已带前缀）。
             # 这条限制能挡掉绝大多数「群里别人随口一说就被插件抢答」的情况。
             try:
                 if not event.is_at_or_wake_command:
-                    return False
+                    return None
             except AttributeError:
-                return False
-        return True
+                return None
+        return effective
 
     async def _nlu_classify_with_llm(
         self, event: AstrMessageEvent, text: str
@@ -1112,11 +1169,15 @@ class Dota2Plugin(Star):
         uid = str(event.get_sender_id())
 
         # ---------- 1. 先处理「确认 / 取消」回复 ----------
+        # 这一步**不受唤醒词限制**：用户的确认是对上一轮已授权操作的收尾，
+        # 再逼他打一遍「dota2助手 确认」是没必要的摩擦。为了两种写法都能用，
+        # 统一拿剥离唤醒词后的正文来比对。
         pending = self._nlu_confirm.get((umo, uid))
         if pending is not None:
+            head = self._nlu_head_text(text)
             if pending[2] < time.time():
                 self._nlu_confirm.pop((umo, uid), None)
-            elif text in NLU_CONFIRM_WORDS:
+            elif head in NLU_CONFIRM_WORDS:
                 name, args, _ = self._nlu_pop_confirm(umo, uid)
                 agen = self._nlu_invoke(name, event, args)
                 if agen is not None:
@@ -1124,19 +1185,21 @@ class Dota2Plugin(Star):
                     async for item in agen:
                         yield item
                 return
-            elif text in NLU_CANCEL_WORDS:
+            elif head in NLU_CANCEL_WORDS:
                 self._nlu_pop_confirm(umo, uid)
                 yield event.plain_result("好的，已取消。")
                 return
 
         # ---------- 2. 该不该处理这条消息 ----------
-        if not self._nlu_should_handle(event, text):
+        # 返回的是剥离唤醒词后的正文（没通过闸门时为 None）
+        effective = self._nlu_should_handle(event, text)
+        if effective is None:
             return
 
         # ---------- 3. 识别意图 ----------
-        intent = dota_nlu.parse(text)
+        intent = dota_nlu.parse(effective)
         if intent is None and self.cfg("nlu_llm_fallback", False):
-            intent = await self._nlu_classify_with_llm(event, text)
+            intent = await self._nlu_classify_with_llm(event, effective)
         if intent is None:
             # 没识别出来：什么都不做，把消息让给默认大模型，避免抢答
             return
@@ -1150,14 +1213,17 @@ class Dota2Plugin(Star):
                 pass  # 取消监听允许不带目标（按当前绑定来）
             elif intent.name == "match":
                 yield event.plain_result(
-                    "复盘单场需要比赛 ID，例如：`这局 8993438099 帮我复盘一下`。\n"
+                    "复盘单场需要比赛 ID，例如："
+                    f"`{self._nlu_keyword()} 这局 8993438099 帮我复盘一下`。\n"
                     "比赛 ID 可以从「我的战绩」里拿，或直接用 Dota 客户端的比赛编号。"
                 )
                 return
             elif intent.name == "forceparse":
                 yield event.plain_result(
-                    "催解析需要指定是哪一局，例如：`催一下 8993438099 的解析`。\n"
-                    "想让插件等解析完再自动出复盘，说「这局 8993438099 复盘一下」即可。"
+                    "催解析需要指定是哪一局，例如："
+                    f"`{self._nlu_keyword()} 催一下 8993438099 的解析`。\n"
+                    "想让插件等解析完再自动出复盘，"
+                    f"说「{self._nlu_keyword()} 这局 8993438099 复盘一下」即可。"
                 )
                 return
             elif intent.name in {"bind", "info", "heroes", "matches", "analyze", "watch"}:
