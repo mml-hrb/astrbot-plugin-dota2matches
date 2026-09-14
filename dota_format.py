@@ -279,7 +279,12 @@ def item_cost(items: dict[str, dict], key: Any) -> int:
 
 
 def is_radiant(player_slot: Any) -> bool:
-    """player_slot < 128 表示天辉。"""
+    """player_slot < 128 表示天辉。
+
+    ``None`` / 无法解析时**默认 True** —— 这是 OpenDota 的历史约定（缺失 slot
+    的多是单人视角数据，按天辉处理）。但要注意：这个默认值会让「未知阵营」
+    被当成天辉，所以**数据源必须保证 player_slot 有值**，别指望这里兜底。
+    """
     try:
         return int(player_slot) < 128
     except (TypeError, ValueError):
@@ -287,7 +292,16 @@ def is_radiant(player_slot: Any) -> bool:
 
 
 def player_win(match: dict) -> bool:
-    """判断该玩家在这场比赛中是否获胜。"""
+    """判断该玩家在这场比赛中是否获胜。
+
+    优先用数据源自带的 ``isVictory`` / ``win``（最权威，不依赖 slot 编码）；
+    没有时再按 ``player_slot`` 推。这样即使某个源的 slot 归一化出了岔子，
+    胜负也不会反 —— 早期 STRATZ 侧 slot 缺失就曾导致「天辉获胜 + 焦点❌负」。
+    """
+    for key in ("isVictory", "is_victory", "win"):
+        flag = match.get(key)
+        if isinstance(flag, bool):
+            return flag
     radiant_win = bool(match.get("radiant_win"))
     return radiant_win if is_radiant(match.get("player_slot")) else not radiant_win
 
@@ -764,7 +778,7 @@ def _player_row(
     side = "天辉" if is_radiant(slot) else "夜魇"
     kda = f"{player.get('kills', 0)}/{player.get('deaths', 0)}/{player.get('assists', 0)}"
     tf = player.get("teamfight_participation")
-    tf_text = f"{float(tf) * 100:.0f}%" if isinstance(tf, (int, float)) else "-"
+    tf_text = f"{float(tf) * 100:.0f}%" if isinstance(tf, (int, float)) and not isinstance(tf, bool) else "-"
     net = fmt_k(player.get("net_worth") or player.get("total_gold") or 0)
 
     inventory = []
@@ -784,7 +798,8 @@ def _player_row(
         f"| 补刀{player.get('last_hits', '-')}/{player.get('denies', '-')} "
         f"| 英雄伤害{fmt_num(player.get('hero_damage', 0))} 塔伤{fmt_num(player.get('tower_damage', 0))} "
         f"治疗{fmt_num(player.get('hero_healing', 0))} | 参团率{tf_text} "
-        f"| 控制{fmt_float(player.get('stuns', 0), 1)}s 假眼{player.get('obs_placed', '-')}/真眼{player.get('sen_placed', '-')} "
+        f"| 控制{_num_or_dash(player.get('stuns'), 1, suffix='s')} "
+        f"假眼{_int_or_dash(player.get('obs_placed'))}/真眼{_int_or_dash(player.get('sen_placed'))} "
         f"| 出装: {', '.join(inventory) or '-'}"
     )
 
@@ -893,9 +908,8 @@ def build_match_data_text(
         lines.append(f"补丁版本代号(patch): {match.get('patch')}")
     if region or cluster:
         lines.append(f"region: {region}　cluster: {cluster}")
-    lines.append(
-        f"数据完整度: {'已解析（含逐分钟经济、团战、出装日志）' if _has_timeseries(players) else '未解析（仅基础统计）'}"
-    )
+    _parsed, _parsed_note = parsed_state(match)
+    lines.append(f"数据完整度: {_parsed_note}")
 
     # 阵容
     lines.append("")
@@ -995,8 +1009,8 @@ def build_match_data_text(
                 lines.append(f"--- 焦点玩家 {index} ---")
             lines.extend(_focus_detail_lines(focus, heroes, item_index, radiant_win))
 
-    # 未解析时补充可用的统计
-    if not _has_timeseries(players):
+    # 未解析时补充提示（与标题行走同一套判据，不会自相矛盾）
+    if not _parsed:
         lines.append("")
         lines.append(
             "注意: 本场尚未被解析，缺少逐分钟经济、团战分布与出装日志，"
@@ -1006,11 +1020,119 @@ def build_match_data_text(
     return "\n".join(lines)
 
 
+def _num_or_dash(value: Any, digits: int = 1, *, suffix: str = "") -> str:
+    """数值缺失时返回 ``-``，而不是把 ``None`` 伪装成 ``0``。
+
+    ``None`` 表示「数据源没给这个字段」（例如未解析时的团战数据），
+    与「确实是 0」是完全不同的语义。把它们都渲染成 0 会误导大模型
+    得出「这名选手参团率为 0」这种错误结论。
+    """
+    if value is None or isinstance(value, bool):
+        return "-"
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if digits <= 0:
+        return f"{int(round(num))}{suffix}"
+    return f"{num:.{digits}f}{suffix}"
+
+
+def _int_or_dash(value: Any) -> str:
+    """整数缺失时返回 ``-``。"""
+    if value is None or isinstance(value, bool):
+        return "-"
+    try:
+        return str(int(value))
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _pct_or_dash(value: Any, digits: int = 1) -> str:
+    """把 0~1 的比例渲染成百分比；缺失时返回 ``-``。"""
+    if value is None or isinstance(value, bool):
+        return "-"
+    try:
+        return f"{float(value) * 100:.{digits}f}%"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _match_has_timeseries(match: dict) -> bool:
+    """这场比赛是否具备「逐分钟」级别的解析产物。
+
+    两个数据源的产物形态不同，这里统一判定，避免出现「标题说已解析、
+    正文说未解析」的自相矛盾：
+
+    - **OpenDota**：解析后会给每名玩家填 ``gold_t``（逐分钟金钱）。
+    - **STRATZ**：不给 ``gold_t``，但会给比赛级的 ``radiant_gold_adv`` /
+      ``radiant_xp_adv`` 曲线（逐分钟经济/经验差）。
+
+    任一存在即视为「有逐分钟数据」。注意本函数只回答「有没有逐分钟曲线」，
+    「是否已解析」的对外口径统一由 :func:`_parsed_state` 给出。
+    """
+    if not isinstance(match, dict):
+        return False
+    # STRATZ：比赛级曲线
+    for key in ("radiant_gold_adv", "radiant_xp_adv"):
+        series = match.get(key)
+        if isinstance(series, list) and series:
+            return True
+    # OpenDota：玩家级逐分钟金钱
+    for player in match.get("players") or []:
+        if isinstance(player, dict) and player.get("gold_t"):
+            return True
+    return False
+
+
 def _has_timeseries(players: list[dict]) -> bool:
+    """兼容旧调用点：只按玩家 ``gold_t`` 判断（OpenDota 口径）。
+
+    新代码请优先用 :func:`_match_has_timeseries`，它同时认 STRATZ 的曲线，
+    不会误判成「未解析」。
+    """
     for player in players:
         if player.get("gold_t"):
             return True
     return False
+
+
+def parsed_state(match: dict) -> tuple[bool, str]:
+    """统一的「解析状态」判定，返回 ``(是否已解析, 人类可读说明)``。
+
+    这是**唯一**的解析口径，标题行与提示词正文都必须用它，否则同一条信息
+    在两处会打架。判定顺序：
+
+    1. 有逐分钟曲线（OpenDota ``gold_t`` 或 STRATZ 的经济/经验曲线）→ 已解析；
+    2. 否则看 ``od_data.has_parsed``（OpenDota 的解析状态对象）；
+    3. 都没有 → 未解析（仅基础统计）。
+    """
+    if not isinstance(match, dict):
+        return False, "未知（无数据）"
+    if _match_has_timeseries(match):
+        # 区分一下来源，方便排查时看出走的是哪条通道
+        dates = []
+        for key in ("radiant_gold_adv", "radiant_xp_adv"):
+            series = match.get(key)
+            if isinstance(series, list) and series:
+                dates.append(f"{len(series)} 分钟")
+        has_gold_t = any(
+            isinstance(p, dict) and p.get("gold_t")
+            for p in (match.get("players") or [])
+        )
+        detail = "含逐分钟经济/经验曲线"
+        if dates:
+            detail += f"（{dates[0]}）"
+        elif has_gold_t:
+            detail += "（玩家 gold_t）"
+        return True, f"已解析（{detail}）"
+
+    od_data = match.get("od_data")
+    if isinstance(od_data, dict) and od_data.get("has_parsed") is True:
+        # 声明已解析，却没有拿到任何逐分钟曲线 —— 说明解析产物不完整。
+        return True, "已解析（未取到逐分钟曲线，团战/出装日志可能缺失）"
+
+    return False, "未解析（仅基础统计）"
 
 
 def _focus_win(player: dict, radiant_win: bool) -> bool:
@@ -1047,18 +1169,19 @@ def _focus_detail_lines(
         f"治疗 {fmt_num(focus.get('hero_healing') or 0)}"
     )
     lines.append(
-        f"参团率 {fmt_float((focus.get('teamfight_participation') or 0) * 100, 1)}% "
-        f"控制时长 {fmt_float(focus.get('stuns') or 0, 1)}s "
+        f"参团率 {_pct_or_dash(focus.get('teamfight_participation'))} "
+        f"控制时长 {_num_or_dash(focus.get('stuns'), 1, suffix='s')} "
         f"击杀建筑 {focus.get('towers_killed', '-')} 击杀肉山 {focus.get('roshans_killed', '-')}"
     )
     lines.append(
-        f"假眼 {focus.get('obs_placed', 0)} 真眼 {focus.get('sen_placed', 0)} "
-        f"堆野 {focus.get('camps_stacked', 0)} 吃符 {focus.get('rune_pickups', 0)} "
+        f"假眼 {_int_or_dash(focus.get('obs_placed'))} 真眼 {_int_or_dash(focus.get('sen_placed'))} "
+        f"堆野 {_int_or_dash(focus.get('camps_stacked'))} "
+        f"吃符 {_int_or_dash(focus.get('rune_pickups'))} "
         f"信使击杀 {focus.get('courier_kills', '-')}"
     )
     lines.append(
         f"分路: {_lane_text(focus)}　"
-        f"补刀效率 {fmt_float(focus.get('lane_efficiency_pct') or 0, 1)}%"
+        f"补刀效率 {_pct_or_dash(focus.get('lane_efficiency_pct'))}"
     )
     killed = focus.get("killed")
     if isinstance(killed, dict):
@@ -1222,14 +1345,19 @@ def match_quality_block(match: dict) -> str:
     duration = int(match.get("duration") or 0)
     total_kills = int(match.get("radiant_score") or 0) + int(match.get("dire_score") or 0)
     peak, minute = peak_gold_advance(match)
-    fights = match.get("teamfights") or []
+    fights = match.get("teamfights")
 
     rows = [
         f"总击杀数: {total_kills}（{(total_kills / max(1, duration / 60)):.2f} 次/分钟）",
         f"时长: {fmt_duration(duration)}",
         f"最大经济领先: {'天辉' if peak >= 0 else '夜魇'} {abs(peak) / 1000:.1f}k @ {minute} 分钟",
-        f"团战次数（5 人以上交战）: {len(fights)}",
     ]
+    # 团战数据只在真的解析出来时才可用。未解析时 teamfights 缺失/为空，
+    # 此时必须说「不可用」；说「0 次」会让模型以为这局没有团战。
+    if isinstance(fights, list) and fights:
+        rows.append(f"团战次数（5 人以上交战）: {len(fights)}")
+    else:
+        rows.append("团战数据: 不可用（该局未产出团战解析数据，请勿据此推断团战次数）")
     swing = gold_adv_metrics(match)
     if swing:
         rows.append(f"经济领先易手次数: {swing['lead_changes']} 次")

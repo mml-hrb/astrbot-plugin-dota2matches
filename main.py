@@ -51,6 +51,7 @@ try:  # 插件目录被作为包加载时的相对导入
         hname,
         mode_text,
         normalize_focus_ids,
+        parsed_state,
         player_win,
         rank_text,
         summarize_hero_history,
@@ -92,6 +93,7 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
         hname,
         mode_text,
         normalize_focus_ids,
+        parsed_state,
         player_win,
         rank_text,
         summarize_hero_history,
@@ -695,6 +697,23 @@ class Dota2Plugin(Star):
         choice = str(self.cfg("data_source_priority", "stratz") or "").strip().lower()
         return choice if choice in self.DATA_SOURCE_CHOICES else "stratz"
 
+    def _source_name(self) -> str:
+        """当前生效的数据源名，用于给用户看的提示文案。
+
+        不要在提示里硬编码「OpenDota」——STRATZ 才是默认主源，
+        写死会让用户拿着错误的线索去排查。
+        """
+        api = getattr(self, "api", None)
+        label = getattr(api, "describe", None)
+        if callable(label):
+            try:
+                text = str(label() or "").strip()
+                if text:
+                    return text
+            except Exception:  # noqa: BLE001
+                pass
+        return "STRATZ" if self._data_source_choice() == "stratz" else "OpenDota"
+
     def _build_data_source(self):
         """按配置组装数据源。
 
@@ -867,9 +886,9 @@ class Dota2Plugin(Star):
             player = await self.api.get_player(account_id)
             if not player:
                 raise TargetNotFoundError(
-                    f"OpenDota 查不到账号 **{account_id}**。\n"
+                    f"{self._source_name()} 查不到账号 **{account_id}**。\n"
                     "常见原因：该账号在 Dota 2 设置中关闭了「公开比赛数据」，"
-                    "或从未被 OpenDota 索引过。"
+                    "或从未被数据源索引过。"
                 )
             profile = player.get("profile") or {}
             return account_id, profile.get("personaname") or f"账号{account_id}"
@@ -888,13 +907,13 @@ class Dota2Plugin(Star):
                 hit_id = int(hits[0]["account_id"])
                 return hit_id, str(hits[0].get("personaname") or f"账号{hit_id}")
 
-        # 昵称：走 OpenDota 搜索
+        # 昵称：走主数据源搜索（STRATZ 优先，不可用时自动降级）
         try:
             results = await self.api.search_player(target)
         except OpenDotaError as e:
             raise TargetNotFoundError(
                 f"昵称搜索失败（{e}）。\n"
-                "OpenDota 的昵称搜索接口偶尔会超时或限流，建议改用"
+                f"{self._source_name()} 的昵称搜索接口偶尔会超时或限流，建议改用"
                 "**32 位账号 ID** 或 **64 位 SteamID**，结果更准确也更稳定。"
             ) from e
         if not results:
@@ -3007,7 +3026,12 @@ class Dota2Plugin(Star):
         """生成比赛概览头部文本。
 
         ``focus_account_ids`` 可以是一位或多位焦点玩家，多位时逐个列出。
+
+        ``parsed`` 参数**已不参与判定**（保留仅为兼容既有调用方）：完整度文案
+        统一由 :func:`parsed_state` 从 ``match`` 推导，确保与 AI 提示词正文
+        用的是同一套口径，不会一个说已解析、一个说未解析。
         """
+        _ = parsed  # 兼容保留：判定改用 parsed_state(match)，见下
         focus_ids = normalize_focus_ids(focus_account_ids)
         radiant_win = bool(match.get("radiant_win"))
         winner = "天辉" if radiant_win else "夜魇"
@@ -3041,9 +3065,9 @@ class Dota2Plugin(Star):
                     f"{'✅胜' if win else '❌负'}"
                 )
 
-        lines.append(
-            f"数据完整度：{'已解析（含逐分钟经济、团战与出装日志）' if parsed else '未解析（仅基础统计）'}"
-        )
+        # 与提示词正文共用同一套判据（parsed_state），避免标题与正文打架
+        _parsed_flag, parsed_note = parsed_state(match)
+        lines.append(f"数据完整度：{parsed_note}")
         return "\n".join(lines)
 
     # ==================================================================

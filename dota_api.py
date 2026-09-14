@@ -517,21 +517,26 @@ class OpenDotaClient:
     def is_parsed(match: dict | None) -> bool:
         """判断一场比赛是否已经具备逐分钟级别的解析数据。
 
-        注意:OpenDota 返回的 ``match["od_data"]`` 是一个**状态对象**(形如
+        判据集中在 :func:`dota_format.parsed_state`，两个数据源共用一套口径：
+
+        - OpenDota 解析后会给每名玩家填 ``gold_t``（逐分钟金钱）；
+        - STRATZ 不给 ``gold_t``，但给比赛级的 ``radiant_gold_adv`` /
+          ``radiant_xp_adv`` 曲线。
+
+        注意: OpenDota 的 ``match["od_data"]`` 是**状态对象**（形如
         ``{"has_api": bool, "has_gcdata": bool, "has_parsed": bool,
-        "has_archive": bool}``),存在并不代表解析完成。必须 ``has_parsed`` 为真
-        **且** 至少一名玩家的 ``gold_t`` 已被填充,才视为真正解析完毕。
+        "has_archive": bool}``），它存在并不代表拿到了逐分钟产物，因此
+        只在没有曲线时才拿它兜底。
         """
         if not isinstance(match, dict):
             return False
-        od_data = match.get("od_data")
-        if isinstance(od_data, dict) and od_data.get("has_parsed") is True:
-            return True
-        players = match.get("players") or []
-        for player in players:
-            if isinstance(player, dict) and player.get("gold_t"):
-                return True
-        return False
+        try:
+            from .dota_format import parsed_state
+        except ImportError:  # 模块方式加载时的兜底
+            from dota_format import parsed_state  # type: ignore[no-redef]
+
+        parsed, _note = parsed_state(match)
+        return parsed
 
 
 # ======================================================================

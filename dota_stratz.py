@@ -346,13 +346,31 @@ class StratzClient:
 
     @classmethod
     def _normalize_player(cls, node: dict, *, include_lobby: bool = False) -> dict:
-        """把 STRATZ 的 MatchPlayerType 映射成 OpenDota 的 player dict。"""
+        """把 STRATZ 的 MatchPlayerType 映射成 OpenDota 的 player dict。
+
+        注意 **`isRadiant` 必须落到 `player_slot` 上**，不能只存一个平行的
+        ``is_radiant`` 字段：下游 ``dota_format.player_win`` / ``is_radiant``
+        读的是 ``player_slot``，而 STRATZ 不直接给这个字段。早期版本这里
+        直接写 ``node.get("playerSlot")``（几乎永远是 ``None``）→
+        ``int(None)`` 走 except 分支默认成「天辉」→ 夜魇玩家被误判为胜方，
+        标题上就出现「天辉获胜」配「❌负」的自相矛盾。
+        """
         account = node.get("steamAccount") or {}
         hero = node.get("hero") or {}
         is_radiant = node.get("isRadiant")
+        if is_radiant is None:
+            # 没有阵营标记时，退回原始 playerSlot（STRATZ 偶有直给）
+            raw_slot = node.get("playerSlot")
+            if raw_slot is not None:
+                try:
+                    is_radiant = int(raw_slot) < 128
+                except (TypeError, ValueError):
+                    is_radiant = None
         out: dict[str, Any] = {
             "account_id": node.get("steamAccountId"),
-            "player_slot": node.get("playerSlot"),
+            # player_slot 统一成 OpenDota 口径：<128 天辉 / >=128 夜魇。
+            # 具体序号在 get_match 里按阵营归类后回填（那边能看到整队）。
+            "player_slot": (0 if is_radiant else 128) if is_radiant is not None else None,
             "hero_id": node.get("heroId"),
             "kills": node.get("kills"),
             "deaths": node.get("deaths"),
@@ -370,13 +388,15 @@ class StratzClient:
             "is_roaming": (str(node.get("lane") or "").upper() == "ROAMING") or None,
             # 附加（OpenDota 侧没有，但提示词里能用上）
             "personaname": account.get("name"),
+            # ``name`` 是下游取昵称的统一字段（OpenDota 用它、提示词用它），
+            # 只给 personaname 会让 STRATZ 侧所有人显示成 "None"。
+            "name": account.get("name"),
             "hero_name": hero.get("displayName"),
             "position": node.get("position"),
             "is_radiant": is_radiant,
+            # 胜负的权威来源（STRATZ 直接给），player_win 会优先用它
+            "isVictory": node.get("isVictory"),
         }
-        if is_radiant is not None:
-            # OpenDota 用 player_slot < 128 == 天辉；这里顺手把 slot 规整一下
-            pass
         return out
 
     @classmethod
@@ -854,20 +874,25 @@ class StratzClient:
             if isinstance(p, dict)
         ]
         # player_slot：OpenDota 用 0~4（天辉）/128~132（夜魇）编码。
-        # STRATZ 的 playerSlot 也是 0~4 / 128~132，但为稳妥起见按阵营重排。
+        # _normalize_player 已按 isRadiant 落下 0 / 128 的阵营标记，
+        # 这里再按阵营顺序回填具体序号，保证同队之间不重复。
+        raw_rows = [p for p in match.get("players") or [] if isinstance(p, dict)]
         radiant_idx = 0
         dire_idx = 0
-        for raw, normalized in zip(
-            [p for p in match.get("players") or [] if isinstance(p, dict)], players
-        ):
-            if raw.get("playerSlot") is not None:
+        for raw, normalized in zip(raw_rows, players):
+            is_radiant = normalized.get("is_radiant")
+            if is_radiant is None:
+                is_radiant = raw.get("isRadiant")
+            if is_radiant is None:
+                # 阵营未知：保留 None，让下游的判据显式判定而不是默认天辉
                 continue
-            if raw.get("isRadiant"):
+            if is_radiant:
                 normalized["player_slot"] = radiant_idx
                 radiant_idx += 1
             else:
                 normalized["player_slot"] = 128 + dire_idx
                 dire_idx += 1
+            normalized["is_radiant"] = bool(is_radiant)
 
         radiant_win = match.get("didRadiantWin")
         radiant_kills = match.get("radiantKills") or []
@@ -916,7 +941,14 @@ class StratzClient:
     def is_parsed(match: dict | None) -> bool:
         """判断比赛是否已解析。
 
-        复用 OpenDota 侧同一套判据（``od_data.has_parsed`` 或玩家 ``gold_t``），
-        因此 :meth:`get_match` 里塞了等价的 ``od_data``。
+        与 OpenDota 侧共用 :func:`dota_format.parsed_state` 这一套**唯一**判据，
+        它会同时认 OpenDota 的玩家 ``gold_t`` 和 STRATZ 的比赛级经济/经验曲线。
+        这样「标题行」与「提示词正文」不会再出现一个说已解析、一个说未解析。
         """
-        return OpenDotaClient.is_parsed(match)
+        try:
+            from .dota_format import parsed_state
+        except ImportError:  # 模块方式加载时的兜底
+            from dota_format import parsed_state  # type: ignore[no-redef]
+
+        parsed, _note = parsed_state(match or {})
+        return parsed
