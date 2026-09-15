@@ -5,7 +5,7 @@
 2. 查询最近战绩；
 3. 调用大模型分析近期表现与打法风格（默认最近 20 场，场次可调）；
 4. 调用大模型深度复盘单场比赛（比赛走势、质量评估、十人点评）；
-5. 监听玩家，对有详细数据的新比赛自动生成分析并推送到绑定会话，支持解绑。
+5. 监听玩家，比赛结束后自动推送一条「胜负 + KDA + 近期战绩对照」的短评到会话，支持解绑。
 
 数据来源：OpenDota API（https://docs.opendota.com/）
 """
@@ -26,8 +26,10 @@ try:  # 插件目录被作为包加载时的相对导入
     from .dota_analyzer import (
         LLMRequestError,
         OpenAICompatibleClient,
+        WATCH_COMMENT_SYSTEM_PROMPT,
         build_recent_analysis_prompt,
         build_single_match_analysis_prompt,
+        build_watch_comment_prompt,
         call_llm,
         resolve_provider,
     )
@@ -69,8 +71,10 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
     from dota_analyzer import (  # type: ignore[no-redef]
         LLMRequestError,
         OpenAICompatibleClient,
+        WATCH_COMMENT_SYSTEM_PROMPT,
         build_recent_analysis_prompt,
         build_single_match_analysis_prompt,
+        build_watch_comment_prompt,
         call_llm,
         resolve_provider,
     )
@@ -121,11 +125,7 @@ PLUGIN_NAME = "astrbot_plugin_dota2"
 #: 否则 ``next_try_at`` 设成 60s 也要等满一个轮询周期才会被兑现。
 PENDING_TICK_SECONDS = 30
 
-#: 连续第几次「已收录但未解析」时重新提交一次解析申请。
-#: OpenDota 的解析任务可能丢单，只申请一次不够稳。
-REPARSE_REQUEST_EVERY = 5
-
-#: 监听推送时，最多为几位焦点玩家附带「近期状态」上下文。
+#: 监听推送时，最多为几位焦点玩家附带「近期战绩」上下文。
 #: 同一局里被监听的玩家越多，这几段统计就会把提示词撑得越长，因此设上限。
 MAX_FOCUS_RECENT_CONTEXT = 4
 
@@ -244,7 +244,7 @@ HELP_TEXT = """🎮 Dota2 数据查询助手（数据来源：STRATZ / OpenDota 
 /d2 催解析 <比赛ID>　　　　　 只催 OpenDota 解析这局，不等结果
 
 【监听】
-/d2 监听 [目标]　　　　　　　 比赛结束后自动推送分析到本会话
+/d2 监听 [目标]　　　　　　　 比赛结束后自动推送一条简短点评到本会话
 /d2 取消监听 <目标 | 全部>　　取消你自己添加的监听
 /d2 监听列表　　　　　　　　　查看本会话的监听
 
@@ -257,7 +257,9 @@ HELP_TEXT = """🎮 Dota2 数据查询助手（数据来源：STRATZ / OpenDota 
 说明：
 · 「目标」可以填昵称、32 位账号 ID 或 64 位 SteamID；
 · 不填「目标」时，默认使用你在当前会话绑定的账号；
-· 一局比赛只分析一次：若这场比赛里有多位被监听的玩家，报告会对他们逐一深入点评；
+· 一局比赛只点评一次：若这场比赛里有多位被监听的玩家，会在一段短评里逐一点到；
+· 监听推送只给「胜负 + KDA + 近期战绩对照」的几句话，不占用录像解析、不用等；
+  要看深度复盘（走势、团战、出装）请用 `/d2 单场 <比赛ID>`；
 · 「绑定列表」中他人的账号与用户 ID 默认打码，保护群聊隐私；
 · 想让查询结果更好看，可以在配置中调整「长报告转为图片发送」。
 
@@ -757,17 +759,21 @@ class Dota2Plugin(Star):
                 continue
         return picked
 
-    async def _build_recent_context(
+    async def _recent_summary_blocks(
         self,
         match_id: int,
         focus_ids: list[int],
         focus_names: dict[int, str],
         heroes: dict[int, dict],
-    ) -> str:
-        """为焦点玩家拼出「本场之外的近期状态」上下文块。"""
+    ) -> list[str]:
+        """拼出几位焦点玩家「本场之外的近期战绩」文本块（每人一段）。
+
+        用于两处：单场深度复盘的「附加上下文」，以及监听短评里判断
+        「这局是不是正常发挥」的对照数据。
+        """
         recent_count = max(0, int(self.cfg("watch_match_analysis_count", 10)))
         if not focus_ids or not recent_count:
-            return ""
+            return []
         blocks: list[str] = []
         for focus_id in focus_ids[:MAX_FOCUS_RECENT_CONTEXT]:
             label = focus_names.get(focus_id) or focus_id
@@ -794,6 +800,19 @@ class Dota2Plugin(Star):
                 f"（用于判断本场是他的正常发挥还是异常）：\n"
                 + format_summary_block(summary, heroes)
             )
+        return blocks
+
+    async def _build_recent_context(
+        self,
+        match_id: int,
+        focus_ids: list[int],
+        focus_names: dict[int, str],
+        heroes: dict[int, dict],
+    ) -> str:
+        """为单场深度复盘拼出「本场之外的近期状态」上下文块（含报告尾部要求）。"""
+        blocks = await self._recent_summary_blocks(
+            match_id, focus_ids, focus_names, heroes
+        )
         if not blocks:
             return ""
         return "\n\n".join(blocks) + (
@@ -2340,7 +2359,7 @@ class Dota2Plugin(Star):
         pending = list(self._pending.values())
         if pending:
             lines.append("")
-            lines.append(f"⏳ 当前有 {len(pending)} 场比赛正在等待详细数据：")
+            lines.append(f"⏳ 当前有 {len(pending)} 场比赛正在等待数据源收录：")
             for item in pending[:5]:
                 focus_label = "、".join(
                     str(focus.get("name") or focus.get("account_id"))
@@ -2349,8 +2368,7 @@ class Dota2Plugin(Star):
                 lines.append(
                     f"　　· 比赛 {item['match_id']}"
                     f"（焦点：{focus_label or '未知'}）"
-                    f"　等收录 {item.get('wait_attempts', 0)} 次 / "
-                    f"等解析 {item.get('parse_attempts', 0)} 次"
+                    f"　等收录 {item.get('wait_attempts', 0)} 次"
                 )
         yield event.plain_result("\n".join(lines))
 
@@ -2796,16 +2814,16 @@ class Dota2Plugin(Star):
         targets: list[dict],
         focus_name: str = "",
     ) -> None:
-        """把「一场比赛」加入待推送队列（等待详细数据就绪）。
+        """把「一场比赛」加入待推送队列（等待数据源收录）。
 
         队列键就是 ``match_id``：**同一局比赛只保留一项**。当群里多位成员各自
         监听了不同的玩家、而这几位玩家又恰好打了同一局时，老实现会按
         ``(match_id, account_id)`` 拆成多份，于是同一场比赛被重复调用大模型、
-        在群里刷好几份几乎一样的报告。现在他们共用一份分析与一次推送。
+        在群里刷好几份几乎一样的推送。现在他们共用一份短评与一次推送。
 
         每位焦点玩家在 ``focuses`` 里各占一项，以自己为焦点收集 ``targets``；
-        分析时把所有人的 account_id 一起交给提示词，报告里对每个人分别给出
-        深入数据，因此既不重复分析、也不会互相覆盖焦点。
+        生成短评时把所有人的 account_id 一起交给提示词，对每个人分别点一句，
+        因此既不重复调用模型、也不会互相覆盖焦点。
         """
         item = self._pending.get(match_id)
         if item is None:
@@ -2814,10 +2832,8 @@ class Dota2Plugin(Star):
                 "match_id": match_id,
                 #: 本局中所有被监听的玩家：``[{"account_id", "name", "targets"}]``
                 "focuses": [],
-                #: 比赛还没被 OpenDota 收录的次数（不消耗解析配额）
+                #: 比赛还没被数据源收录的次数（收录是这里唯一要等的东西）
                 "wait_attempts": 0,
-                #: 已收录但还没有逐分钟解析数据的次数
-                "parse_attempts": 0,
                 #: 投递尝试次数。数据都就绪、但标题始终发不出去时（例如平台侧一直
                 #: 报错），超过上限就放弃这场比赛，避免无限重试刷屏。
                 "deliver_attempts": 0,
@@ -2878,9 +2894,8 @@ class Dota2Plugin(Star):
             return
 
         # 单轮内共享：一局比赛无论有多少位被监听的玩家参战，都只拉一次比赛详情、
-        # 只提交一次解析申请（解析接口按 10 倍额度计费）、只调用一次大模型。
+        # 只调用一次大模型。
         match_cache: dict[int, dict | None] = {}
-        parse_requested: set[int] = set()
 
         for item in due:
             # due 是一次性算好的，期间另一个并发的检查可能已经把这一项处理掉了，
@@ -2895,7 +2910,7 @@ class Dota2Plugin(Star):
             # 同时投递同一场比赛，造成重复推送。
             item["processing"] = True
             try:
-                await self._try_deliver(item, match_cache, parse_requested)
+                await self._try_deliver(item, match_cache)
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
@@ -2908,12 +2923,17 @@ class Dota2Plugin(Star):
         self,
         item: dict,
         match_cache: dict[int, dict | None],
-        parse_requested: set[int],
     ) -> None:
-        """尝试获取详细数据并推送；数据未就绪时安排下次重试。"""
+        """尝试获取比赛数据并推送；比赛还没被收录时安排下次重试。
+
+        这里**不再等待 OpenDota 解析录像**。监听推送的内容已经改成
+        「胜负 + K/D/A + 近期战绩」的赛后短评（见
+        :func:`dota_analyzer.build_watch_comment_prompt`），这些字段在比赛被
+        收录的那一刻就齐全；而等解析要十几分钟，只会把推送白白推迟。
+        需要解析产物（逐分钟曲线、团战逐人等）的深度复盘走
+        ``/d2 单场 <比赛ID>``，那条链路该等还是会等。
+        """
         match_id = int(item["match_id"])
-        require_parsed = bool(self.cfg("watch_require_parsed", True))
-        max_parse = max(1, int(self.cfg("watch_max_parse_attempts", 20)))
         max_wait = max(1, int(self.cfg("watch_max_wait_attempts", 30)))
 
         if match_id in match_cache:
@@ -2922,15 +2942,14 @@ class Dota2Plugin(Star):
             match = await self.api.get_match(match_id)
             match_cache[match_id] = match
 
-        # ---- 情况一：OpenDota 尚未收录这场比赛 ----
-        # 这一阶段不能消耗「等待解析」的次数：否则等比赛终于被收录时，
-        # 解析次数早已用光，而且解析申请从头到尾都不会被发出去。
+        # ---- 数据源尚未收录这场比赛 ----
+        # 短评要的胜负与 K/D/A 也在这份数据里，所以这里必须等收录。
         if not match:
             item["wait_attempts"] += 1
             waited = item["wait_attempts"]
             if waited > max_wait:
                 logger.warning(
-                    f"[dota2] 比赛 {match_id} 等待 OpenDota 收录超过 {max_wait} 次，"
+                    f"[dota2] 比赛 {match_id} 等待数据源收录超过 {max_wait} 次，"
                     f"放弃推送"
                 )
                 await self._finish(item, delivered_umos=set(), force_advance=True)
@@ -2938,47 +2957,12 @@ class Dota2Plugin(Star):
             delay = 60 if waited <= 5 else 180
             item["next_try_at"] = time.time() + delay
             logger.info(
-                f"[dota2] 比赛 {match_id} 尚未被 OpenDota 收录"
+                f"[dota2] 比赛 {match_id} 尚未被数据源收录"
                 f"（第 {waited}/{max_wait} 次），{delay}s 后重试"
             )
             return
 
-        parsed = self.api.is_parsed(match)
-
-        # ---- 情况二：已收录，但还没有逐分钟级别的解析数据 ----
-        if require_parsed and not parsed:
-            item["parse_attempts"] += 1
-            attempts = item["parse_attempts"]
-
-            # 只要观察到「已收录但未解析」就节流地申请解析。
-            # 之前只在第 1 次尝试时申请，如果那会儿比赛还没被收录，就再也不会申请了。
-            if match_id not in parse_requested and (
-                attempts == 1 or attempts % REPARSE_REQUEST_EVERY == 0
-            ):
-                parse_requested.add(match_id)
-                granted = await self.api.request_parse(match_id)
-                logger.info(
-                    f"[dota2] 已向 OpenDota 提交解析任务 {match_id}（第 {attempts} 次观察）："
-                    f"{'受理' if granted else '未受理'}"
-                )
-
-            if attempts < max_parse:
-                # 前几次尝试间隔短一些，之后拉长
-                delay = 60 if attempts < 5 else 180
-                item["next_try_at"] = time.time() + delay
-                logger.info(
-                    f"[dota2] 比赛 {match_id} 尚无详细数据"
-                    f"（第 {attempts}/{max_parse} 次），{delay}s 后重试"
-                )
-                return
-
-            if not self.cfg("watch_fallback_unparsed", True):
-                logger.info(f"[dota2] 比赛 {match_id} 等待解析超时，按配置放弃推送")
-                await self._finish(item, delivered_umos=set(), force_advance=True)
-                return
-            logger.info(f"[dota2] 比赛 {match_id} 等待解析超时，改用基础数据推送")
-
-        delivered = await self._deliver(item, match, parsed)
+        delivered = await self._deliver(item, match)
 
         # 数据已就绪但一条都没送出去：计数并在超过上限后放弃，避免无限重试。
         # 注意这里只在「完全没送出去」时计数，正文失败不影响 delivered（见 _deliver）。
@@ -3057,12 +3041,17 @@ class Dota2Plugin(Star):
                 "已重新入队，下一轮单独推送"
             )
 
-    async def _deliver(self, item: dict, match: dict, parsed: bool) -> set[str]:
-        """生成分析并推送到所有目标会话。
+    async def _deliver(self, item: dict, match: dict) -> set[str]:
+        """生成「赛后短评」并推送到所有目标会话。
 
-        **一次调用只生成一份大模型报告**，即使本局有多位被监听的玩家参战：
-        报告里会为每位焦点玩家各给一段深入数据，按会话聚合后每个会话只推送
-        一条（同一会话里的多位添加者会在 @ 时一并带上）。
+        **一次调用只生成一份短评**，即使本局有多位被监听的玩家参战：短评里会
+        为每位焦点玩家各点一句，按会话聚合后每个会话只推送一条。
+
+        推送内容只要胜负与 K/D/A（外加各人近期战绩作对照），因此**不依赖录像
+        解析**，比赛一被数据源收录就能发出。想要完整分析的走
+        ``/d2 单场 <比赛ID>``，那条链路才用深度复盘提示词。
+
+        注意这里**不 @ 任何订阅人**：比赛结束的自动播报不该每次都在群里点名。
 
         Returns:
             推送成功的会话标识（umo）集合。调用方据此决定是否推进这些监听者的
@@ -3090,104 +3079,63 @@ class Dota2Plugin(Star):
         item["delivered_focus_ids"] = set(focus_ids)
 
         # 按会话聚合：同一会话（群）可能既是 A 的监听者、也是 B 的监听者，
-        # 这一局只应收到一条推送，@ 时把该会话里的添加者都带上。
+        # 这一局只应收到一条推送。这里只做「按会话去重」——早期的 @ 已移除，
+        # 因此不再收集 creators。
         per_umo: dict[str, dict] = {}
         for focus in focuses:
             for target in focus.get("targets") or []:
                 umo = str(target.get("umo") or "")
                 if not umo:
                     continue
-                aggregated = per_umo.get(umo)
-                if aggregated is None:
-                    aggregated = {
+                if umo not in per_umo:
+                    per_umo[umo] = {
                         "umo": umo,
                         "platform": target.get("platform") or "",
                         "personaname": target.get("personaname") or "",
-                        "creators": [],
                     }
-                    per_umo[umo] = aggregated
-                creator = str(target.get("created_by") or "")
-                if creator and creator not in aggregated["creators"]:
-                    aggregated["creators"].append(creator)
         targets = list(per_umo.values())
         if not targets:
             return set()
 
+        # 短评只需要英雄名（把 hero_id 写成人话），不再拉道具与技能常量：
+        # 那两次请求原先是为深度复盘准备的，短评用不上。
         try:
             heroes = await self.api.get_heroes()
-            items_const = await self.api.get_items()
         except OpenDotaError as e:
-            logger.error(f"[dota2] 推送比赛 {match_id} 时拉取常量失败：{e}")
-            heroes, items_const = {}, {}
-        # 技能常量（id → 技能名）：拿到才输出「技能加点」小节
-        abilities = await self._ability_constants()
+            logger.error(f"[dota2] 推送比赛 {match_id} 时拉取英雄常量失败：{e}")
+            heroes = {}
 
-        # 附上焦点玩家近期的整体状态，让报告更有上下文。
-        # 焦点玩家可能不止一位，这里逐位取；超过上限的只做本场复盘，
-        # 否则统计块会把提示词撑得过长。
-        extra_blocks: list[str] = []
-        recent_count = max(0, int(self.cfg("watch_match_analysis_count", 10)))
-        if recent_count:
-            for focus_id in focus_ids[:MAX_FOCUS_RECENT_CONTEXT]:
-                label = focus_names.get(focus_id) or focus_id
-                try:
-                    recent_matches, economy_samples = (
-                        await self.api.get_player_matches_enriched(
-                            focus_id, recent_count
-                        )
-                    )
-                    recent_matches = [
-                        m
-                        for m in recent_matches
-                        if int(m.get("match_id") or 0) != match_id
-                    ]
-                except OpenDotaError as e:
-                    logger.debug(f"[dota2] 获取 {focus_id} 近期状态上下文失败：{e}")
-                    continue
-                if not recent_matches:
-                    continue
-                summary = summarize_matches(
-                    recent_matches, economy_samples=economy_samples
-                )
-                extra_blocks.append(
-                    f"—— {label}（account_id={focus_id}）在本场之外最近 "
-                    f"{len(recent_matches)} 场的整体情况"
-                    f"（用于判断本场是他的正常发挥还是异常）：\n"
-                    + format_summary_block(summary, heroes)
-                )
-            if len(focus_ids) > MAX_FOCUS_RECENT_CONTEXT:
-                logger.debug(
-                    f"[dota2] 比赛 {match_id} 焦点玩家较多，仅前 "
-                    f"{MAX_FOCUS_RECENT_CONTEXT} 位附带近期状态"
-                )
-
-        recent_tail = (
-            "\n\n请在报告最后额外增加一节「## 近期状态」"
-            + (
-                "，为上面每位焦点玩家各起一个小标题，各用 3 句以内说明其最近的竞技走向。"
-                if len(focus_ids) > 1
-                else "，用 3 句以内说明这名玩家最近的整体竞技走向。"
-            )
+        # 近期战绩：短评要靠它判断「这局是不是正常发挥」。
+        recent_blocks = await self._recent_summary_blocks(
+            match_id, focus_ids, focus_names, heroes
         )
-        extra_context = "\n\n".join(extra_blocks) + (recent_tail if extra_blocks else "")
+        if len(focus_ids) > MAX_FOCUS_RECENT_CONTEXT:
+            logger.debug(
+                f"[dota2] 比赛 {match_id} 焦点玩家较多，仅前 "
+                f"{MAX_FOCUS_RECENT_CONTEXT} 位附带近期战绩"
+            )
 
-        prompt = build_single_match_analysis_prompt(
+        prompt = build_watch_comment_prompt(
             match=match,
             heroes=heroes,
-            items=items_const,
             focus_account_ids=focus_ids,
             focus_names=focus_names,
-            extra_context=extra_context,
-            abilities=abilities,
-            curve_ids=self._curve_targets(match, focus_ids),
+            recent_blocks=recent_blocks,
         )
 
-        headline = self.match_headline(match, heroes, focus_ids, parsed)
+        # 标题不带「数据完整度」：短评不依赖解析，写上去只会让人以为数据有问题。
+        headline = self.match_headline(
+            match, heroes, focus_ids, with_parsed_note=False
+        )
 
-        # 大模型报告只生成一次，多个会话复用（避免重复消耗配额）。
+        # 大模型短评只生成一次，多个会话复用（避免重复消耗配额）。
         # 走 `_call_report_llm`：专用 API Key 优先，未配置时回退 AstrBot 提供商。
+        # 系统提示词用短评专用版本——报告那套要求 Markdown 小标题与 800 字，
+        # 会把「几句话」带成一篇小作文。
         first_umo = targets[0]["umo"]
-        report = await self._call_report_llm(prompt, umo=first_umo)
+        comment = await self._call_report_llm(
+            prompt, umo=first_umo, system_prompt=self._watch_comment_system_prompt()
+        )
 
         delivered: set[str] = set()
         for target in targets:
@@ -3198,13 +3146,12 @@ class Dota2Plugin(Star):
                 # 比赛重新发现并再推一遍标题 —— 群里就会无限复读那一行标题。
                 #
                 # 这不是假想：线上日志里「🏁 比赛回顾 · 8996928421」从 20:21 一路
-                # 复读到 20:39（7 次、间隔 2~3.5 分钟）。用 v1.2.1 原始代码在
-                # 「analysis_as_image=True 且图片发送失败」的场景下可以 1:1 复现：
-                # 图片失败 → ok=False → 基线不推进 → 每轮重推标题。
-                # （详见 tests/old_code_repro.py 的对照输出。）
+                # 复读到 20:39（7 次、间隔 2~3.5 分钟）。
+                # （当时的对照复现在 tests/old_code_repro.py；那个脚本针对的是旧版
+                #  「图片正文」链路，v2.0.0 改成短评后已失效，保留仅供追溯。）
                 #
                 # 因此正文发送失败只记日志、不回退，绝不影响 delivered。
-                headline_ok = await self._send_to_session(umo, target, headline)
+                headline_ok = await self._send_to_session(umo, headline)
                 if not headline_ok:
                     logger.warning(
                         f"[dota2] 向 {umo} 推送比赛 {match_id} 的标题未送达，稍后重试"
@@ -3212,23 +3159,23 @@ class Dota2Plugin(Star):
                     continue
 
                 delivered.add(umo)
-                logger.info(f"[dota2] 比赛 {match_id} 分析已推送到 {umo}")
+                logger.info(f"[dota2] 比赛 {match_id} 的赛后短评已推送到 {umo}")
 
                 # 正文属于「尽力而为」：失败不影响送达判定，只提示用户去看概览。
-                # `_send_report_body` 内部已逐块收敛异常，这里的 try 是最后一道保险。
+                # `_send_watch_comment` 内部已逐块收敛异常，这里的 try 是最后一道保险。
                 try:
-                    body_ok = await self._send_report_body(umo, report)
+                    body_ok = await self._send_watch_comment(umo, comment)
                 except Exception as e:  # noqa: BLE001
-                    logger.error(f"[dota2] 向 {umo} 推送比赛 {match_id} 的正文失败：{e}")
+                    logger.error(f"[dota2] 向 {umo} 推送比赛 {match_id} 的短评失败：{e}")
                     body_ok = False
                 if not body_ok:
                     logger.warning(
-                        f"[dota2] 比赛 {match_id} 的复盘正文未能送达 {umo}，"
+                        f"[dota2] 比赛 {match_id} 的短评未能送达 {umo}，"
                         f"标题已发出，不再重复推送"
                     )
                     await self._notify_body_failed(umo, match_id)
             except Exception as e:  # noqa: BLE001
-                # 兜底：`_send_to_session` / `_send_report_body` 内部已各自收敛异常，
+                # 兜底：`_send_to_session` / `_send_watch_comment` 内部已各自收敛异常，
                 # 走到这里说明出了预期外的问题（例如常量或格式化代码抛错）。
                 # 此时该会话本轮只发出去一部分，补一条提示让失败可感知——
                 # 否则用户会看到「只有标题、后面什么都没有」而不知道为什么。
@@ -3237,38 +3184,41 @@ class Dota2Plugin(Star):
                     await self._notify_body_failed(umo, match_id)
         return delivered
 
-    async def _send_report_body(self, umo: str, report: str | None) -> bool:
-        """发送复盘正文（图片优先，失败或未启用时按长度拆分文本）。
+    def _watch_comment_system_prompt(self) -> str:
+        """监听短评用的系统提示词；配置留空则用内置版本。
 
-        返回是否成功送达。**调用方不应据此回退监听进度**：正文只是标题的补充，
-        用户已经通过标题知道这场比赛打完了。
+        必须是**独立**的一套：``analysis_system_prompt`` 是给长报告写的
+        （要求 Markdown 小标题、总长 800 字以内），拿它写「2~4 句话」的短评
+        会被带成一篇小作文，正好违背监听推送的初衷。
+        """
+        text = str(self.cfg("watch_comment_system_prompt", "") or "").strip()
+        return text or WATCH_COMMENT_SYSTEM_PROMPT
+
+    async def _send_watch_comment(self, umo: str, comment: str | None) -> bool:
+        """发送监听短评正文。
+
+        短评只有几句话（几十到一两百字），因此**不转图片、也不做报告式分块**：
+        直接按 ``max_message_length`` 拆成文本发出去即可。模型不可用时给一句
+        说明，让用户知道不是插件哑了。
 
         每一块的发送都是独立的：某一块抛异常或返回 False 只会让这一块失败，
-        后续分块仍会继续尝试。早期实现里任何一块出错就直接冒泡出函数，
-        导致「第 2 块失败 → 第 3 块起全部丢失」，群里只剩半篇报告。
+        后续分块仍会继续尝试（早期实现里任何一块出错就直接冒泡出函数，
+        导致「第 2 块失败 → 第 3 块起全部丢失」）。
         """
-        if not report:
+        if not comment:
             return await self._send_quiet(
                 umo,
                 "⚠️ 未启用大模型分析或模型不可用，仅提供上述比赛概览。",
                 match_id=None,
             )
 
-        image_url = await self._render_image(report)
-        if image_url:
-            if await self._send_quiet(umo, None, image_url=image_url):
-                return True
-            logger.warning(
-                f"[dota2] 复盘图片发送失败，回退为文本发送：{umo}"
-            )
-
         ok = True
-        chunks = self._chunk_text(report)
+        chunks = self._chunk_text(comment)
         for index, chunk in enumerate(chunks, start=1):
             # 逐块 try/except：单块失败不能拖垮后面的分块。
             if not await self._send_quiet(umo, chunk):
                 logger.warning(
-                    f"[dota2] 复盘正文第 {index}/{len(chunks)} 块发送失败：{umo}"
+                    f"[dota2] 短评第 {index}/{len(chunks)} 块发送失败：{umo}"
                 )
                 ok = False
         return ok
@@ -3278,21 +3228,19 @@ class Dota2Plugin(Star):
         umo: str,
         text: str | None,
         *,
-        image_url: str | None = None,
         match_id: int | None = None,
     ) -> bool:
-        """发送一条消息并把异常收敛成 ``False``。
+        """发送一条**文本**消息并把异常收敛成 ``False``。
 
         统一入口，避免每个调用点各写一遍 try/except——前面就是因为漏了一处，
         让正文异常直接冒泡到 ``_deliver`` 的外层 except，最后只留在日志里，
         用户侧完全无感。
+
+        只发文本：监听推送已改成几句短评（不需要转图片），需要图片的是
+        ``/d2 单场`` 那条链路，它在自己那边处理渲染与回退。
         """
         try:
-            chain = (
-                MessageChain().file_image(image_url)
-                if image_url
-                else MessageChain().message(text or "")
-            )
+            chain = MessageChain().message(text or "")
             return await self._send(umo, chain) is not False
         except Exception as e:  # noqa: BLE001
             label = f"比赛 {match_id} 的" if match_id is not None else ""
@@ -3300,15 +3248,15 @@ class Dota2Plugin(Star):
             return False
 
     async def _notify_body_failed(self, umo: str, match_id: int) -> None:
-        """正文发送失败时给一条轻量提示，避免用户以为「只有标题、没有分析」。
+        """正文发送失败时给一条轻量提示，避免用户以为「只有标题、没有点评」。
 
         提示本身也走 :meth:`_send_quiet`：连提示都发不出去时只记日志，
         绝不能再往上报——否则会把「正文失败」升级成「整轮推送失败」。
         """
         await self._send_quiet(
             umo,
-            f"⚠️ 比赛 {match_id} 的复盘正文未能发出（平台发送通道异常），"
-            f"上方为比赛概览。可用 `/d2 单场 {match_id}` 重新获取完整报告。",
+            f"⚠️ 比赛 {match_id} 的短评未能发出（平台发送通道异常），"
+            f"上方为比赛概览。可用 `/d2 单场 {match_id}` 获取完整复盘。",
             match_id=match_id,
         )
 
@@ -3316,40 +3264,17 @@ class Dota2Plugin(Star):
         """发送单条消息并归一化返回值（不同版本 AstrBot 的返回契约不一致）。"""
         return await self.context.send_message(umo, chain)
 
-    async def _send_to_session(self, umo: str, target: dict, text: str) -> bool:
-        """发送推送消息，支持在群聊中 @ 添加监听的人。
+    async def _send_to_session(self, umo: str, text: str) -> bool:
+        """发送推送标题，按 ``max_message_length`` 分块。
 
-        ``target["creators"]`` 是该会话里所有添加过监听的人：同一局比赛可能
-        同时被群里两个人关注（各自监听了不同的玩家），此时把他们都 @ 上。
+        **故意不 @ 任何订阅人**：这是「比赛结束的自动播报」，一次推送就在群里
+        @ 一串人是纯打扰。早期实现会 @ 该会话里所有添加过监听的人
+        （``target["creators"]``，配置项 ``watch_notify_at``），现已整体移除——
+        想被提醒的成员自己看群消息即可。
 
         Returns:
             是否全部发送成功。失败时调用方会保留该监听者的基线以便补推。
         """
-        use_at = bool(self.cfg("watch_notify_at", True))
-        platform = str(target.get("platform") or "")
-        creators = [
-            str(uid)
-            for uid in (target.get("creators") or [])
-            if str(uid)
-        ]
-        if not creators and target.get("created_by"):
-            creators = [str(target["created_by"])]
-
-        if use_at and creators and platform == "aiocqhttp":
-            try:
-                from astrbot.api.message_components import At, Plain
-
-                chain = MessageChain(
-                    chain=[
-                        *[At(qq=uid) for uid in creators[:5]],
-                        Plain(text=" " + text),
-                    ]
-                )
-                if await self._send(umo, chain) is not False:
-                    return True
-            except Exception as e:  # noqa: BLE001
-                logger.debug(f"[dota2] 构造 At 消息失败，回退为纯文本：{e}")
-
         ok = True
         chunks = self._chunk_text(text)
         for index, chunk in enumerate(chunks, start=1):
@@ -3367,6 +3292,8 @@ class Dota2Plugin(Star):
         heroes: dict[int, dict],
         focus_account_ids: int | list[int] | tuple[int, ...] | None = None,
         parsed: bool = True,
+        *,
+        with_parsed_note: bool = True,
     ) -> str:
         """生成比赛概览头部文本。
 
@@ -3375,6 +3302,10 @@ class Dota2Plugin(Star):
         ``parsed`` 参数**已不参与判定**（保留仅为兼容既有调用方）：完整度文案
         统一由 :func:`parsed_state` 从 ``match`` 推导，确保与 AI 提示词正文
         用的是同一套口径，不会一个说已解析、一个说未解析。
+
+        ``with_parsed_note`` 控制是否输出最后那行「数据完整度」：监听推送的
+        赛后短评不依赖录像解析（只要胜负与 K/D/A），标注完整度只会让用户
+        误以为数据有问题，因此那边传 ``False``。
         """
         _ = parsed  # 兼容保留：判定改用 parsed_state(match)，见下
         focus_ids = normalize_focus_ids(focus_account_ids)
@@ -3410,9 +3341,10 @@ class Dota2Plugin(Star):
                     f"{'✅胜' if win else '❌负'}"
                 )
 
-        # 与提示词正文共用同一套判据（parsed_state），避免标题与正文打架
-        _parsed_flag, parsed_note = parsed_state(match)
-        lines.append(f"数据完整度：{parsed_note}")
+        if with_parsed_note:
+            # 与提示词正文共用同一套判据（parsed_state），避免标题与正文打架
+            _parsed_flag, parsed_note = parsed_state(match)
+            lines.append(f"数据完整度：{parsed_note}")
         return "\n".join(lines)
 
     # ==================================================================

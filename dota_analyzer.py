@@ -20,6 +20,7 @@ from astrbot.api import logger
 try:  # 插件目录被作为包加载时的相对导入
     from .dota_format import (
         build_match_data_text,
+        fmt_ago,
         fmt_duration,
         fmt_timestamp,
         format_summary_block,
@@ -39,6 +40,7 @@ except ImportError:  # 兜底：以普通模块方式加载时，把插件目录
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from dota_format import (  # type: ignore[no-redef]
         build_match_data_text,
+        fmt_ago,
         fmt_duration,
         fmt_timestamp,
         format_summary_block,
@@ -95,6 +97,135 @@ MATCH_REPORT_FORMAT = """写作纪律（先读这三条，再动笔）：
 
 ## 关键转折点
 （列出本场最重要的 1-3 个转折点，说明当时发生了什么、对后续局势造成了什么影响。优先引用团战逐场数据与关键事件时间轴里的具体时间点）"""
+
+#: 监听自动短评的系统提示词。
+#: **必须与报告用的 ``analysis_system_prompt`` 分开**：后者要求「Markdown 小标题、
+#: 800 字以内」，把 2~4 句的短评交给它写会被带成一篇小作文，正好违背监听推送
+#: 「几句话说清楚这局打得怎么样」的初衷。
+WATCH_COMMENT_SYSTEM_PROMPT = """你是一位 Dota 2 老玩家，负责在群聊里对刚打完的一局做一个口头点评。
+
+写作要求：
+1. 只写 2~4 句话，总长度控制在 120 字以内。直接给结论，不要铺垫、不要总结段。
+2. 用聊天口吻，像朋友在群里随口点评。不要 Markdown 标题、不要分点列举、
+   不要写「点评如下」「综上」之类的套话。
+3. 必须点到这局的胜负与该玩家的 K/D/A，并把它放进这名玩家近期的状态里做对照：
+   这局算正常发挥、明显超常，还是明显拉胯。
+4. 只使用我给出的数字。没有给我的数据（装备、经济、团战细节等）一律不要提，
+   更不要编造。
+5. 对事不对人：可以说「这局送得多」「发挥好于近期平均」，但不要脏话、不要人身攻击。
+6. 直接输出点评正文，不要任何开场白或结尾寒暄。"""
+
+#: 监听短评的用户提示词里的输出要求（与 ``WATCH_COMMENT_SYSTEM_PROMPT`` 配套）。
+WATCH_COMMENT_FORMAT = """请直接输出一段 2~4 句话、120 字以内的点评：
+· 先说这局的结果与他本人的 K/D/A；
+· 再对照上面的近期战绩，说明这局算正常、超常还是拉胯，并用给出的数字作依据；
+· 不要分点、不要小标题、不要超过 4 句话。"""
+
+
+def _watch_focus_line(
+    match: dict,
+    heroes: dict[int, dict],
+    account_id: int,
+    name: str,
+) -> str:
+    """监听短评里那一行「谁、什么英雄、多少 KDA、赢没赢」。"""
+    label = f"{name}（account_id={account_id}）" if name else f"account_id={account_id}"
+    player = None
+    for entry in match.get("players") or []:
+        if not isinstance(entry, dict):
+            continue
+        if int(entry.get("account_id") or 0) == int(account_id):
+            player = entry
+            break
+    if player is None:
+        # 玩家不在本局名单里（数据源没给全 / 焦点已过期）：如实说明，别编数据
+        return f"{label}：本局数据里没有这名玩家"
+    win = player_win(player)
+    return (
+        f"{label}：{hname(heroes, player.get('hero_id'))} · "
+        f"{player.get('kills', 0)}/{player.get('deaths', 0)}/{player.get('assists', 0)} · "
+        f"{'胜' if win else '负'}"
+    )
+
+
+def build_watch_comment_prompt(
+    match: dict,
+    heroes: dict[int, dict],
+    focus_account_ids: int | list[int] | tuple[int, ...] | None = None,
+    focus_names: dict[int, str] | None = None,
+    recent_blocks: list[str] | None = None,
+) -> str:
+    """构造「监听推送的短评」提示词。
+
+    与 :func:`build_single_match_analysis_prompt` 的关键区别是**故意只要很少的数据**：
+
+    * 本场只给胜负、K/D/A，外加英雄 / 时长 / 模式这几个用于「说清楚是哪局」的字段；
+    * 再有就是焦点玩家近期战绩（``recent_blocks``，由调用方用
+      :func:`dota_format.format_summary_block` 生成），用来判断本场是否异常。
+
+    这里**不渲染任何解析产物**（逐分钟曲线、伤害构成、视野日志、团战逐人…）。
+    这样做的直接收益是监听推送不再需要等 OpenDota 解析录像——解析要等十几分钟，
+    而短评只需要比赛被收录时就有胜负与 K/D/A。想要完整复盘的走
+    ``/d2 单场 <比赛ID>``，那条链路仍然用深度提示词。
+
+    Args:
+        match: 比赛详情。
+        heroes: 英雄常量 ``{hero_id: {...}}``。
+        focus_account_ids: 需要点评的玩家（同一局可能有多位被监听的玩家）。
+        focus_names: ``{account_id: 昵称}``，让提示词里出现可读的名字。
+        recent_blocks: 每位焦点玩家一段近期战绩文本（可空）。
+    """
+    ids = normalize_focus_ids(focus_account_ids)
+    names = focus_names or {}
+    radiant_win = bool(match.get("radiant_win"))
+
+    lines: list[str] = []
+    if len(ids) > 1:
+        lines.append(
+            f"请根据下面这场比赛的结果，分别对 {len(ids)} 位被关注的玩家各写一段简短点评。"
+        )
+    else:
+        lines.append("请根据下面这场比赛的结果，写一段简短点评。")
+    lines.append("")
+
+    lines.append("=== 本场比赛 ===")
+    lines.append(f"比赛ID: {match.get('match_id')}")
+    lines.append(
+        f"开始时间: {fmt_timestamp(match.get('start_time'))}"
+        f"（{fmt_ago(match.get('start_time'))}）"
+    )
+    lines.append(
+        f"时长: {fmt_duration(match.get('duration'))} · 模式: {mode_text(match)}"
+    )
+    lines.append(
+        f"比分: 天辉 {match.get('radiant_score', 0)} : {match.get('dire_score', 0)} 夜魇"
+        f" · {'天辉' if radiant_win else '夜魇'}获胜"
+    )
+    lines.append("")
+
+    lines.append("=== 被关注的玩家（本场）===")
+    if ids:
+        for account_id in ids:
+            lines.append(
+                _watch_focus_line(match, heroes, account_id, names.get(account_id) or "")
+            )
+    else:
+        # 没有指定玩家时退化成「这场比赛」的点评，仍比不推好
+        lines.append("（本次没有指定具体玩家，就这局比赛本身点评）")
+    lines.append("")
+
+    if recent_blocks:
+        lines.append("=== 近期战绩（不含本场，用于判断本场是否正常）===")
+        lines.append("\n\n".join(recent_blocks))
+        lines.append("")
+    else:
+        lines.append("=== 近期战绩 ===")
+        lines.append("（拿不到近期战绩，只能就本场的数据点评，不要臆测他的状态趋势）")
+        lines.append("")
+
+    lines.append("=== 输出要求 ===")
+    lines.append(WATCH_COMMENT_FORMAT)
+    return "\n".join(lines)
 
 
 def _player_headline(

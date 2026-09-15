@@ -270,41 +270,23 @@
     "default": 180,
     "hint": "拉取被监听玩家比赛列表的间隔，建议不低于 120 秒，以免消耗过多 OpenDota 配额。注意：等待解析的重试有独立的 30 秒节拍，不受此值影响。"
   },
-  "watch_require_parsed": {
-    "description": "等待录像解析完成后再分析",
-    "type": "bool",
-    "default": true,
-    "hint": "开启后会主动向 OpenDota 提交解析任务（POST /request/{match_id}），拿到逐分钟经济/团战等详细数据后再调用大模型，分析质量更高，但可能需要等几分钟到几十分钟。"
-  },
-  "watch_max_parse_attempts": {
-    "description": "等待解析最大尝试次数",
-    "type": "int",
-    "default": 20,
-    "hint": "仅统计「比赛已被 OpenDota 收录但还没解析完」的次数。超过该次数后按下面的策略处理。"
-  },
   "watch_max_wait_attempts": {
     "description": "等待收录最大尝试次数",
     "type": "int",
     "default": 30,
-    "hint": "比赛刚打完时可能还没被 OpenDota 收录，这段等待单独计数，不消耗上面的解析次数。超过该次数后放弃推送该场比赛。"
-  },
-  "watch_fallback_unparsed": {
-    "description": "超时后仍用基础数据分析",
-    "type": "bool",
-    "default": true,
-    "hint": "关闭后，如果一直拿不到解析数据就放弃推送该场比赛（仅记录日志）。"
+    "hint": "比赛刚打完时可能还没被数据源收录，短评要的胜负与 K/D/A 也在这份数据里，因此这里必须等。超过该次数后放弃推送该场比赛。"
   },
   "watch_match_analysis_count": {
-    "description": "推送时附带的近期场次",
+    "description": "短评对照用的近期场次",
     "type": "int",
     "default": 10,
-    "hint": "推送分析时，除了本场复盘外还会附带最近若干场的整体状态评价。设为 0 表示只做单场复盘。"
+    "hint": "短评会拿这名玩家最近若干场的整体战绩来判断本场是否正常发挥。设为 0 表示不看近期战绩，只就本场胜负与 KDA 点评。"
   },
-  "watch_notify_at": {
-    "description": "推送时 @ 添加监听的人",
-    "type": "bool",
-    "default": true,
-    "hint": "仅对支持 @ 的平台（如 QQ / aiocqhttp）生效。"
+  "watch_comment_system_prompt": {
+    "description": "监听短评系统提示词（留空用内置）",
+    "type": "text",
+    "default": "",
+    "hint": "监听推送只发「胜负 + KDA + 近期战绩对照」的几句话。留空使用内置的短评提示词（要求 2~4 句、120 字以内、不要 Markdown 标题）。注意这里不要填「分析报告系统提示词」那套长报告要求，否则短评会被写成长文。"
   },
   "watch_concurrency": {
     "description": "监听检查并发数",
