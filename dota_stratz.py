@@ -397,6 +397,14 @@ class StratzClient:
             # 胜负的权威来源（STRATZ 直接给），player_win 会优先用它
             "isVictory": node.get("isVictory"),
         }
+        # ---- 物品槽位 -------------------------------------------------
+        # 查询里本来就带了 item0Id~item5Id / neutral0Id，但早期版本**没有映射**，
+        # 于是 STRATZ 直连时「出装」永远显示成 `-`：数据明明拿到了却凭空丢掉。
+        # 这里按 OpenDota 的 ``item_0``~``item_5`` / ``item_neutral`` 命名落地，
+        # 数值是道具 ID，``ItemIndex`` 能直接按 ID 查出显示名。
+        for index in range(6):
+            out[f"item_{index}"] = node.get(f"item{index}Id")
+        out["item_neutral"] = node.get("neutral0Id")
         return out
 
     @classmethod
@@ -528,6 +536,16 @@ class StratzClient:
         self._item_cache = items
         self._item_cache_at = now
         return items
+
+    async def get_ability_names(self) -> dict[int, str]:
+        """技能常量表。
+
+        STRATZ 侧的 GraphQL 没有 OpenDota ``/constants/ability_ids`` 那种
+        「技能 ID → 技能名」的扁平映射，而且 STRATZ 的 ``get_match`` 也不返回
+        ``ability_upgrades_arr``，所以这里没有可复用的数据，直接返回空字典。
+        调用方按「拿不到就不输出技能加点小节」处理。
+        """
+        return {}
 
     # ------------------------------------------------------------------
     # 玩家相关

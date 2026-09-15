@@ -224,6 +224,26 @@ NEGATION_FLIP = {"bind": "unbind", "watch": "unwatch"}
 #: 触发判定所需的最低分数。设成 3 意味着必须命中一个「强特征」词。
 MIN_SCORE = 3
 
+#: 「指示插件做事」型意图。它们的关键词很容易被**分析型问句**顺带带出来：
+#: 「对比一下目前监听的几个人谁最菜」里那个「监听」只是描述现状，
+#: 打分却是 ``watch``=4，于是被当成「添加监听」，答非所问（而且真的
+#: 会去改数据）。命中下面的问句特征时，这些意图一律让位给闲聊兜底。
+ANALYSIS_GATED_INTENTS = frozenset(
+    {"watch", "unwatch", "bind", "unbind", "watchlist", "my", "bindings"}
+)
+
+#: 分析型问句特征：要的是**结论 / 对比 / 建议**，不是一条指令。
+#: 刻意写得很窄（带上具体搭配），避免误伤「我该怎么改进」这类
+#: 本来就该走 ``analyze`` 指令的说法。
+ANALYSIS_QUESTION_RE = re.compile(
+    r"谁(最|更|比|厉|强|菜|牛|秀|坑)"
+    r"|最(菜|强|弱|厉害|牛|秀|坑|差|水)"
+    r"|对比|比较|排名|排行"
+    r"|该(怎么|如何)(练|提升|进步|上分|补|学|改)"
+    r"|怎么(练|提升|进步|上分)"
+    r"|推荐|值不值"
+)
+
 #: 意图 → 是否需要「目标玩家」参数
 INTENT_NEEDS_TARGET = {
     "bind",
@@ -715,6 +735,17 @@ def parse(text: str) -> Intent | None:
     if scores[best] < MIN_SCORE:
         return None
     best_score = scores[best]
+
+    # 分析型问句让位给闲聊兜底。
+    #
+    # 「对比一下目前监听的几个人谁最菜」这类问题里，「监听」是在描述现状，
+    # 不是在要求插件添加监听 —— 但打分只看关键词，``watch`` 照样拿 4 分。
+    # 与其把它执行成一个**会改数据的动作**（真的往监听列表里加人），
+    # 不如交回给上层：插件的闲聊兜底会带着监听名单与各人战绩来回答，
+    # 这正是用户想要的。注意 `analyze` / `matches` / `heroes` 这些
+    # **只读查询**不在闸门里，被误判也只是多给一份数据，代价可控。
+    if best in ANALYSIS_GATED_INTENTS and ANALYSIS_QUESTION_RE.search(raw):
+        return None
 
     # 否定词把「绑定 / 监听」翻成取消动作
     flipped = False

@@ -99,7 +99,39 @@
     "description": "规则识别不了时交给大模型判断",
     "type": "bool",
     "default": false,
-    "hint": "默认关闭以节省 token。开启后，规则没识别出意图的消息会额外调用一次模型做意图分类；若模型也判断不出，仍会把消息交回给默认大模型正常回复。"
+    "hint": "默认关闭以节省 token。开启后，规则没识别出意图的消息会额外调用一次模型做意图分类，试图把它归到某个内置指令上；仍归不上时再走下面的「闲聊兜底」。"
+  },
+  "nlu_chat_fallback": {
+    "description": "没识别出指令时带插件数据回答",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，消息里写了唤醒词、但没识别出具体指令时，插件不再把消息直接交给默认大模型（它看不到本会话的监听名单、绑定关系与战绩），而是把这些真实数据连同问题一起发给模型来回答。例如「dota2助手 对比一下目前监听的几个人谁最菜」「dota2助手 我想转辅助该怎么练」。注意：这类回答会占用模型额度，并且不会继承 AstrBot 的多轮上下文；模型不可用或想省 token 时把它关掉，消息就回到默认大模型手里。"
+  },
+  "nlu_chat_context_matches": {
+    "description": "闲聊兜底每人取几场比赛",
+    "type": "int",
+    "default": 10,
+    "hint": "为每个相关玩家拉取最近多少场用于计算胜率/KDA/GPM。数值越大越准，耗时与 token 也越高；问「谁最菜」这类横向对比时建议 10~20。"
+  },
+  "nlu_chat_max_players": {
+    "description": "闲聊兜底最多分析几个玩家",
+    "type": "int",
+    "default": 6,
+    "hint": "监听列表可能很长，一次最多取几个人的数据（提问者本人优先）。超出的会在回答里注明「还有 N 位没取数据」。"
+  },
+  "nlu_chat_timeout": {
+    "description": "闲聊兜底数据拉取超时（秒）",
+    "type": "float",
+    "default": 25.0,
+    "hint": "拉取战绩快照与英雄池的单次超时。这些人同时并发拉取，所以总等待时间接近这个值。拉不到数据的玩家会被跳过并注明，不会拖垮整条回答。"
+  },
+  "nlu_chat_system_prompt": {
+    "description": "闲聊兜底系统提示词",
+    "type": "text",
+    "default": "",
+    "hint": "定义插件带数据闲聊时模型扮演的角色与口吻。留空使用内置提示词（「混在群里的老玩家」风格，并会强调不要编造数据）。注意这里和数据是否注入无关——数据由插件自动附加。",
+    "editor_mode": true,
+    "editor_language": "markdown"
   },
   "enable_llm_analysis": {
     "description": "启用 LLM 分析",

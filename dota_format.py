@@ -62,6 +62,17 @@ LANE_ROLES: dict[int, str] = {
     4: "野区(Jungle)",
 }
 
+#: STRATZ 的 ``position`` 枚举 → 中文「几号位」。
+#: OpenDota 侧没有这个字段（只有 lane_role），但 STRATZ 直连时每个玩家都带，
+#: 是判断阵容分工最直接的依据，因此这里补一张映射表。
+POSITION_TEXT: dict[str, str] = {
+    "POSITION_1": "1号位（核心/优势路）",
+    "POSITION_2": "2号位（中单）",
+    "POSITION_3": "3号位（劣势路）",
+    "POSITION_4": "4号位（游走/打架辅助）",
+    "POSITION_5": "5号位（保人辅助）",
+}
+
 RANK_MEDALS: list[str] = [
     "无段位",
     "先锋 Herald",
@@ -92,8 +103,10 @@ BUILDING_HINTS: list[tuple[str, str]] = [
     ("tower3", "三塔"),
     ("tower4", "四塔"),
     ("fort", "基地"),
-    ("rax_melee", "近战兵营"),
-    ("rax_ranged", "远程兵营"),
+    # 键名取自 OpenDota objectives 的真实 key：``..._melee_rax_bot`` /
+    # ``..._range_rax_bot``（顺序不能与下面通用的 "rax" 对调，否则会被吃掉）
+    ("melee_rax", "近战兵营"),
+    ("range_rax", "远程兵营"),
     ("rax", "兵营"),
     ("shrine", "圣坛"),
     ("fillers", "建筑"),
@@ -103,6 +116,69 @@ LANE_HINTS: list[tuple[str, str]] = [
     ("top", "上路"),
     ("mid", "中路"),
     ("bot", "下路"),
+]
+
+#: OpenDota ``gold_reasons`` 的语义。
+#:
+#: 口径取自 Valve 官方枚举 ``EDOTA_ModifyGold_Reason``（不是网上流传的
+#: YASP 旧表——旧表把 14 写成 Roshan、15 写成 Courier，与现行引擎对不上：
+#: 实测拿野怪击杀数与 key 14 相除恒为 50~70 金币/只，key 17 则同队五人完全
+#: 相等，正是赏金符的「全队均分」特征）。这张表是「金币从哪来」的分解：
+#: 补刀占比高 = 刷子型；击杀英雄占比高 = 打架型；拆建筑占比高 = 推进型。
+GOLD_REASONS: dict[int, str] = {
+    0: "其他/初始金",
+    1: "死亡损失",
+    2: "买活支出",
+    3: "购买消耗品",
+    4: "购买装备",
+    5: "队友放弃后分配",
+    6: "卖出物品",
+    7: "技能耗金",
+    10: "随时间自然增长",
+    11: "拆建筑",
+    12: "击杀英雄",
+    13: "补刀小兵",
+    14: "击杀野怪",
+    15: "击杀肉山",
+    16: "击杀信使",
+    17: "赏金符",
+    18: "团队共享",
+    19: "技能产金",
+    20: "击杀守卫",
+}
+
+#: OpenDota ``xp_reasons`` 的语义（Valve 官方枚举 ``EDOTA_ModifyXP_Reason``）。
+XP_REASONS: dict[int, str] = {
+    0: "其他",
+    1: "击杀英雄",
+    2: "补刀/野怪",
+    3: "肉山",
+    4: "经验书",
+    5: "前哨站",
+}
+
+#: ``multi_kills`` 的键（连杀人数）→ 中文。
+MULTI_KILL_TEXT: dict[int, str] = {
+    2: "双杀",
+    3: "三杀",
+    4: "四杀",
+    5: "暴走",
+    6: "6 连杀以上",
+}
+
+#: ``life_state`` 的键 → 中文语义。实测三者之和恒等于比赛时长，且键 ``2``
+#: 的数值随死亡次数单调增长（11 死 → 433s、4 死 → 168s），因此 ``2`` 是
+#: 「阵亡 + 复活等待」。
+LIFE_STATE_TEXT: dict[int, str] = {
+    0: "存活",
+    1: "其他状态",
+    2: "阵亡/复活等待",
+}
+
+#: 视野类日志的字段名 → 中文，用于统一渲染
+WARD_LOGS: list[tuple[str, str, str]] = [
+    ("obs_log", "假眼", "obs_left_log"),
+    ("sen_log", "真眼", "sen_left_log"),
 ]
 
 
@@ -731,8 +807,38 @@ def gold_adv_metrics(match: dict) -> dict[str, Any] | None:
     }
 
 
-def summarize_teamfights(teamfights: list[dict], limit: int = 12) -> list[str]:
-    """整理团战列表。"""
+def summarize_teamfights(
+    teamfights: list[dict],
+    limit: int = 12,
+    *,
+    heroes: dict[int, dict] | None = None,
+    players: list[dict] | None = None,
+    focus_ids: list[int] | None = None,
+    focus_names: dict[int, str] | None = None,
+) -> list[str]:
+    """整理团战列表。
+
+    Args:
+        heroes: 英雄常量表，用于把 ``killed`` 里的 NPC 名翻成英雄名。
+        players: 本场十名玩家，用来建立「团战里的第 N 个位置 → 是哪位玩家」
+            的映射（``teamfights[].players`` 按 player_slot 顺序排列）。
+        focus_ids: 焦点玩家，会在每次团战里单独列出他们的贡献。
+        focus_names: ``{account_id: 昵称}``。
+
+    每场团战输出主行（时间、阵亡人数、双方经济）＋可选的两条细节：
+    「谁死了」与「焦点玩家做了什么」。解析产物里 ``teamfights[].players``
+    本来就带 ``damage`` / ``healing`` / ``killed`` / ``deaths`` / ``gold_delta``
+    / ``xp_delta``，早期版本只把它们求和成一条经济数字，白白丢掉了
+    「这场团战谁在打输出、谁先死」这类最关键的复盘证据。
+    """
+    heroes = heroes or {}
+    ordered_players = sorted(
+        [p for p in (players or []) if isinstance(p, dict)],
+        key=lambda p: int(p.get("player_slot") or 0),
+    )
+    focus_set = {int(i) for i in (focus_ids or [])}
+    names = focus_names or {}
+
     rows: list[str] = []
     for index, fight in enumerate(teamfights or [], start=1):
         if not isinstance(fight, dict):
@@ -742,26 +848,509 @@ def summarize_teamfights(teamfights: list[dict], limit: int = 12) -> list[str]:
         start = fmt_clock(fight.get("start"))
         end = fmt_clock(fight.get("end"))
         deaths = fight.get("deaths", 0)
-        players = fight.get("players") or []
+        fighters = fight.get("players") or []
         radiant_gold = 0
         dire_gold = 0
-        for slot, player in enumerate(players):
-            if not isinstance(player, dict):
+        radiant_deaths = 0
+        dire_deaths = 0
+        radiant_dead_names: list[str] = []
+        dire_dead_names: list[str] = []
+        focus_notes: list[str] = []
+
+        for slot, entry in enumerate(fighters):
+            if not isinstance(entry, dict):
                 continue
             try:
-                delta = int(player.get("gold_delta") or 0)
+                delta = int(entry.get("gold_delta") or 0)
             except (TypeError, ValueError):
                 delta = 0
             # teamfights.players 按 player_slot 顺序排列（0-4 天辉，128-132 夜魇）
-            if slot < 5:
+            is_rad = slot < 5
+            if is_rad:
                 radiant_gold += delta
             else:
                 dire_gold += delta
+
+            # 找出这一位是哪名玩家（用于把击杀/阵亡翻译成人名英雄名）
+            owner: dict = {}
+            if slot < len(ordered_players):
+                owner = ordered_players[slot]
+            own_label = ""
+            if owner:
+                hero_name = hname(heroes, owner.get("hero_id"))
+                own_label = (
+                    f"{names.get(int(owner.get('account_id') or 0)) or owner.get('name') or owner.get('account_id')}·{hero_name}"
+                )
+
+            entry_deaths = int(entry.get("deaths") or 0)
+            if entry_deaths:
+                if is_rad:
+                    radiant_deaths += entry_deaths
+                    if own_label:
+                        radiant_dead_names.append(own_label)
+                else:
+                    dire_deaths += entry_deaths
+                    if own_label:
+                        dire_dead_names.append(own_label)
+
+            account_id = int((owner or {}).get("account_id") or 0)
+            if account_id and account_id in focus_set:
+                bits = [f"{names.get(account_id) or account_id}"]
+                kills = entry.get("killed")
+                if isinstance(kills, dict) and kills:
+                    killed_names = [
+                        hname_by_npc(heroes, k)
+                        for k in kills
+                        if str(k).startswith("npc_dota_hero_")
+                    ]
+                    if killed_names:
+                        bits.append("击杀 " + "、".join(killed_names))
+                if entry_deaths:
+                    bits.append(f"阵亡 {entry_deaths} 次")
+                damage = entry.get("damage")
+                if damage:
+                    bits.append(f"打出 {fmt_num(damage)} 伤害")
+                healing = entry.get("healing")
+                if healing:
+                    bits.append(f"治疗 {fmt_num(healing)}")
+                bits.append(f"经济 {delta:+d}")
+                try:
+                    bits.append(f"经验 {int(entry.get('xp_delta') or 0):+d}")
+                except (TypeError, ValueError):
+                    pass
+                if entry.get("buybacks"):
+                    bits.append("交了买活")
+                focus_notes.append("　".join(bits))
+
         rows.append(
-            f"#{index} {start}-{end} 阵亡 {deaths} 人 · 天辉合计经济 {radiant_gold:+d} "
-            f"/ 夜魇 {dire_gold:+d}"
+            f"#{index} {start}-{end} 阵亡 {deaths} 人"
+            f"（天辉 {radiant_deaths} / 夜魇 {dire_deaths}）· "
+            f"天辉合计经济 {radiant_gold:+d} / 夜魇 {dire_gold:+d}"
         )
+        if radiant_dead_names or dire_dead_names:
+            dead_bits = []
+            if radiant_dead_names:
+                dead_bits.append("天辉 " + "、".join(radiant_dead_names))
+            if dire_dead_names:
+                dead_bits.append("夜魇 " + "、".join(dire_dead_names))
+            rows.append("   阵亡: " + "；".join(dead_bits))
+        for note in focus_notes:
+            rows.append(f"   焦点贡献: {note}")
     return rows
+
+
+# ----------------------------------------------------------------------
+# 解析产物的通用渲染工具
+# ----------------------------------------------------------------------
+#: ``damage`` / ``killed`` 这类字典的键是「单位内部名」，这里把它们收敛成
+#: 少量可读类别，避免提示词里出现一长串 ``npc_dota_neutral_xxx``。
+def unit_label(heroes: dict[int, dict], key: Any) -> str:
+    """把单位内部名翻成可读标签（英雄名 / 小兵 / 野怪 / 建筑）。"""
+    raw = str(key or "").strip()
+    if not raw or raw.lower() in ("null", "none"):
+        return "普攻/未记录来源"
+    if raw.startswith("npc_dota_hero_"):
+        return hname_by_npc(heroes, raw)
+    if raw.startswith("npc_dota_creep_"):
+        return "小兵"
+    if raw.startswith("npc_dota_neutral_"):
+        return "野怪"
+    if raw.startswith("npc_dota_badguys_") or raw.startswith("npc_dota_goodguys_"):
+        return "建筑"
+    if raw.startswith("npc_dota_"):
+        return raw[len("npc_dota_"):].replace("_", " ")
+    return raw
+
+
+def ability_label(key: Any) -> str:
+    """技能 / 物品内部名 → 可读标签（``ogre_magi_fireblast`` → ``Ogre Magi Fireblast``）。"""
+    raw = str(key or "").strip()
+    if not raw or raw.lower() in ("null", "none"):
+        return "普攻/未记录"
+    if raw.startswith("npc_dota_"):
+        return raw[len("npc_dota_"):].replace("_", " ")
+    return raw.replace("_", " ")
+
+
+def _breakdown_text(
+    data: Any,
+    limit: int = 5,
+    *,
+    labels: dict[int, str] | None = None,
+    labeler: Any = None,
+    percent: bool = True,
+) -> str:
+    """把 ``{键: 数值}`` 形状的解析数据渲染成「标签 数值(占比)」。
+
+    解析产物里大量字段都是这个形状（``gold_reasons`` / ``damage`` /
+    ``item_uses`` / ``killed`` / ``damage_taken`` …），统一在这里处理：
+
+    * 数值解析失败的项直接跳过（``None`` / 嵌套 dict 等）；
+    * 按绝对值倒序取前 ``limit`` 项；
+    * 占比按绝对值之和算，这样「死亡损失」这类负值不会把分母搞错。
+    """
+    if not isinstance(data, dict) or not data:
+        return ""
+    rows: list[tuple[float, float, str]] = []
+    for key, value in data.items():
+        if isinstance(value, bool):
+            continue
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            continue
+        if num == 0:
+            continue
+        if labeler is not None:
+            label = labeler(key)
+        elif labels is not None:
+            try:
+                label = labels.get(int(key), f"原因{key}")
+            except (TypeError, ValueError):
+                label = f"原因{key}"
+        else:
+            label = str(key)
+        rows.append((abs(num), num, label))
+    if not rows:
+        return ""
+    total = sum(row[0] for row in rows) or 1.0
+    rows.sort(key=lambda item: item[0], reverse=True)
+    parts: list[str] = []
+    for _, num, label in rows[:limit]:
+        if percent:
+            parts.append(f"{label} {num:,.0f}({abs(num) / total * 100:.0f}%)")
+        else:
+            parts.append(f"{label} {num:,.0f}")
+    return "、".join(parts)
+
+
+def summarize_series(values: Any, step: int = 3) -> str:
+    """把逐分钟数组采样成 ``0m 0 · 3m 2.1k · …``。
+
+    解析产物动辄 40~60 个采样点，全部塞进提示词性价比极低：采样后既保住
+    走势形状，又不会把其它信息淹掉。
+    """
+    if not isinstance(values, list) or not values:
+        return ""
+    step = max(1, int(step))
+    parts: list[str] = []
+    for minute in range(0, len(values), step):
+        parts.append(f"{minute}m {fmt_k(values[minute])}")
+    last = len(values) - 1
+    if last % step:  # 末尾没落在采样点上时补一个，避免丢掉终局值
+        parts.append(f"{last}m {fmt_k(values[last])}")
+    return " · ".join(parts)
+
+
+def summarize_player_curve(player: dict, step: int = 3) -> list[str]:
+    """逐分钟发育曲线（经济 / 经验 / 补刀 / 反补 / 英雄伤害 / 堆野）。
+
+    只有 OpenDota 的完整解析产物才带这些数组；缺哪条就跳过哪条。
+    """
+    rows: list[str] = []
+    pairs = [
+        ("gold_t", "逐分钟累计金钱"),
+        ("xp_t", "逐分钟累计经验"),
+        ("lh_t", "逐分钟累计补刀"),
+        ("dn_t", "逐分钟累计反补"),
+        ("hero_damage_t", "逐分钟累计英雄伤害"),
+    ]
+    for key, title in pairs:
+        text = summarize_series(player.get(key), step)
+        if text:
+            rows.append(f"{title}: {text}")
+    stacked = player.get("camps_stacked_t")
+    if isinstance(stacked, list) and any(int(x or 0) for x in stacked if isinstance(x, (int, float))):
+        rows.append("逐分钟堆野: " + summarize_series(stacked, step))
+    healed = player.get("hero_healing_t")
+    if isinstance(healed, list) and any(int(x or 0) for x in healed if isinstance(x, (int, float))):
+        rows.append("逐分钟累计治疗: " + summarize_series(healed, step))
+    return rows
+
+
+def dead_time_text(player: dict) -> str:
+    """由 ``life_state`` 推算「阵亡 + 复活等待」时长（占比赛时长比例）。"""
+    states = player.get("life_state")
+    if not isinstance(states, dict):
+        return "-"
+    total = 0.0
+    dead = 0.0
+    found = False
+    for key, value in states.items():
+        try:
+            num = float(value)
+            index = int(key)
+        except (TypeError, ValueError):
+            continue
+        total += num
+        if index == 2:
+            dead = num
+            found = True
+    if not found or total <= 0:
+        return "-"
+    return f"{dead:,.0f}s（占总时长 {dead / total * 100:.0f}%）"
+
+
+def summarize_damage_targets(
+    player: dict, heroes: dict[int, dict], limit: int = 4
+) -> str:
+    """``damage_targets``（技能 → 受害者）汇总成「对谁造成最多英雄伤害」。
+
+    这是判断「谁在对线/团战里针对谁」最直接的证据，比单纯的
+    ``hero_damage`` 总量信息量大得多。
+    """
+    targets = player.get("damage_targets")
+    if not isinstance(targets, dict):
+        return ""
+    total: dict[str, float] = {}
+    for victims in targets.values():
+        if not isinstance(victims, dict):
+            continue
+        for victim, value in victims.items():
+            name = str(victim)
+            if not name.startswith("npc_dota_hero_"):
+                continue
+            try:
+                num = float(value)
+            except (TypeError, ValueError):
+                continue
+            total[name] = total.get(name, 0.0) + num
+    if not total:
+        return ""
+    ordered = sorted(total.items(), key=lambda kv: kv[1], reverse=True)
+    return "、".join(
+        f"对{hname_by_npc(heroes, name)} {int(value):,}" for name, value in ordered[:limit]
+    )
+
+
+def summarize_wards(player: dict, heroes: dict[int, dict]) -> str:
+    """视野：插眼数量 + 时间跨度 + 被敌方清除的数量。
+
+    ``obs_left_log`` / ``sen_left_log`` 里 ``attackername`` 是「是谁让它消失的」，
+    自己把自己插的眼换掉（补位）也会记进去，因此这里只把「敌方英雄清除」算作被反。
+    """
+    hero_info = heroes.get(player.get("hero_id")) if isinstance(heroes, dict) else None
+    own_npc = (hero_info or {}).get("name")
+
+    def _times(rows: Any) -> list[int]:
+        out: list[int] = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            stamp = row.get("time")
+            if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+                continue
+            out.append(int(stamp))
+        return out
+
+    parts: list[str] = []
+    for log_key, label, left_key in WARD_LOGS:
+        placed = _times(player.get(log_key))
+        if not placed:
+            continue
+        text = f"{label} {len(placed)} 个（首次 {fmt_clock(min(placed))}"
+        if len(placed) > 1:
+            text += f" / 末次 {fmt_clock(max(placed))}"
+        text += "）"
+        denied = 0
+        for row in player.get(left_key) or []:
+            if not isinstance(row, dict):
+                continue
+            attacker = row.get("attackername")
+            if not isinstance(attacker, str) or not attacker.startswith("npc_dota_hero_"):
+                continue
+            if own_npc and attacker == own_npc:
+                continue  # 自己换的眼，不算被反
+            denied += 1
+        if denied:
+            text += f"（被敌方清除 {denied} 个）"
+        parts.append(text)
+    return "　".join(parts)
+
+
+def summarize_kill_log(player: dict, heroes: dict[int, dict]) -> str:
+    """``kills_log`` → 「时间 目标」的击杀时间线（判断节奏点用）。"""
+    log = player.get("kills_log")
+    if not isinstance(log, list) or not log:
+        return ""
+    parts: list[str] = []
+    for row in log:
+        if not isinstance(row, dict):
+            continue
+        parts.append(f"{fmt_clock(row.get('time'))} {hname_by_npc(heroes, row.get('key'))}")
+    return "、".join(parts)
+
+
+def summarize_killed_by(player: dict, heroes: dict[int, dict], limit: int = 5) -> str:
+    """``killed_by`` → 「被谁击杀了几次」。"""
+    killed_by = player.get("killed_by")
+    if not isinstance(killed_by, dict) or not killed_by:
+        return ""
+    rows: list[tuple[float, str]] = []
+    for name, value in killed_by.items():
+        if not str(name).startswith("npc_dota_hero_"):
+            continue
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            continue
+        rows.append((num, hname_by_npc(heroes, name)))
+    if not rows:
+        return ""
+    rows.sort(key=lambda item: item[0], reverse=True)
+    return "、".join(f"{label}×{int(num)}" for num, label in rows[:limit])
+
+
+def summarize_multi_kills(player: dict) -> str:
+    """``multi_kills`` / ``kill_streaks`` → 「双杀×2、三杀×1」这种描述。"""
+    parts: list[str] = []
+    multi = player.get("multi_kills")
+    if isinstance(multi, dict):
+        rows: list[tuple[int, int]] = []
+        for key, value in multi.items():
+            try:
+                rows.append((int(key), int(value)))
+            except (TypeError, ValueError):
+                continue
+        rows.sort()
+        text = "、".join(
+            f"{MULTI_KILL_TEXT.get(size, f'{size}连杀')}×{count}"
+            for size, count in rows
+            if count
+        )
+        if text:
+            parts.append(text)
+    streaks = player.get("kill_streaks")
+    if isinstance(streaks, dict):
+        rows = []
+        for key, value in streaks.items():
+            try:
+                rows.append((int(key), int(value)))
+            except (TypeError, ValueError):
+                continue
+        rows.sort(reverse=True)
+        if rows:
+            parts.append(
+                "最长连杀 %d 次" % rows[0][0]
+                + (f"（达成 {sum(c for _, c in rows)} 次）" if rows[0][1] else "")
+            )
+    return "；".join(parts)
+
+
+def summarize_item_timeline(
+    player: dict, item_index: ItemIndex, min_cost: int = 2000
+) -> str:
+    """``purchase_log`` → 关键装备（≥ ``min_cost``）的购买时间线。"""
+    log = player.get("purchase_log")
+    if not isinstance(log, list) or not log:
+        return ""
+    parts: list[str] = []
+    for entry in log:
+        if not isinstance(entry, dict):
+            continue
+        key = entry.get("key")
+        if item_index.cost(key) < min_cost:
+            continue
+        parts.append(
+            f"{item_index.name(key, default=str(key))}@{fmt_clock(entry.get('time'))}"
+        )
+    return "、".join(parts)
+
+
+def summarize_neutral_items(player: dict, item_index: ItemIndex) -> str:
+    """``neutral_item_history`` → 中立物品（含附魔）的获取时间线。"""
+    history = player.get("neutral_item_history")
+    if not isinstance(history, list) or not history:
+        return ""
+    parts: list[str] = []
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        name = item_index.name(
+            entry.get("item_neutral"), default=str(entry.get("item_neutral") or "?")
+        )
+        enhancement = entry.get("item_neutral_enhancement")
+        text = f"{name}@{fmt_clock(entry.get('time'))}"
+        if enhancement:
+            text += f"[{str(enhancement).replace('enhancement_', '')}]"
+        parts.append(text)
+    return "、".join(parts)
+
+
+def summarize_ability_build(
+    player: dict, ability_names: dict[int, str] | None, limit: int = 20
+) -> str:
+    """``ability_upgrades_arr`` → 加点顺序。
+
+    数组里存的是技能**数字 ID**，没有常量表就完全不可读（``5439`` 是什么
+    谁也猜不出来），因此拿不到名字映射时**宁可不输出**，也不喂一串数字。
+    """
+    upgrades = player.get("ability_upgrades_arr")
+    if not isinstance(upgrades, list) or not upgrades or not ability_names:
+        return ""
+    ordinals = [
+        "1级", "2级", "3级", "4级", "5级", "6级", "7级", "8级", "9级", "10级",
+        "11级", "12级", "13级", "14级", "15级", "16级", "17级", "18级",
+        "19级", "20级", "21级", "22级", "23级", "24级", "25级",
+    ]
+    parts: list[str] = []
+    for index, ability_id in enumerate(upgrades[:limit]):
+        try:
+            name = ability_names.get(int(ability_id))
+        except (TypeError, ValueError):
+            name = None
+        label = ability_label(name) if name else f"技能#{ability_id}"
+        level_text = ordinals[index] if index < len(ordinals) else f"第{index + 1}次"
+        parts.append(f"{level_text} {label}")
+    return " → ".join(parts)
+
+
+def summarize_ability_uses(player: dict, limit: int = 6) -> str:
+    """``ability_uses`` → 用得最多的技能（看这名玩家实际在干什么）。"""
+    return _breakdown_text(player.get("ability_uses"), limit, labeler=ability_label)
+
+
+def summarize_item_uses(player: dict, limit: int = 6) -> str:
+    """``item_uses`` → 用得最多的主动道具（跳刀/魔棒/雾…看行动力）。"""
+    return _breakdown_text(player.get("item_uses"), limit, labeler=ability_label)
+
+
+def player_advanced_line(
+    player: dict,
+    heroes: dict[int, dict],
+    item_index: ItemIndex,
+    *,
+    limit: int = 3,
+) -> str:
+    """十人表里的「进阶一行」：把解析产物按最影响判断的几个维度压缩成一行。
+
+    与焦点玩家的深入小节故意保持不同粒度 —— 十人表要的是横向可比，
+    焦点要的是纵向细节。
+    """
+    parts: list[str] = []
+    dealt = _breakdown_text(player.get("damage_inflictor"), limit, labeler=ability_label)
+    if dealt:
+        parts.append(f"输出构成 {dealt}")
+    taken = _breakdown_text(
+        player.get("damage_taken"), limit, labeler=lambda k: unit_label(heroes, k)
+    )
+    if taken:
+        parts.append(f"承伤构成 {taken}")
+    # 说明：经济来源已在上一条「进阶行」里给过（那里还带死亡耗时等），
+    # 这里不再重复，避免同一份提示词里同一条信息出现两次。
+    xp_from = _breakdown_text(player.get("xp_reasons"), limit, labels=XP_REASONS)
+    if xp_from:
+        parts.append(f"经验来源 {xp_from}")
+    targets = summarize_damage_targets(player, heroes, limit)
+    if targets:
+        parts.append(f"主要输出对象 {targets}")
+    uses = summarize_item_uses(player, limit)
+    if uses:
+        parts.append(f"道具使用 {uses}")
+    abilities = summarize_ability_uses(player, limit)
+    if abilities:
+        parts.append(f"技能使用 {abilities}")
+    return " | ".join(parts)
 
 
 def _player_row(
@@ -786,28 +1375,103 @@ def _player_row(
         item_name = item_index.name(player.get(f"item_{index}"), default="")
         if item_name:
             inventory.append(item_name)
+    for index in range(3):
+        backpack_item = item_index.name(player.get(f"backpack_{index}"), default="")
+        if backpack_item:
+            inventory.append(f"[背包]{backpack_item}")
     neutral = item_index.name(player.get("item_neutral"), default="")
     if neutral:
         inventory.append(f"[中立]{neutral}")
+    if player.get("aghanims_scepter"):
+        inventory.append("[已出神杖]")
+    if player.get("aghanims_shard"):
+        inventory.append("[已出魔晶]")
+    if player.get("moonshard"):
+        inventory.append("[已吃月之碎片]")
 
-    return (
-        f"{side} | {name}"
-        f"{'(→焦点)' if player.get('_focus') else ''} | {hname(heroes, player.get('hero_id'))} "
-        f"Lv{player.get('level', '-')} | {kda} KDA{fmt_float(player.get('_kda', 0))} "
-        f"| 净经济{net} GPM{player.get('gold_per_min', '-')}/XPM{player.get('xp_per_min', '-')} "
-        f"| 补刀{player.get('last_hits', '-')}/{player.get('denies', '-')} "
-        f"| 英雄伤害{fmt_num(player.get('hero_damage', 0))} 塔伤{fmt_num(player.get('tower_damage', 0))} "
-        f"治疗{fmt_num(player.get('hero_healing', 0))} | 参团率{tf_text} "
-        f"| 控制{_num_or_dash(player.get('stuns'), 1, suffix='s')} "
-        f"假眼{_int_or_dash(player.get('obs_placed'))}/真眼{_int_or_dash(player.get('sen_placed'))} "
-        f"| 出装: {', '.join(inventory) or '-'}"
-    )
+    # 受伤/死亡相关的进阶字段：只有完整解析才有，缺失时整段不输出
+    extras: list[str] = []
+    gold_reasons = _breakdown_text(player.get("gold_reasons"), 3, labels=GOLD_REASONS)
+    if gold_reasons:
+        extras.append(f"经济来源 {gold_reasons}")
+    dead_time = dead_time_text(player)
+    if dead_time != "-":
+        extras.append(f"阵亡+复活耗时 {dead_time}")
+    gold_spent = player.get("gold_spent")
+    gold_left = player.get("gold")
+    if gold_spent is not None or gold_left is not None:
+        extras.append(f"已花费{fmt_num(gold_spent)}/余额{fmt_num(gold_left)}")
+    if player.get("firstblood_claimed"):
+        extras.append("拿到一血")
+    multi = summarize_multi_kills(player)
+    if multi:
+        extras.append(multi)
+    for label, key in (
+        ("击杀建筑", "towers_killed"),
+        ("击杀肉山", "roshans_killed"),
+        ("堆野", "camps_stacked"),
+        ("吃符", "rune_pickups"),
+        ("信使击杀", "courier_kills"),
+        ("野怪击杀", "neutral_kills"),
+    ):
+        value = player.get(key)
+        if value:
+            extras.append(f"{label}{_int_or_dash(value)}")
+    pings = player.get("pings")
+    if pings is not None:
+        extras.append(f"打点 {pings} 次")
+
+    lines = [
+        (
+            f"{side} | {name}"
+            f"{'(→焦点)' if player.get('_focus') else ''} | {hname(heroes, player.get('hero_id'))} "
+            f"Lv{player.get('level', '-')} | {kda} KDA{fmt_float(player.get('_kda', 0))} "
+            f"| 净经济{net} GPM{player.get('gold_per_min', '-')}/XPM{player.get('xp_per_min', '-')} "
+            f"| 补刀{player.get('last_hits', '-')}/{player.get('denies', '-')} "
+            f"| 英雄伤害{fmt_num(player.get('hero_damage', 0))} 塔伤{fmt_num(player.get('tower_damage', 0))} "
+            f"治疗{fmt_num(player.get('hero_healing', 0))} | 参团率{tf_text} "
+            f"| 控制{_num_or_dash(player.get('stuns'), 1, suffix='s')} "
+            f"假眼{_int_or_dash(player.get('obs_placed'))}/真眼{_int_or_dash(player.get('sen_placed'))} "
+            f"| 出装: {', '.join(inventory) or '-'}"
+        )
+    ]
+    if extras:
+        lines.append("    　" + " | ".join(extras))
+    advanced = player_advanced_line(player, heroes, item_index)
+    if advanced:
+        lines.append("    　" + advanced)
+    return "\n".join(lines)
+
+
+def lane_efficiency_text(player: dict) -> str:
+    """对线补刀效率（把两种口径统一成百分比）。
+
+    OpenDota 同时给两个字段，而且**量纲不一样**，早期实现直接把
+    ``lane_efficiency_pct`` 又乘了一次 100，于是 119% 变成了「11900%」：
+
+    * ``lane_efficiency``：比率，1.2 表示 120%；
+    * ``lane_efficiency_pct``：已经是百分数，119 表示 119%。
+
+    优先用比率，其次用百分数（值 ≤5 时按比率处理，兼容少数把百分数字段
+    写成比率的解析结果）。两者都缺时返回 ``-``。
+    """
+    ratio = player.get("lane_efficiency")
+    if isinstance(ratio, (int, float)) and not isinstance(ratio, bool):
+        return f"{float(ratio) * 100:.0f}%"
+    pct = player.get("lane_efficiency_pct")
+    if isinstance(pct, (int, float)) and not isinstance(pct, bool):
+        value = float(pct)
+        return f"{value * 100:.0f}%" if value <= 5 else f"{value:.0f}%"
+    return "-"
 
 
 def _lane_text(player: dict) -> str:
     role = player.get("lane_role")
     lane = player.get("lane")
     parts = []
+    position = POSITION_TEXT.get(str(player.get("position") or "").upper())
+    if position:
+        parts.append(position)
     if role:
         parts.append(LANE_ROLES.get(int(role), f"位置{role}"))
     if lane:
@@ -815,6 +1479,40 @@ def _lane_text(player: dict) -> str:
     if player.get("is_roaming"):
         parts.append("游走")
     return " ".join(parts) or "未识别"
+
+
+def curve_points_text(player: dict, minutes: tuple[int, ...] = (10, 20, 30, 40)) -> str:
+    """把逐分钟曲线抽成「第 N 分钟累计值」，方便十人横向对比。
+
+    与 :func:`summarize_player_curve` 的分工：这里只取几个关键节点，
+    用来横向比谁发育快；那里保留完整走势，用来看单人的曲线形状。
+    """
+    bits: list[str] = []
+    gold = player.get("gold_t")
+    if isinstance(gold, list) and gold:
+        points = []
+        for minute in minutes:
+            if minute < len(gold):
+                points.append(f"{minute}m {fmt_k(gold[minute])}")
+        if points:
+            bits.append("金钱累计 " + " / ".join(points))
+    lh = player.get("lh_t")
+    if isinstance(lh, list) and lh:
+        points = []
+        for minute in minutes:
+            if minute < len(lh):
+                points.append(f"{minute}m {fmt_k(lh[minute])}")
+        if points:
+            bits.append("补刀累计 " + " / ".join(points))
+    xp = player.get("xp_t")
+    if isinstance(xp, list) and xp:
+        points = []
+        for minute in minutes:
+            if minute < len(xp):
+                points.append(f"{minute}m {fmt_k(xp[minute])}")
+        if points:
+            bits.append("经验累计 " + " / ".join(points))
+    return "；".join(bits)
 
 
 def normalize_focus_ids(value: Any) -> list[int]:
@@ -851,14 +1549,26 @@ def build_match_data_text(
     items: dict[str, dict] | None = None,
     focus_account_ids: int | list[int] | tuple[int, ...] | None = None,
     include_timeline: bool = True,
+    *,
+    abilities: dict[int, str] | None = None,
+    ability_names: dict[int, str] | None = None,
+    curve_ids: list[int] | None = None,
 ) -> str:
     """把单场比赛整理成详尽的文本，供大模型复盘使用。
 
     ``focus_account_ids`` 支持传一位或多位焦点玩家（同一局里可能有多位被监听
     的玩家参战）；每位焦点玩家都会得到一份独立的「深入数据」小节。
+
+    ``abilities`` / ``ability_names``：技能常量映射 ``{技能ID: 技能内部名}``。
+    只有拿到它才能把 ``ability_upgrades_arr``（一串数字）翻译成加点顺序，
+    因此这是个可选增强项，拿不到就不输出加点小节。
+
+    ``curve_ids``：额外需要「逐分钟发育曲线」的玩家。焦点玩家默认都有，
+    这里主要给「无焦点玩家时也要看两边核心的发育节奏」这种场景用。
     """
     items = items or {}
     item_index = ItemIndex(items)
+    ability_map = ability_names if ability_names is not None else abilities
     players = [p for p in (match.get("players") or []) if isinstance(p, dict)]
 
     radiant = [p for p in players if is_radiant(p.get("player_slot"))]
@@ -867,6 +1577,7 @@ def build_match_data_text(
     winner = "天辉" if radiant_win else "夜魇"
 
     focus_ids = normalize_focus_ids(focus_account_ids)
+    curve_id_list = normalize_focus_ids(curve_ids)
 
     for player in players:
         try:
@@ -907,7 +1618,23 @@ def build_match_data_text(
     if match.get("patch"):
         lines.append(f"补丁版本代号(patch): {match.get('patch')}")
     if region or cluster:
-        lines.append(f"region: {region}　cluster: {cluster}")
+        lines.append(
+            f"region: {region if region is not None else '未提供'}"
+            f"　cluster: {cluster if cluster is not None else '未提供'}"
+        )
+    buildings = building_states_text(match)
+    if buildings:
+        lines.append("建筑存活: " + buildings)
+    if match.get("average_rank"):
+        lines.append(f"双方平均段位: {rank_text(match.get('average_rank'))}")
+    if match.get("human_players") is not None:
+        lines.append(f"真人玩家数: {match.get('human_players')}/10")
+    league = match.get("leagueid")
+    if league:
+        lines.append(
+            f"联赛对局: leagueid={league}"
+            + (f"　series_id={match.get('series_id')}" if match.get("series_id") else "")
+        )
     _parsed, _parsed_note = parsed_state(match)
     lines.append(f"数据完整度: {_parsed_note}")
 
@@ -943,13 +1670,13 @@ def build_match_data_text(
     xp_adv = match.get("radiant_xp_adv")
     if isinstance(xp_adv, list) and xp_adv:
         sampled = []
-        for minute in range(0, len(xp_adv), 6):
+        for minute in range(0, len(xp_adv), 3):
             try:
                 sampled.append(f"{minute}m {float(xp_adv[minute]) / 1000:+.1f}k")
             except (TypeError, ValueError):
                 continue
         if sampled:
-            lines.append("经验差采样: " + " ".join(sampled))
+            lines.append("经验差采样（每 3 分钟）: " + " ".join(sampled))
 
     swing = gold_adv_metrics(match)
     if swing:
@@ -969,8 +1696,16 @@ def build_match_data_text(
             lines.append("=== 关键事件时间轴 ===")
             lines.extend(events)
 
-    # 团战
-    fights = summarize_teamfights(match.get("teamfights") or [])
+    # 团战：带上英雄/玩家映射，才能说清「哪场团战谁先死、焦点玩家打出了什么」
+    fights = summarize_teamfights(
+        match.get("teamfights") or [],
+        heroes=heroes,
+        players=players,
+        focus_ids=focus_ids,
+        focus_names={
+            int(p.get("account_id") or 0): str(p.get("name") or "") for p in players
+        },
+    )
     if fights:
         lines.append("")
         lines.append(f"=== 团战（共 {len(match.get('teamfights') or [])} 次，列出前 12 次）===")
@@ -986,10 +1721,45 @@ def build_match_data_text(
     lines.append("")
     lines.append("=== 分路信息 ===")
     for player in players:
+        detail = _lane_text(player)
+        efficiency = lane_efficiency_text(player)
+        if efficiency != "-":
+            detail += f"　对线补刀效率 {efficiency}"
         lines.append(
             f"{('天辉' if is_radiant(player.get('player_slot')) else '夜魇')} "
-            f"{hname(heroes, player.get('hero_id'))}: {_lane_text(player)}"
+            f"{hname(heroes, player.get('hero_id'))}"
+            f"（{player.get('name') or player.get('account_id')}）: {detail}"
         )
+
+    # 十人发育节奏对比（只对完整解析产物有效）
+    comparison = []
+    for player in sorted(players, key=lambda p: int(p.get("player_slot") or 0)):
+        points = curve_points_text(player)
+        if points:
+            comparison.append(
+                f"{('天辉' if is_radiant(player.get('player_slot')) else '夜魇')} "
+                f"{hname(heroes, player.get('hero_id'))}"
+                f"（{player.get('name') or player.get('account_id')}）: {points}"
+            )
+    if comparison:
+        lines.append("")
+        lines.append("=== 发育节奏节点对比（累计值，可横向比发育速度）===")
+        lines.extend(comparison)
+
+    # 全员视野：判断「哪边视野做得好、辅助有没有干活」的直接证据
+    ward_rows = []
+    for player in sorted(players, key=lambda p: int(p.get("player_slot") or 0)):
+        ward = summarize_wards(player, heroes)
+        if ward:
+            ward_rows.append(
+                f"{('天辉' if is_radiant(player.get('player_slot')) else '夜魇')} "
+                f"{hname(heroes, player.get('hero_id'))}"
+                f"（{player.get('name') or player.get('account_id')}）: {ward}"
+            )
+    if ward_rows:
+        lines.append("")
+        lines.append("=== 视野与守卫 ===")
+        lines.extend(ward_rows)
 
     # 焦点玩家深入数据（可能有多位：同一局里被监听的多位玩家都参战了）
     if focuses:
@@ -1007,7 +1777,30 @@ def build_match_data_text(
             if len(focuses) > 1:
                 lines.append("")
                 lines.append(f"--- 焦点玩家 {index} ---")
-            lines.extend(_focus_detail_lines(focus, heroes, item_index, radiant_win))
+            lines.extend(
+                _focus_detail_lines(
+                    focus, heroes, item_index, radiant_win, ability_map
+                )
+            )
+
+    # 额外指定的曲线对象（无焦点玩家时也能看到指定玩家的发育走势）
+    extra_curve = [
+        p
+        for p in players
+        if int(p.get("account_id") or 0) in curve_id_list
+        and not p.get("_focus")
+    ]
+    if extra_curve:
+        lines.append("")
+        lines.append("=== 指定玩家发育曲线 ===")
+        for player in extra_curve:
+            lines.append(
+                f"{hname(heroes, player.get('hero_id'))}"
+                f"（{player.get('name') or player.get('account_id')}）:"
+            )
+            lines.extend(
+                "　" + row for row in summarize_player_curve(player)
+            )
 
     # 未解析时补充提示（与标题行走同一套判据，不会自相矛盾）
     if not _parsed:
@@ -1144,8 +1937,16 @@ def _focus_detail_lines(
     heroes: dict[int, dict],
     item_index: ItemIndex,
     radiant_win: bool,
+    ability_names: dict[int, str] | None = None,
+    *,
+    curve_step: int = 3,
 ) -> list[str]:
-    """生成一位焦点玩家的「深入数据」小节。"""
+    """生成一位焦点玩家的「深入数据」小节。
+
+    这里的原则是**把解析产物榨干**：凡是能影响「这名玩家打得怎么样」判断的
+    字段，只要数据源给了，就都翻成可读文本喂进去。整段都是「有则输出、
+    无则跳过」，所以未解析的比赛不会出现半截空小节。
+    """
     lines: list[str] = []
     lines.append(
         f"玩家: {focus.get('name') or focus.get('account_id')}（account_id={focus.get('account_id')}）"
@@ -1181,8 +1982,66 @@ def _focus_detail_lines(
     )
     lines.append(
         f"分路: {_lane_text(focus)}　"
-        f"补刀效率 {_pct_or_dash(focus.get('lane_efficiency_pct'))}"
+        f"补刀效率 {lane_efficiency_text(focus)}"
     )
+
+    # ---- 经济与经验：钱和经验到底从哪来 ------------------------------
+    gold_from = _breakdown_text(focus.get("gold_reasons"), 6, labels=GOLD_REASONS)
+    if gold_from:
+        lines.append("经济来源分解: " + gold_from)
+    xp_from = _breakdown_text(focus.get("xp_reasons"), 5, labels=XP_REASONS)
+    if xp_from:
+        lines.append("经验来源分解: " + xp_from)
+    money_bits = []
+    for label, key in (
+        ("总金钱", "total_gold"),
+        ("总经验", "total_xp"),
+        ("已花费", "gold_spent"),
+        ("未花费", "gold"),
+        ("野怪击杀", "neutral_kills"),
+        ("堆野", "camps_stacked"),
+        ("吃符", "rune_pickups"),
+    ):
+        value = focus.get(key)
+        if value is not None:
+            money_bits.append(f"{label} {fmt_num(value)}")
+    if money_bits:
+        lines.append("　".join(money_bits))
+
+    # ---- 输出 / 承伤构成：判断「他到底在打谁、被谁打」----------------
+    dealt_by_ability = _breakdown_text(
+        focus.get("damage_inflictor"), 6, labeler=ability_label
+    )
+    if dealt_by_ability:
+        lines.append("输出构成（按技能，null 为普攻）: " + dealt_by_ability)
+    dealt_by_target = _breakdown_text(
+        focus.get("damage"), 6, labeler=lambda k: unit_label(heroes, k)
+    )
+    if dealt_by_target:
+        lines.append("输出构成（按目标单位）: " + dealt_by_target)
+    hero_matrix = summarize_damage_targets(focus, heroes, limit=5)
+    if hero_matrix:
+        lines.append("对英雄伤害明细: " + hero_matrix)
+    taken_from = _breakdown_text(
+        focus.get("damage_taken"), 6, labeler=lambda k: unit_label(heroes, k)
+    )
+    if taken_from:
+        lines.append("承伤构成（按来源单位）: " + taken_from)
+    taken_by_ability = _breakdown_text(
+        focus.get("damage_inflictor_received"), 6, labeler=ability_label
+    )
+    if taken_by_ability:
+        lines.append("承伤构成（按技能）: " + taken_by_ability)
+    max_hit = focus.get("max_hero_hit")
+    if isinstance(max_hit, dict) and max_hit.get("value"):
+        lines.append(
+            f"单次最高英雄伤害 {fmt_num(max_hit.get('value'))}"
+            f"（{fmt_clock(max_hit.get('time'))}，"
+            f"{ability_label(max_hit.get('inflictor'))} → "
+            f"{hname_by_npc(heroes, max_hit.get('key'))}）"
+        )
+
+    # ---- 击杀网络 -------------------------------------------------
     killed = focus.get("killed")
     if isinstance(killed, dict):
         hero_kills = {
@@ -1198,6 +2057,59 @@ def _focus_detail_lines(
                 "击杀记录: "
                 + "、".join(f"{hname_by_npc(heroes, k)}×{v}" for k, v in ordered)
             )
+    killed_by = summarize_killed_by(focus, heroes, 5)
+    if killed_by:
+        lines.append("被谁击杀: " + killed_by)
+    kill_log = summarize_kill_log(focus, heroes)
+    if kill_log:
+        lines.append("击杀时间线: " + kill_log)
+    multi = summarize_multi_kills(focus)
+    if multi:
+        lines.append("连杀记录: " + multi)
+
+    # ---- 生存能力 -------------------------------------------------
+    dead_time = dead_time_text(focus)
+    if dead_time != "-":
+        lines.append("阵亡+复活耗时: " + dead_time)
+
+    # ---- 视野 -----------------------------------------------------
+    wards = summarize_wards(focus, heroes)
+    if wards:
+        lines.append("视野: " + wards)
+
+    # ---- 技能与道具 ------------------------------------------------
+    build = summarize_ability_build(focus, ability_names)
+    if build:
+        lines.append("技能加点顺序: " + build)
+    ability_uses = summarize_ability_uses(focus, 8)
+    if ability_uses:
+        lines.append("技能使用次数: " + ability_uses)
+    ability_targets = focus.get("ability_targets")
+    if isinstance(ability_targets, dict) and ability_targets:
+        bits = []
+        for ability, victims in list(ability_targets.items())[:4]:
+            if not isinstance(victims, dict) or not victims:
+                continue
+            top = sorted(
+                ((str(k), v) for k, v in victims.items()),
+                key=lambda kv: -float(kv[1] or 0),
+            )[0]
+            bits.append(
+                f"{ability_label(ability)} 主要给 {unit_label(heroes, top[0])}×{top[1]}"
+            )
+        if bits:
+            lines.append("技能施放对象: " + "、".join(bits))
+    item_uses = summarize_item_uses(focus, 8)
+    if item_uses:
+        lines.append("道具使用次数: " + item_uses)
+    hero_hits = _breakdown_text(focus.get("hero_hits"), 6, labeler=ability_label)
+    if hero_hits:
+        lines.append("技能命中英雄次数（按技能）: " + hero_hits)
+
+    # ---- 装备 -----------------------------------------------------
+    neutral_items = summarize_neutral_items(focus, item_index)
+    if neutral_items:
+        lines.append("中立物品获取: " + neutral_items)
     buybacks = focus.get("buyback_log")
     if isinstance(buybacks, list) and buybacks:
         lines.append(
@@ -1208,20 +2120,23 @@ def _focus_detail_lines(
                 if isinstance(item, dict)
             )
         )
-    # 大件时间线
-    log = focus.get("purchase_log")
-    if isinstance(log, list) and log:
-        majors = []
-        for entry in log:
-            if not isinstance(entry, dict):
-                continue
-            key = entry.get("key")
-            if item_index.cost(key) >= 2000:
-                majors.append(
-                    f"{item_index.name(key, default=str(key))}@{fmt_clock(entry.get('time'))}"
-                )
-        if majors:
-            lines.append("关键装备时间线: " + "、".join(majors))
+    major_timeline = summarize_item_timeline(focus, item_index, min_cost=2000)
+    if major_timeline:
+        lines.append("关键装备时间线（≥2000 金币）: " + major_timeline)
+    all_timeline = summarize_item_timeline(focus, item_index, min_cost=500)
+    if all_timeline and all_timeline != major_timeline:
+        lines.append("全部装备时间线（≥500 金币）: " + all_timeline)
+
+    # ---- 逐分钟发育曲线 --------------------------------------------
+    curve = summarize_player_curve(focus, curve_step)
+    if curve:
+        lines.append("逐分钟发育曲线（每 %d 分钟采样）:" % curve_step)
+        lines.extend("　" + row for row in curve)
+
+    # ---- 行动节奏 -------------------------------------------------
+    pings = focus.get("pings")
+    if pings is not None:
+        lines.append(f"信号打点次数: {pings}")
     return lines
 
 
@@ -1339,6 +2254,50 @@ def to_steam_id64(account_id: Any) -> str:
         return ""
 
 
+def _popcount(value: Any, mask: int) -> int:
+    """位掩码里被置位的数量（用于塔/兵营存活状态）。"""
+    try:
+        return bin(int(value) & mask).count("1")
+    except (TypeError, ValueError):
+        return 0
+
+
+def building_states_text(match: dict) -> str:
+    """由塔 / 兵营的状态位掩码推算出「丢了多少、还剩多少」。
+
+    **口径（踩过坑，别再改回去）**：OpenDota 的 ``tower_status_*`` /
+    ``barracks_status_*`` 位掩码里，**置位 = 这座建筑还活着（standing）**，
+    不是「已被摧毁」。``0x7FF``（11 位全 1）= 11 座塔全在，``0`` = 全丢。
+
+    取证方式（两处独立字段互证）：样本 ``8995536921`` 里
+    ``tower_status_radiant = 54``（popcount 4）、``tower_status_dire = 1974``
+    （popcount 8），而 ``objectives`` 的 ``building_kill`` 事件显示天辉被拆
+    7 座、夜魇被拆 3 座 —— ``11 - 7 = 4``、``11 - 3 = 8``，正好等于置位数。
+    兵营同理（``barracks_status_radiant = 15`` → 4 存活，而事件只拆了
+    下路近战/远程两座）。
+    """
+    parts: list[str] = []
+    tower_mask = 0x7FF  # 11 座塔（三路各 3 座 + 2 座四塔）
+    barracks_mask = 0x3F  # 6 座兵营（三路各 近战/远程）
+    for key, label, mask, total in (
+        ("tower_status_radiant", "天辉塔", tower_mask, 11),
+        ("tower_status_dire", "夜魇塔", tower_mask, 11),
+        ("barracks_status_radiant", "天辉兵营", barracks_mask, 6),
+        ("barracks_status_dire", "夜魇兵营", barracks_mask, 6),
+    ):
+        if match.get(key) is None:
+            continue
+        alive = _popcount(match.get(key), mask)
+        lost = total - alive
+        if lost >= total:
+            parts.append(f"{label} 全丢（{total}/{total}）")
+        elif lost:
+            parts.append(f"{label} 丢 {lost}/{total}（剩 {alive}）")
+        else:
+            parts.append(f"{label} 完好（{total}/{total}）")
+    return "　".join(parts)
+
+
 def match_quality_block(match: dict) -> str:
     """比赛质量评估用到的客观指标。"""
     players = match.get("players") or []
@@ -1352,6 +2311,14 @@ def match_quality_block(match: dict) -> str:
         f"时长: {fmt_duration(duration)}",
         f"最大经济领先: {'天辉' if peak >= 0 else '夜魇'} {abs(peak) / 1000:.1f}k @ {minute} 分钟",
     ]
+    # 数据源自带的翻盘/碾压指标（与上面自行推导的口径可以互相印证）
+    comeback = match.get("comeback")
+    stomp = match.get("stomp")
+    if comeback is not None and stomp is not None:
+        rows.append(
+            f"数据源判定: 最终输方全场最大领先 {float(comeback) / 1000:.1f}k（翻盘深度）、"
+            f"最终胜方全场最大领先 {float(stomp) / 1000:.1f}k（碾压程度）"
+        )
     # 团战数据只在真的解析出来时才可用。未解析时 teamfights 缺失/为空，
     # 此时必须说「不可用」；说「0 次」会让模型以为这局没有团战。
     if isinstance(fights, list) and fights:
@@ -1368,6 +2335,45 @@ def match_quality_block(match: dict) -> str:
         else:
             rows.append("最终胜方全场未曾落后（一路领先/碾压局）")
         rows.append(f"终局经济差: {swing['final_margin'] / 1000:+.1f}k（正=天辉）")
+    # 塔 / 兵营 / 视野 / 经济总量：判断「优势有没有转化成推进」的关键
+    buildings = building_states_text(match)
+    if buildings:
+        rows.append("建筑存活: " + buildings)
+    sides = {"天辉": [], "夜魇": []}
+    for player in players:
+        if not isinstance(player, dict):
+            continue
+        sides["天辉" if is_radiant(player.get("player_slot")) else "夜魇"].append(player)
+    if all(sides.values()):
+        net_lines = []
+        for side, members in sides.items():
+            net = 0
+            obs = 0
+            sen = 0
+            for member in members:
+                try:
+                    net += int(member.get("net_worth") or member.get("total_gold") or 0)
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    obs += int(member.get("obs_placed") or 0)
+                    sen += int(member.get("sen_placed") or 0)
+                except (TypeError, ValueError):
+                    pass
+            net_lines.append(f"{side} 总净经济 {net / 1000:.1f}k、合计插眼 {obs}假/{sen}真")
+        rows.append("　".join(net_lines))
     deaths = sum(int(p.get("deaths") or 0) for p in players if isinstance(p, dict))
     rows.append(f"十人合计阵亡: {deaths}")
+    average_rank = match.get("average_rank")
+    if average_rank:
+        rows.append(f"双方平均段位: {rank_text(average_rank)}")
+    human = match.get("human_players")
+    if human is not None:
+        rows.append(f"真人玩家数: {human}/10")
+    league = match.get("leagueid")
+    series = match.get("series_id")
+    if league:
+        rows.append(f"联赛对局: leagueid={league}" + (f" series_id={series}" if series else ""))
+    if match.get("pre_game_duration"):
+        rows.append(f"赛前准备时长: {fmt_duration(match.get('pre_game_duration'))}")
     return "\n".join(rows)

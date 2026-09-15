@@ -16,7 +16,7 @@ import inspect
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
@@ -58,6 +58,7 @@ try:  # 插件目录被作为包加载时的相对导入
         summarize_matches,
     )
     from .dota_store import DotaStore
+    from . import dota_chat
     from . import dota_nlu
     from . import dota_parse
 except ImportError:  # 兜底：以普通模块方式加载时（把插件目录加入 sys.path）
@@ -101,6 +102,7 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
     )
     from dota_store import DotaStore  # type: ignore[no-redef]
 
+    import dota_chat  # type: ignore[no-redef]
     import dota_nlu  # type: ignore[no-redef]
     import dota_parse  # type: ignore[no-redef]
 
@@ -190,6 +192,26 @@ NLU_SKIP_PREFIXES = ("/", "／", "!", "！", "#", "。", "~", "～")
 #: 对话（尤其群里），因此默认要求消息里出现这个词才认。
 NLU_DEFAULT_KEYWORD = "dota2助手"
 
+
+class NluGate(NamedTuple):
+    """唤醒词闸门的判定结果。
+
+    自然语言入口需要区分两种情况：
+
+    * 「放行」—— 这条消息不该由插件处理，原样交给别的插件与默认大模型；
+    * 「因为命中唤醒词才放行」—— 用户已经**明确点名**了插件，只是没说清
+      要什么。此时不该把消息扔回默认大模型（它看不到插件里的监听列表、
+      绑定关系、战绩数据），而应该由插件带着数据自己回答，
+      这就是「闲聊兜底」的触发条件。
+
+    所以闸门除了返回剥离唤醒词后的正文，还要把 ``keyword_matched``
+    一起带出来。
+    """
+
+    text: str
+    keyword_matched: bool
+
+
 #: 配置中未填写系统提示词时的兜底内容
 DEFAULT_SYSTEM_PROMPT = (
     "你是一位资深的 Dota 2 分析师与教练，擅长从 OpenDota 的对局数据中读出比赛的"
@@ -277,7 +299,11 @@ HELP_TEXT = """🎮 Dota2 数据查询助手（数据来源：STRATZ / OpenDota 
 · 少了唤醒词也不会打断你——插件什么都不做，消息照常交给默认大模型；
 · 群聊里不写唤醒词时，仍需 @ 机器人 才会响应（可在配置中关闭这个限制）；
 · 群里说「dota2助手 绑定 86745912」这类会改动数据的操作时，插件会先确认再执行；
-· 确认 / 取消可以直接回「确认」「取消」，不需要再带唤醒词。"""
+· 确认 / 取消可以直接回「确认」「取消」，不需要再带唤醒词；
+· 写了唤醒词但没识别出具体指令时，插件会**带着本会话的真实数据接着聊**，例如
+  「dota2助手 对比一下目前监听的几个人谁最菜」（会读出监听名单与各人近期战绩）、
+  「dota2助手 我想转辅助，该怎么练」（会结合你自己的英雄池与近期表现给建议）。
+  这类回答同样需要模型可用；用 `/d2 帮助` 里列出的指令能拿到更结构化的报告。"""
 
 
 def take_over_event(func=None, *, declinable: bool = False):
@@ -389,6 +415,11 @@ class Dota2Plugin(Star):
         #: 自然语言确认状态：``{(umo, uid): (intent_name, args, 过期时间戳)}``
         #: 群里说「绑定 xxx」这类多义指令时，先记下来等用户确认再执行。
         self._nlu_confirm: dict[tuple[str, str], tuple[str, str, float]] = {}
+        #: 闲聊兜底用的战绩快照缓存：``{(account_id, limit): (时间戳, matches)}``。
+        #: 由插件实例持有、跨会话复用；里面只放**纯数据**，快照对象每次新建
+        #: —— 同一个账号在 A 群是「本人」、在 B 群是「被监听」，
+        #: 直接把快照对象缓存起来会让两个会话互相污染。
+        self._chat_cache: dict[tuple[int, int], tuple[float, list[dict]]] = {}
         #: 正在等待解析的后台任务：``{(umo, match_id, sender_id): task}``
         #: 等待解析最长要十分钟，绝不能把 handler 挂在那里——AstrBot 的流水线
         #: 是洋葱模型，handler 每 yield 一次后续阶段就整体跑一遍。改为后台
@@ -627,10 +658,13 @@ class Dota2Plugin(Star):
         except OpenDotaError as e:
             logger.error(f"[dota2] 复盘比赛 {match_id} 时拉取常量失败：{e}")
             heroes, items = {}, {}
+        # 技能常量（id → 技能名）：拿不到就省略「技能加点」小节
+        abilities = await self._ability_constants()
 
         focus_ids = [int(i) for i in (focus_ids or []) if int(i or 0)]
         parsed = dota_parse.parse_state(match).parsed
         headline = self.match_headline(match, heroes, focus_ids or None, parsed)
+        curve_ids = self._curve_targets(match, focus_ids)
 
         extra_context = await self._build_recent_context(
             match_id, focus_ids, focus_names, heroes
@@ -642,6 +676,8 @@ class Dota2Plugin(Star):
             focus_account_ids=focus_ids or None,
             focus_names=focus_names or None,
             extra_context=extra_context,
+            abilities=abilities,
+            curve_ids=curve_ids,
         )
         report = await self._generate_report_for_umo(umo, prompt)
 
@@ -661,7 +697,12 @@ class Dota2Plugin(Star):
         raw = (
             "⚠️ 未启用大模型分析或模型不可用，以下为从数据源获取的完整原始数据：\n\n"
             + build_match_data_text(
-                match, heroes, items, focus_account_ids=focus_ids or None
+                match,
+                heroes,
+                items,
+                focus_account_ids=focus_ids or None,
+                abilities=abilities,
+                curve_ids=curve_ids,
             )
         )
         for chunk in self._chunk_text(raw):
@@ -670,6 +711,51 @@ class Dota2Plugin(Star):
     async def _generate_report_for_umo(self, umo: str, prompt: str) -> str | None:
         """在指定会话下调用大模型生成报告（供后台任务使用）。"""
         return await self._call_report_llm(prompt, umo=umo)
+
+    async def _ability_constants(self) -> dict[int, str]:
+        """技能常量 ``{技能ID: 技能名}``，用于把解析产物里的加点顺序翻译成可读文本。
+
+        这是**尽力而为**的增强项：只有 OpenDota 提供 ``/constants/ability_ids``
+        （STRATZ 侧直接返回空字典，或者旧数据源根本没有这个方法）。
+        拿不到时提示词会自动省略「技能加点」小节，不影响其余复盘内容。
+        """
+        getter = getattr(self.api, "get_ability_names", None)
+        if getter is None:
+            return {}
+        try:
+            return await getter()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[dota2] 获取技能常量失败，跳过技能加点：{e}")
+            return {}
+
+    @staticmethod
+    def _curve_targets(match: dict, focus_ids: list[int], limit: int = 2) -> list[int]:
+        """挑出「即便没有焦点玩家也值得看发育节奏」的对象。
+
+        没有指定焦点时（例如 `/d2 单场 <比赛ID>` 没写玩家），整场报告就没有
+        任何人的逐分钟曲线，而「两边核心的发育速度」恰恰是复盘的关键。
+        这里按净经济取前 ``limit`` 位补上；有焦点玩家时返回空列表，
+        因为焦点自己的深入小节里已经有完整曲线了。
+        """
+        if focus_ids:
+            return []
+        players = [
+            player
+            for player in (match.get("players") or [])
+            if isinstance(player, dict) and player.get("account_id")
+        ]
+        players.sort(
+            key=lambda player: -(
+                player.get("net_worth") or player.get("total_gold") or 0
+            )
+        )
+        picked: list[int] = []
+        for player in players[: max(0, int(limit))]:
+            try:
+                picked.append(int(player.get("account_id")))
+            except (TypeError, ValueError):
+                continue
+        return picked
 
     async def _build_recent_context(
         self,
@@ -1138,10 +1224,11 @@ class Dota2Plugin(Star):
         _matched, rest = dota_nlu.strip_wake_keyword(text, self._nlu_keyword())
         return rest
 
-    def _nlu_should_handle(self, event: AstrMessageEvent, text: str) -> str | None:
+    def _nlu_should_handle(self, event: AstrMessageEvent, text: str) -> NluGate | None:
         """判断这条消息要不要交给自然语言入口处理。
 
-        返回**真正送去解析的文本**（已剥掉唤醒词），返回 ``None`` 表示不处理。
+        返回 :class:`NluGate`（含**真正送去解析的文本**与「是否命中唤醒词」），
+        返回 ``None`` 表示不处理。
 
         自然语言入口是 ``EventMessageType.ALL`` 上的全局监听，不设闸门就会
         抢答别的插件（以及群里其他人的闲聊）的对话。闸门依次是：
@@ -1154,6 +1241,11 @@ class Dota2Plugin(Star):
         第 3 与第 4 步的关系：**唤醒词本身就是一次明确点名**，命中它就等于
         已经 @ 过机器人，因此不再重复要求 @，避免「又写唤醒词又 @」的双重
         门槛。反过来，只有 @ 而没写唤醒词的消息会被第 3 步挡掉。
+
+        注意返回值里的 ``keyword_matched``：只有它为真时，调用方才允许
+        走「闲聊兜底」（没识别出指令时由插件带数据回答）。关掉唤醒词
+        限制（``nlu_require_keyword=false``）时它恒为假，插件就不会去
+        抢答任何一条闲聊 —— 这是**故意的**安全一侧。
         """
         if not self.cfg("nlu_enabled", True):
             return None
@@ -1197,7 +1289,7 @@ class Dota2Plugin(Star):
                     return None
             except AttributeError:
                 return None
-        return effective
+        return NluGate(text=effective, keyword_matched=keyword_matched)
 
     async def _nlu_classify_with_llm(
         self, event: AstrMessageEvent, text: str
@@ -1215,6 +1307,77 @@ class Dota2Plugin(Star):
             logger.debug(f"[dota2] 自然语言分类调用失败: {e}")
             return None
         return dota_nlu.parse_classifier_reply(reply)
+
+    async def _nlu_chat_reply(self, event: AstrMessageEvent, question: str):
+        """闲聊兜底：没识别出指令时，带着插件内部数据让模型回答。
+
+        只在「命中唤醒词」之后才会走到这里（见 :meth:`_nlu_should_handle`
+        的返回值），因为唤醒词就是用户明确点名了插件。
+
+        典型场景：
+
+        * 「dota2助手 对比一下目前监听的几个人谁最菜」
+          —— 需要监听列表 + 每个人的近期战绩；
+        * 「dota2助手 我要转辅助该怎么练」
+          —— 需要提问者自己的英雄池 + 近期表现。
+
+        失败语义（很重要）：
+
+        * **数据收集失败不算失败**。少拉一块上下文照样能回答，最多在
+          上下文里注明「某人数据没取到」。
+        * **模型不可用才算失败**。此时一条结果都不产出，由
+          ``@take_over_event(declinable=True)`` 原样放行，消息会正常落到
+          AstrBot 的默认大模型手里 —— 绝不能既不回答、又把消息吃掉。
+        """
+        # 用户明确关闭了「启用 LLM 分析」：不要偷偷替他调用模型
+        if not self.cfg("enable_llm_analysis", True):
+            return
+
+        umo = event.unified_msg_origin
+        uid = str(event.get_sender_id())
+        binding, _note = self._effective_binding(event)
+        try:
+            context = await dota_chat.collect_chat_context(
+                self.api,
+                question=question,
+                umo=umo,
+                user_id=uid,
+                watchers=self.store.list_watchers(umo),
+                bindings=list(self.store.list_bindings(umo).values()),
+                self_binding=binding,
+                recent_limit=int(
+                    self.cfg("nlu_chat_context_matches", dota_chat.DEFAULT_RECENT_LIMIT)
+                ),
+                max_players=int(
+                    self.cfg("nlu_chat_max_players", dota_chat.DEFAULT_MAX_PLAYERS)
+                ),
+                timeout=float(
+                    self.cfg("nlu_chat_timeout", dota_chat.DEFAULT_FETCH_TIMEOUT)
+                ),
+                cache=self._chat_cache,
+            )
+        except Exception as e:  # noqa: BLE001 - 兜底失败也要放行，不能吞消息
+            logger.error(f"[dota2] 闲聊兜底收集数据失败: {e}", exc_info=True)
+            return
+
+        prompt = dota_chat.build_chat_prompt(question, context)
+        system_prompt = dota_chat.build_chat_system_prompt(
+            str(self.cfg("nlu_chat_system_prompt", "") or "")
+        )
+        reply = await self._call_report_llm(
+            prompt, umo=umo, system_prompt=system_prompt
+        )
+        if not reply:
+            logger.info("[dota2] 闲聊兜底：模型不可用，消息交回默认大模型")
+            return
+
+        logger.info(
+            f"[dota2] 闲聊兜底回答: {question[:48]!r} "
+            f"needs={sorted(context.needs)} "
+            f"玩家数={len(context.snapshots)}"
+        )
+        async for item in self._emit(event, reply, as_image=False):
+            yield item
 
     def _nlu_pop_confirm(
         self, umo: str, uid: str
@@ -1271,16 +1434,30 @@ class Dota2Plugin(Star):
 
         # ---------- 2. 该不该处理这条消息 ----------
         # 返回的是剥离唤醒词后的正文（没通过闸门时为 None）
-        effective = self._nlu_should_handle(event, text)
-        if effective is None:
+        gate = self._nlu_should_handle(event, text)
+        if gate is None:
             return
+        effective = gate.text
 
         # ---------- 3. 识别意图 ----------
         intent = dota_nlu.parse(effective)
         if intent is None and self.cfg("nlu_llm_fallback", False):
             intent = await self._nlu_classify_with_llm(event, effective)
         if intent is None:
-            # 没识别出来：什么都不做，把消息让给默认大模型，避免抢答
+            # 没识别出内置指令。分两种情况：
+            #
+            # a) 用户写了唤醒词 —— 这是**明确点名**插件。此时直接把消息
+            #    扔回默认大模型是浪费：默认大模型看不到本会话的监听列表、
+            #    绑定关系与战绩数据，只能反问或编造。改为由插件带着这些
+            #    数据回答（「闲聊兜底」）。
+            # b) 没写唤醒词（仅 @，且配置允许）—— 说明只是随口一提，
+            #    原样放行，别抢答。
+            #
+            # 注意 keyword_matched 在 `nlu_require_keyword=false` 时恒为假，
+            # 所以关掉唤醒词限制不会让插件变成「什么都插一嘴」。
+            if gate.keyword_matched and self.cfg("nlu_chat_fallback", True):
+                async for item in self._nlu_chat_reply(event, effective):
+                    yield item
             return
 
         handler_name = self.NLU_DISPATCH.get(intent.name)
@@ -1849,6 +2026,8 @@ class Dota2Plugin(Star):
         extra_context = await self._build_recent_context(
             match_id, focus_ids, focus_names, heroes
         )
+        abilities = await self._ability_constants()
+        curve_ids = self._curve_targets(match, focus_ids)
 
         prompt = build_single_match_analysis_prompt(
             match=match,
@@ -1857,6 +2036,8 @@ class Dota2Plugin(Star):
             focus_account_ids=focus_ids or None,
             focus_names=focus_names or None,
             extra_context=extra_context,
+            abilities=abilities,
+            curve_ids=curve_ids,
         )
 
         report = await self._generate_report(event, prompt)
@@ -1873,6 +2054,8 @@ class Dota2Plugin(Star):
                     heroes,
                     items,
                     focus_account_ids=focus_ids or None,
+                    abilities=abilities,
+                    curve_ids=curve_ids,
                 )
             )
             for chunk in self._chunk_text(raw):
@@ -2384,12 +2567,17 @@ class Dota2Plugin(Star):
             proxy=str(self.cfg("llm_proxy", "") or ""),
         )
 
-    async def _call_report_llm(self, prompt: str, *, umo: str = "") -> str | None:
+    async def _call_report_llm(
+        self, prompt: str, *, umo: str = "", system_prompt: str = ""
+    ) -> str | None:
         """生成报告用的大模型调用：专用 Key 优先，失败按配置回退 AstrBot。
 
         Args:
             prompt: 用户提示词。
             umo: 会话来源，回退到 AstrBot 提供商时用来解析会话默认模型。
+            system_prompt: 自定义系统提示词。留空则用配置项
+                ``analysis_system_prompt``，再留空用内置的报告模板。
+                闲聊兜底会传自己的系统提示词进来，避免被「报告体」污染。
 
         Returns:
             报告正文；失败或未启用时返回 None（并在日志里说明原因）。
@@ -2397,7 +2585,9 @@ class Dota2Plugin(Star):
         if not self.cfg("enable_llm_analysis", True):
             return None
 
-        system_prompt = str(self.cfg("analysis_system_prompt", "") or "").strip()
+        system_prompt = (system_prompt or "").strip()
+        if not system_prompt:
+            system_prompt = str(self.cfg("analysis_system_prompt", "") or "").strip()
         if not system_prompt:
             system_prompt = DEFAULT_SYSTEM_PROMPT
 
@@ -2929,6 +3119,8 @@ class Dota2Plugin(Star):
         except OpenDotaError as e:
             logger.error(f"[dota2] 推送比赛 {match_id} 时拉取常量失败：{e}")
             heroes, items_const = {}, {}
+        # 技能常量（id → 技能名）：拿到才输出「技能加点」小节
+        abilities = await self._ability_constants()
 
         # 附上焦点玩家近期的整体状态，让报告更有上下文。
         # 焦点玩家可能不止一位，这里逐位取；超过上限的只做本场复盘，
@@ -2986,6 +3178,8 @@ class Dota2Plugin(Star):
             focus_account_ids=focus_ids,
             focus_names=focus_names,
             extra_context=extra_context,
+            abilities=abilities,
+            curve_ids=self._curve_targets(match, focus_ids),
         )
 
         headline = self.match_headline(match, heroes, focus_ids, parsed)

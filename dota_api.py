@@ -128,6 +128,9 @@ class OpenDotaClient:
         self._hero_cache_at = 0.0
         self._item_cache: dict[str, dict] | None = None
         self._item_cache_at = 0.0
+        #: 技能常量（id → 技能名）。None 表示还没拉过；空 dict 表示拉过但失败。
+        self._ability_cache: dict[int, str] | None = None
+        self._ability_cache_at = 0.0
 
     # ------------------------------------------------------------------
     # 底层请求
@@ -305,6 +308,47 @@ class OpenDotaClient:
         self._item_cache = items
         self._item_cache_at = now
         return items
+
+    async def get_ability_names(self, force: bool = False) -> dict[int, str]:
+        """获取技能常量表，返回 ``{ability_id: ability_key}``。
+
+        用途很具体：解析产物里的 ``ability_upgrades_arr`` 存的是技能**数字 ID**
+        （``5439`` 这种），没有这张表就完全不可读，加点顺序也就没法喂给大模型。
+
+        这是**尽力而为**的增强项：接口不可用时返回空字典（并做负缓存，避免
+        每次分析都白跑一趟），调用方按「拿不到就不输出加点小节」处理。
+        """
+        now = time.time()
+        if (
+            not force
+            and self._ability_cache is not None
+            and now - self._ability_cache_at < HERO_CACHE_TTL
+        ):
+            return self._ability_cache
+
+        names: dict[int, str] = {}
+        try:
+            data = await self._request("/constants/ability_ids", timeout=max(30, self.timeout))
+        except OpenDotaError as e:
+            logger.debug(f"[dota2] 获取技能常量失败，跳过技能加点：{e}")
+            data = {}
+
+        rows = data.values() if isinstance(data, dict) else data
+        if isinstance(rows, (list, dict)):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    ability_id = int(row.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                name = row.get("name") or row.get("dname")
+                if ability_id and name:
+                    names[ability_id] = str(name)
+        # 负缓存：失败时也记时间戳，避免每次分析都重试
+        self._ability_cache = names
+        self._ability_cache_at = now
+        return names
 
     # ------------------------------------------------------------------
     # 玩家相关
@@ -581,6 +625,7 @@ _FALLBACK_METHODS: tuple[str, ...] = (
     "get_heroes",
     "hero_name",
     "get_items",
+    "get_ability_names",
     "get_player",
     "search_player",
     "get_player_matches",
