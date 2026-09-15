@@ -1746,8 +1746,14 @@ class Dota2Plugin(Star):
         try:
             match = await self.api.get_match(match_id)
             if not match:
+                # 走到这里说明**两端都问过了**（降级器会在主源返回空时补问
+                # 后备），所以可以放心说「查不到」，不必再单点 OpenDota。
                 yield event.plain_result(
-                    f"❌ 找不到比赛 {match_id}，或该比赛尚未被 OpenDota 收录。"
+                    f"❌ 查不到比赛 {match_id}：STRATZ 与 OpenDota 都没有这盘的数据。\n"
+                    "可能原因：比赛 ID 写错、该局刚结束还没被收录（可过几分钟再试）、"
+                    "或对局方未公开比赛数据。\n"
+                    f"如果是刚打完的局，可以用 `{self._nlu_keyword()} 催一下 "
+                    f"{match_id} 的解析` 试一次。"
                 )
                 return
             heroes = await self.api.get_heroes()

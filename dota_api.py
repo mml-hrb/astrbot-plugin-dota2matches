@@ -595,6 +595,26 @@ _FALLBACK_METHODS: tuple[str, ...] = (
 )
 
 
+#: 「返回空 = 本数据源没有这条记录」的方法名。
+#:
+#: 与 :data:`_FALLBACK_TRIGGER` 是**两种不同的降级理由**：
+#:
+#: * ``_FALLBACK_TRIGGER`` 是**异常**触发 —— 源挂了、鉴权失败、限流；
+#: * 这里是**空结果**触发 —— 源好好的，但它就是没有这条记录。
+#:
+#: 为什么必须有后者（踩过的坑）：两个数据源的**收录范围并不一致**。
+#: 实测 8995536921 这盘，STRATZ 的 ``match(id:)`` 返回 ``null``（不是报错，
+#: 是它真的没有这盘），而 OpenDota 有完整且已解析的数据。如果只对异常降级，
+#: 主源一句「我没有」就会被当成「这盘不存在」直接抛给用户，用户连查三次
+#: 都是「找不到比赛」—— 而数据明明就在后备源里。
+#:
+#: 只收录「单个资源、``None`` 明确表示该源没有这条记录」的方法。**列表类
+#: 方法绝对不能加进来**：``get_player_matches`` 返回空列表完全可能是业务事实
+#: （这位玩家就是没打过），把它列进来会让每次查询都白跑一趟后备源，既慢
+#: 又浪费额度。
+_EMPTY_TRIGGERS_FALLBACK: tuple[str, ...] = ("get_match",)
+
+
 class FallbackDataSource:
     """把「主数据源 + 后备数据源」组合成一个对外透明的数据源。
 
@@ -603,6 +623,9 @@ class FallbackDataSource:
     - 所有只读查询**先走主数据源**；主数据源抛出「不可用」类异常时，
       自动切到后备数据源并记录一条 warning。
     - 主数据源**没配置**（例如 STRATZ 未填 Key）时，直接走后备，不做无谓尝试。
+    - 主数据源**答得出来但答案是「没有这条记录」**（见
+      :data:`_EMPTY_TRIGGERS_FALLBACK`）时，也会补问一次后备 —— 两个源的
+      收录范围不一致，主源没有不代表真的没有。只有两边都没有才下结论。
     - 玩家不存在 / 昵称歧义这类**业务结果**不触发降级 —— 换数据源也查不到，
       直接如实返回用户。
     - 一旦主数据源在本进程内失败过，会在 ``_degraded`` 上记一笔；后续请求
@@ -634,6 +657,9 @@ class FallbackDataSource:
         self.degraded = False
         #: 最近一次降级的原因
         self.last_error = ""
+        #: 最近一次降级的**类别**，用于抬头措辞：
+        #: ``""`` 未降级 / ``"unavailable"`` 主源不可用 / ``"missing"`` 主源无此记录
+        self.degrade_reason = ""
 
         for method_name in _FALLBACK_METHODS:
             setattr(
@@ -657,10 +683,11 @@ class FallbackDataSource:
                 )
 
             try:
-                return await primary_method(*args, **kwargs)
+                result = await primary_method(*args, **kwargs)
             except _fallback_trigger_types() as e:
                 # 主数据源挂了（未配置/鉴权/限流/网络）→ 切后备
                 self.degraded = True
+                self.degrade_reason = "unavailable"
                 self.last_error = f"{type(e).__name__}: {e}"
                 logger.warning(
                     f"[dota2] {self.primary_label}不可用（{e}），"
@@ -669,6 +696,28 @@ class FallbackDataSource:
                 return await self._call_secondary(
                     method_name, secondary_method, args, kwargs, reason=str(e)
                 )
+
+            if (
+                result is None
+                and method_name in _EMPTY_TRIGGERS_FALLBACK
+                and secondary_method is not None
+            ):
+                # 主数据源「没有这条记录」≠「这条记录不存在」。
+                # 两个源的收录范围并不一致，实测存在「STRATZ 返回 null、
+                # OpenDota 却有完整解析数据」的比赛。这里补问一次后备，
+                # 避免把主源的沉默当成全局结论直接甩给用户。
+                self.degraded = True
+                self.degrade_reason = "missing"
+                self.last_error = f"{self.primary_label}无此记录"
+                logger.info(
+                    f"[dota2] {self.primary_label}没有这条记录，"
+                    f"改问{self.secondary_label}再下结论：{method_name}"
+                )
+                return await self._call_secondary(
+                    method_name, secondary_method, args, kwargs, reason="主数据源无此记录"
+                )
+
+            return result
 
         forward.__name__ = method_name
         forward.__qualname__ = f"FallbackDataSource.{method_name}"
@@ -735,7 +784,13 @@ class FallbackDataSource:
 
     # ------------------------------------------------------------------
     def describe(self) -> str:
-        """给出一行「当前数据源状态」描述，供查询结果抬头展示。"""
+        """给出一行「当前数据源状态」描述，供查询结果抬头展示。
+
+        「主源无此记录」与「主源不可用」要分开说：前者主源是好的，只是
+        它没有这条数据，抬头若写成「暂时不可用」会让人误以为 STRATZ 挂了。
+        """
+        if self.degrade_reason == "missing":
+            return f"{self.secondary_label}（{self.primary_label}无此记录）"
         if self.degraded:
             return f"{self.secondary_label}（{self.primary_label}暂时不可用）"
         return self.primary_label
