@@ -813,6 +813,7 @@ async def collect_chat_context(
     timeout: float = DEFAULT_FETCH_TIMEOUT,
     cache: dict | None = None,
     cache_ttl: float = DEFAULT_CACHE_TTL,
+    localizer: Any = None,
 ) -> ChatContext:
     """收集一次闲聊回答所需的插件数据。
 
@@ -892,6 +893,9 @@ async def collect_chat_context(
         try:
             heroes = await asyncio.wait_for(api.get_heroes(), timeout=timeout)
             if isinstance(heroes, dict):
+                # localizer 由调用方注入（插件的中文名服务），不给就保持原名
+                if localizer is not None:
+                    heroes = await localizer(heroes)
                 ctx.heroes = heroes
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[dota2] 闲聊兜底：拉取英雄常量表失败: {e}")

@@ -15,6 +15,7 @@ import functools
 import inspect
 import re
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -63,6 +64,7 @@ try:  # 插件目录被作为包加载时的相对导入
     from . import dota_chat
     from . import dota_nlu
     from . import dota_parse
+    from . import dota_zh
 except ImportError:  # 兜底：以普通模块方式加载时（把插件目录加入 sys.path）
     import os
     import sys
@@ -109,6 +111,7 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
     import dota_chat  # type: ignore[no-redef]
     import dota_nlu  # type: ignore[no-redef]
     import dota_parse  # type: ignore[no-redef]
+    import dota_zh  # type: ignore[no-redef]
 
 try:
     # AstrBot 用 GreedyStr 标记「接收剩余全部文本」的参数
@@ -463,6 +466,15 @@ class Dota2Plugin(Star):
         self.store = DotaStore(self.data_dir)
         self.store.load()
         self.api = self._build_data_source()
+        #: 中文名服务：本地对照表 + 磁盘缓存 + 缺词补译。
+        #:
+        #: 数据源只给英文名，而推送与战报要全中文。查名顺序是「包内静态表 →
+        #: 磁盘缓存 → 联网补译」，命中就返回，不会每局都去问一次网络。
+        self._zh = dota_zh.ZhNames(
+            self.data_dir / "zh_names.json",
+            enabled=bool(self.cfg("zh_names", True)),
+            learn=bool(self.cfg("zh_learn_missing", True)),
+        ).load()
         #: 等待解析 / 等待推送的比赛：``{match_id: pending_item}``
         #:
         #: 键就是 ``match_id``：**一局比赛只分析一次**。同一局里可能有多位被
@@ -492,6 +504,18 @@ class Dota2Plugin(Star):
         #: 自然语言确认状态：``{(umo, uid): (intent_name, args, 过期时间戳)}``
         #: 群里说「绑定 xxx」这类多义指令时，先记下来等用户确认再执行。
         self._nlu_confirm: dict[tuple[str, str], tuple[str, str, float]] = {}
+        #: 会话语境：每个会话最近提到过的比赛，``{umo: deque[{match_id, desc, ts}]}``。
+        #:
+        #: 用户说「详细分析这一盘」时，光看这一句话根本无从判断是哪一场——
+        #: 必须知道这个会话刚刚推送 / 复盘过什么。这里记录的就是那份语境：
+        #: 监听推送、单场复盘、战绩列表都会往里记一笔，按时间由新到旧排列。
+        #:
+        #: 只放在内存里：重启后语境清空是合理的（「这一盘」本来就是会话内的
+        #: 概念，隔天再问没有意义）。
+        self._nlu_recent_matches: dict[str, deque[dict]] = {}
+        #: 会话语境：每个会话最近几轮对话（含机器人自己说过的话），
+        #: ``{umo: deque[(角色, 文本)]}``。用于给意图分类器消歧（「上面那盘」）。
+        self._nlu_chat_log: dict[str, deque[tuple[str, str]]] = {}
         #: 闲聊兜底用的战绩快照缓存：``{(account_id, limit): (时间戳, matches)}``。
         #: 由插件实例持有、跨会话复用；里面只放**纯数据**，快照对象每次新建
         #: —— 同一个账号在 A 群是「本人」、在 B 群是「被监听」，
@@ -730,8 +754,8 @@ class Dota2Plugin(Star):
         与「直接查已解析比赛的复盘」完全一致。
         """
         try:
-            heroes = await self.api.get_heroes()
-            items = await self.api.get_items()
+            heroes = await self._heroes()
+            items = await self._items()
         except OpenDotaError as e:
             logger.error(f"[dota2] 复盘比赛 {match_id} 时拉取常量失败：{e}")
             heroes, items = {}, {}
@@ -740,7 +764,9 @@ class Dota2Plugin(Star):
 
         focus_ids = [int(i) for i in (focus_ids or []) if int(i or 0)]
         parsed = dota_parse.parse_state(match).parsed
-        headline = self.match_headline(match, heroes, focus_ids or None, parsed)
+        headline = self.match_headline(
+            match, heroes, focus_ids or None, parsed, focus_names
+        )
         curve_ids = self._curve_targets(match, focus_ids)
 
         extra_context = await self._build_recent_context(
@@ -800,10 +826,73 @@ class Dota2Plugin(Star):
         if getter is None:
             return {}
         try:
-            return await getter()
+            raw = await getter()
         except Exception as e:  # noqa: BLE001
             logger.debug(f"[dota2] 获取技能常量失败，跳过技能加点：{e}")
             return {}
+        return await self._localize_abilities(raw)
+
+    # ==================================================================
+    # 名称中文化
+    # ==================================================================
+    async def _localize_heroes(self, raw: dict[int, dict]) -> dict[int, dict]:
+        """把英雄常量的显示名换成中文（只改 ``localized_name``）。"""
+        return await self._localize("hero", raw, dota_zh.localize_heroes)
+
+    async def _localize_items(self, raw: dict[str, dict]) -> dict[str, dict]:
+        """把道具常量的显示名换成中文（只改 ``dname``）。"""
+        return await self._localize("item", raw, dota_zh.localize_items)
+
+    async def _localize_abilities(self, raw: dict[int, str]) -> dict[int, str]:
+        """把技能常量的名字换成中文。"""
+        return await self._localize("ability", raw, dota_zh.localize_abilities)
+
+    async def _localize(self, _kind: str, raw: Any, apply_fn: Any) -> Any:
+        """本地化的统一流程：先查本地表 → 缺词时补译 → 用原始数据重跑一次。
+
+        第二步「用原始数据重跑」是必须的：第一次本地化只是把缺的键记下来，
+        补译拿到新词后必须回到**未经本地化的数据**上再算一遍，否则第二次
+        处理的是已经被替换过的值，缺词键就对不上了。
+        """
+        zh = self._zh
+        if zh is None or not raw:
+            return raw or {}
+        out = apply_fn(raw, zh)
+        if await zh.fill_missing(self._translate_terms):
+            out = apply_fn(raw, zh)
+        return out
+
+    async def _heroes(self) -> dict[int, dict]:
+        """英雄常量（已中文本地化）。"""
+        try:
+            raw = await self.api.get_heroes()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[dota2] 获取英雄常量失败：{e}")
+            return {}
+        return await self._localize_heroes(raw)
+
+    async def _items(self) -> dict[str, dict]:
+        """道具常量（已中文本地化）。"""
+        try:
+            raw = await self.api.get_items()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[dota2] 获取道具常量失败：{e}")
+            return {}
+        return await self._localize_items(raw)
+
+    async def _translate_terms(self, kind: str, keys: list[str]) -> dict[str, str]:
+        """缺词补译：问一次模型，返回 ``{英文键: 中文名}``。
+
+        这里刻意复用报告用的模型通道（专用 Key 优先、失败回退 AstrBot 提供商），
+        不另开一套配置；补译失败只影响名字显示，绝不阻断本次查询。
+        """
+        prompt = dota_zh.build_translate_prompt(kind, keys)
+        text = await self._call_report_llm(
+            prompt, system_prompt=dota_zh._TRANSLATE_SYSTEM
+        )
+        if not text:
+            return {}
+        return dota_zh.parse_translation(text)
 
     @staticmethod
     def _curve_targets(match: dict, focus_ids: list[int], limit: int = 2) -> list[int]:
@@ -1309,6 +1398,59 @@ class Dota2Plugin(Star):
         text = str(raw or "").strip()
         return text or NLU_DEFAULT_KEYWORD
 
+    # ------------------------------------------------------------------
+    # 会话语境（供「这一盘」这类指代消歧）
+    # ------------------------------------------------------------------
+    def _nlu_log_line(self, umo: str, role: str, text: str) -> None:
+        """记一行会话日志。``role`` 为 ``user`` / ``bot``。"""
+        umo = str(umo or "")
+        text = (text or "").strip().replace("\n", " ")
+        if not umo or not text:
+            return
+        if len(text) > 80:
+            text = text[:80] + "…"
+        self._nlu_chat_log.setdefault(umo, deque(maxlen=12)).append((role, text))
+
+    def _nlu_chat_lines(self, umo: str, limit: int = 8) -> list[str]:
+        """取出会话最近几轮对话，渲染成 ``角色: 内容`` 的形式。"""
+        rows = list(self._nlu_chat_log.get(str(umo or "")) or [])[-limit:]
+        return [f"{'用户' if role == 'user' else '机器人'}: {text}" for role, text in rows]
+
+    def _nlu_remember_match(
+        self, umo: str, match_id: Any, desc: str = "", log: bool = True
+    ) -> None:
+        """把一场比赛记进会话语境（供「这一盘」指代）。
+
+        Args:
+            umo: 会话标识。
+            match_id: 比赛 ID。
+            desc: 一句话描述（谁 / 什么英雄 / 结果），越短越好。
+            log: 是否顺带写一行会话日志。批量记录（战绩列表）时关掉，
+                否则一个列表会刷出好几行日志，把真正的对话挤没。
+        """
+        umo = str(umo or "")
+        try:
+            mid = int(match_id)
+        except (TypeError, ValueError):
+            return
+        if not umo or mid <= 0:
+            return
+        bucket = self._nlu_recent_matches.setdefault(umo, deque(maxlen=8))
+        # 同一场再次出现时提到最前面，保持「由新到旧」
+        for row in list(bucket):
+            if int(row.get("match_id") or 0) == mid:
+                bucket.remove(row)
+                break
+        bucket.appendleft({"match_id": mid, "desc": (desc or "").strip(), "ts": time.time()})
+        if log:
+            self._nlu_log_line(
+                umo, "bot", f"[提到比赛 {mid}]" + (f" {desc}" if desc else "")
+            )
+
+    def _nlu_recent_match_rows(self, umo: str, limit: int = 5) -> list[dict]:
+        """本会话最近提到过的比赛（由新到旧）。"""
+        return list(self._nlu_recent_matches.get(str(umo or "")) or [])[:limit]
+
     def _nlu_head_text(self, text: str) -> str:
         """剥离唤醒词后的正文；没写唤醒词时**原样返回**。
 
@@ -1386,21 +1528,117 @@ class Dota2Plugin(Star):
         return NluGate(text=effective, keyword_matched=keyword_matched)
 
     async def _nlu_classify_with_llm(
-        self, event: AstrMessageEvent, text: str
-    ) -> dota_nlu.Intent | None:
-        """规则没把握时，可选地用大模型兜底分类一次。"""
+        self, event: AstrMessageEvent, text: str, umo: str = ""
+    ) -> tuple[bool, dota_nlu.Intent | None]:
+        """用大模型判意图。
+
+        返回 ``(是否真的问过模型, 意图)``。这两个值**必须分开**：
+
+        * 问过模型、模型说 ``none`` → 这就是结论，不能再拿关键词兜底
+          （「详细分析这一盘」正是被关键词判成了 analyze）；
+        * 没问成（未启用 / 没有 provider / 调用报错）→ 返回 ``(False, None)``，
+          调用方回落到规则，保证模型不可用时功能不至于全瘫。
+        """
+        if not self.cfg("nlu_llm_fallback", False):
+            return False, None
         provider = await resolve_provider(
             self.context, event.unified_msg_origin, self.cfg("llm_provider_id", "")
         )
         if not provider:
-            return None
-        prompt = dota_nlu.build_classifier_prompt(text)
+            return False, None
+        umo = umo or str(event.unified_msg_origin)
+        prompt = dota_nlu.build_classifier_prompt(
+            text,
+            recent_lines=self._nlu_chat_lines(umo),
+            recent_matches=self._nlu_recent_match_rows(umo),
+        )
         try:
             reply = await call_llm(provider, dota_nlu.CLASSIFIER_SYSTEM_PROMPT, prompt)
         except Exception as e:  # noqa: BLE001
             logger.debug(f"[dota2] 自然语言分类调用失败: {e}")
-            return None
-        return dota_nlu.parse_classifier_reply(reply)
+            return False, None
+        return True, dota_nlu.parse_classifier_reply(reply)
+
+    def _nlu_sanitize_llm_intent(
+        self, intent: dota_nlu.Intent, text: str, umo: str
+    ) -> bool:
+        """给模型的判断做一次安检。**会就地修改** ``intent``。
+
+        Returns:
+            ``True`` 表示整个意图都不可信，调用方按「没识别出指令」处理。
+
+        模型再聪明也会犯错，而有些错误的代价不对称：
+
+        * 把「对比一下监听的几个人谁最菜」判成「添加监听」→ 会真的往监听
+          列表里加人，是改数据的动作，宁可交给闲聊兜底 ⇒ 整个丢弃；
+        * 凭空编一个比赛 ID → 会去查一场不存在的比赛。这种**只丢 ID**，
+          意图本身保留，后面的语境解析（推送过 / 复盘过的那一场）还能救回来。
+        """
+        if intent.name in {"bind", "unbind", "watch", "unwatch"} and (
+            dota_nlu.ANALYSIS_QUESTION_RE.search(text or "")
+        ):
+            return True
+        if intent.name in {"match", "forceparse"} and intent.args:
+            digits = (intent.args or "").strip()
+            if not re.fullmatch(r"\d{6,20}", digits):
+                intent.args = ""
+                return False
+            if digits in (text or ""):
+                return False
+            known = {str(row.get("match_id")) for row in self._nlu_recent_match_rows(umo)}
+            if digits not in known:
+                logger.info(
+                    f"[dota2] 自然语言：模型给的比赛 ID {digits} 既不在原句也不在"
+                    "会话语境里，判定为编造，改按语境解析"
+                )
+                intent.args = ""
+        return False
+
+    async def _nlu_resolve_match_id(
+        self, umo: str, event: AstrMessageEvent, text: str
+    ) -> int | None:
+        """「这一盘」到底是哪一盘：按语境猜一个比赛 ID。
+
+        顺序是**由便宜到贵**：
+
+        1. 本会话语境里最近提到过的比赛（推送 / 复盘 / 战绩列表记下的）；
+        2. 本会话监听记录里的 ``last_match_id``（已经推送过的那一场）；
+        3. 提问者在当前会话绑定的账号的最近一场。
+
+        猜不出来返回 ``None``，由调用方提示用户补比赛 ID——**绝不瞎猜**。
+        """
+        rows = self._nlu_recent_match_rows(umo, limit=1)
+        if rows:
+            return int(rows[0]["match_id"])
+
+        newest = 0
+        for watcher in self.store.list_watchers(umo) or []:
+            try:
+                value = int(watcher.get("last_match_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if value > newest:
+                newest = value
+        if newest:
+            return newest
+
+        binding, _note = self._effective_binding(event)
+        if binding:
+            try:
+                matches, _ = await self.api.get_player_matches_enriched(
+                    int(binding.get("account_id") or 0), 1
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"[dota2] 解析「这一盘」时拉取最近一场失败: {e}")
+                return None
+            for row in matches or []:
+                try:
+                    value = int(row.get("match_id") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if value > 0:
+                    return value
+        return None
 
     async def _nlu_chat_reply(self, event: AstrMessageEvent, question: str):
         """闲聊兜底：没识别出指令时，带着插件内部数据让模型回答。
@@ -1449,6 +1687,7 @@ class Dota2Plugin(Star):
                     self.cfg("nlu_chat_timeout", dota_chat.DEFAULT_FETCH_TIMEOUT)
                 ),
                 cache=self._chat_cache,
+                localizer=self._localize_heroes,
             )
         except Exception as e:  # noqa: BLE001 - 兜底失败也要放行，不能吞消息
             logger.error(f"[dota2] 闲聊兜底收集数据失败: {e}", exc_info=True)
@@ -1504,6 +1743,11 @@ class Dota2Plugin(Star):
         umo = event.unified_msg_origin
         uid = str(event.get_sender_id())
 
+        # 会话语境：无论这条消息最终有没有被处理，都记一笔。
+        # 后面用户说「上面那盘」「这一局」时全靠它消歧。
+        if text:
+            self._nlu_log_line(umo, "user", text)
+
         # ---------- 1. 先处理「确认 / 取消」回复 ----------
         # 这一步**不受唤醒词限制**：用户的确认是对上一轮已授权操作的收尾，
         # 再逼他打一遍「dota2助手 确认」是没必要的摩擦。为了两种写法都能用，
@@ -1534,9 +1778,29 @@ class Dota2Plugin(Star):
         effective = gate.text
 
         # ---------- 3. 识别意图 ----------
-        intent = dota_nlu.parse(effective)
-        if intent is None and self.cfg("nlu_llm_fallback", False):
-            intent = await self._nlu_classify_with_llm(event, effective)
+        # 关键词只负责**唤醒插件**（见闸门）；判意图以大模型为准。
+        # 「详细分析这一盘」里「分析」4 分压过「这盘」3 分，关键词会把它判成
+        # 「分析近期 1 场表现」——这种词频游戏只有模型看得懂，而且它还带着
+        # 会话上下文，能知道「这一盘」是哪一场。
+        # 模型不可用（未启用 / 没 provider / 调用失败）时才回落到规则，
+        # 免得模型一挂整个自然语言入口就废掉。
+        intent: dota_nlu.Intent | None = None
+        consulted = False
+        if self.cfg("nlu_llm_first", True):
+            consulted, intent = await self._nlu_classify_with_llm(
+                event, effective, umo
+            )
+            if consulted and intent is not None and self._nlu_sanitize_llm_intent(
+                intent, effective, umo
+            ):
+                logger.info(
+                    f"[dota2] 自然语言：模型判为 {intent.name} 但不可信，按未识别处理"
+                )
+                intent = None
+        # 只有**没问成模型**时才回落到关键词。问过模型、模型说「不是指令」
+        # 就是结论，再让关键词翻案等于把上面那段白做。
+        if not consulted:
+            intent = dota_nlu.parse(effective)
         if intent is None:
             # 没识别出内置指令。分两种情况：
             #
@@ -1557,16 +1821,36 @@ class Dota2Plugin(Star):
         handler_name = self.NLU_DISPATCH.get(intent.name)
         if not handler_name:
             return
+
+        # 「这一盘」「上面那局」这类指代：模型或规则都给不出比赛 ID 时，
+        # 用会话语境补一个（推送过 / 复盘过 / 监听过的那一场）。
+        if intent.name == "match" and not intent.args:
+            resolved = await self._nlu_resolve_match_id(umo, event, effective)
+            if resolved:
+                intent.args = str(resolved)
+                logger.info(
+                    f"[dota2] 自然语言：按会话语境把 {effective!r} 解析为比赛 {resolved}"
+                )
+
         # 缺参数的意图直接告诉用户怎么补，别去猜
         if intent.name in dota_nlu.INTENT_NEEDS_TARGET and not intent.args:
             if intent.name == "unwatch":
                 pass  # 取消监听允许不带目标（按当前绑定来）
             elif intent.name == "match":
-                yield event.plain_result(
-                    "复盘单场需要比赛 ID，例如："
-                    f"`{self._nlu_keyword()} 这局 8993438099 帮我复盘一下`。\n"
-                    "比赛 ID 可以从「我的战绩」里拿，或直接用 Dota 客户端的比赛编号。"
-                )
+                if dota_nlu.looks_like_single_match(effective):
+                    yield event.plain_result(
+                        "你说的是哪一盘？本会话里还没有刚提到过的比赛。\n"
+                        f"直接给比赛 ID 最快："
+                        f"`{self._nlu_keyword()} 这局 8993438099 复盘一下`；\n"
+                        f"也可以先说「{self._nlu_keyword()} 我的战绩」，"
+                        "从列表里挑一局的编号。"
+                    )
+                else:
+                    yield event.plain_result(
+                        "复盘单场需要比赛 ID，例如："
+                        f"`{self._nlu_keyword()} 这局 8993438099 帮我复盘一下`。\n"
+                        "比赛 ID 可以从「我的战绩」里拿，或直接用 Dota 客户端的比赛编号。"
+                    )
                 return
             elif intent.name == "forceparse":
                 yield event.plain_result(
@@ -1812,7 +2096,7 @@ class Dota2Plugin(Star):
                 return
             wl = await self.api.get_player_wl(account_id)
             hero_rows = await self.api.get_player_heroes(account_id)
-            heroes = await self.api.get_heroes()
+            heroes = await self._heroes()
         except OpenDotaError as e:
             yield event.plain_result(f"❌ 查询失败：{e}")
             return
@@ -1842,7 +2126,7 @@ class Dota2Plugin(Star):
 
         try:
             hero_rows = await self.api.get_player_heroes(account_id)
-            heroes = await self.api.get_heroes()
+            heroes = await self._heroes()
         except OpenDotaError as e:
             yield event.plain_result(f"❌ 查询失败：{e}")
             return
@@ -1878,7 +2162,7 @@ class Dota2Plugin(Star):
         limit = self._clamp_count(count)
         try:
             matches, _ = await self.api.get_player_matches_enriched(account_id, limit)
-            heroes = await self.api.get_heroes()
+            heroes = await self._heroes()
         except OpenDotaError as e:
             yield event.plain_result(f"❌ 查询失败：{e}")
             return
@@ -1886,6 +2170,12 @@ class Dota2Plugin(Star):
         if not matches:
             yield event.plain_result(f"没有查询到 {name} 的比赛记录。可能该账号未公开比赛数据。")
             return
+        # 记进会话语境（批量，不逐条写日志）：随后说「详细分析第三场」这类话
+        # 才有得猜。列表本身已经列出了编号，用户照着报也行。
+        for row in matches[:5]:
+            self._nlu_remember_match(
+                event.unified_msg_origin, row.get("match_id"), name, log=False
+            )
         title = f"📊 {name} 的最近 {len(matches)} 场比赛"
         if note:
             title += note
@@ -1932,7 +2222,7 @@ class Dota2Plugin(Star):
             matches, economy_samples = await self.api.get_player_matches_enriched(
                 account_id, limit
             )
-            heroes = await self.api.get_heroes()
+            heroes = await self._heroes()
             try:
                 player_data = await self.api.get_player(account_id) or {}
                 wl = await self.api.get_player_wl(account_id)
@@ -2024,11 +2314,13 @@ class Dota2Plugin(Star):
                     "可能原因：比赛 ID 写错、该局刚结束还没被收录（可过几分钟再试）、"
                     "或对局方未公开比赛数据。\n"
                     f"如果是刚打完的局，可以用 `{self._nlu_keyword()} 催一下 "
-                    f"{match_id} 的解析` 试一次。"
-                )
+                f"{match_id} 的解析` 试一次。"
+                    )
                 return
-            heroes = await self.api.get_heroes()
-            items = await self.api.get_items()
+            heroes = await self._heroes()
+            items = await self._items()
+            # 记进会话语境：紧接着问「再详细说说这把」时不用再报 ID
+            self._nlu_remember_match(event.unified_msg_origin, match_id)
         except OpenDotaError as e:
             yield event.plain_result(f"❌ 拉取比赛数据失败：{e}")
             return
@@ -2113,7 +2405,9 @@ class Dota2Plugin(Star):
                 f"稍后可用 `/d2 单场 {match_id}` 重新尝试等待解析。"
             )
 
-        headline = self.match_headline(match, heroes, focus_ids or None, parsed)
+        headline = self.match_headline(
+            match, heroes, focus_ids or None, parsed, focus_names
+        )
 
         # 附上焦点玩家近期的整体状态，让复盘更有上下文。
         # 焦点可能不止一位，逐位取；超过上限的只做本场复盘，避免提示词被撑爆。
@@ -3283,7 +3577,7 @@ class Dota2Plugin(Star):
         # 短评只需要英雄名（把 hero_id 写成人话），不再拉道具与技能常量：
         # 那两次请求原先是为深度复盘准备的，短评用不上。
         try:
-            heroes = await self.api.get_heroes()
+            heroes = await self._heroes()
         except OpenDotaError as e:
             logger.error(f"[dota2] 推送比赛 {match_id} 时拉取英雄常量失败：{e}")
             heroes = {}
@@ -3308,7 +3602,7 @@ class Dota2Plugin(Star):
 
         # 标题不带「数据完整度」：短评不依赖解析，写上去只会让人以为数据有问题。
         headline = self.match_headline(
-            match, heroes, focus_ids, with_parsed_note=False
+            match, heroes, focus_ids, with_parsed_note=False, focus_names=focus_names
         )
 
         # 大模型短评只生成一次，多个会话复用（避免重复消耗配额）。
@@ -3359,6 +3653,12 @@ class Dota2Plugin(Star):
                 self._watch_failures.get(match_id, {}).pop(umo, None)
                 delivered.add(umo)
                 logger.info(f"[dota2] 比赛 {match_id} 的赛后短评已推送到 {umo}")
+                # 记进会话语境：用户紧接着问「详细分析这一盘」时靠它消歧
+                self._nlu_remember_match(
+                    umo,
+                    match_id,
+                    "、".join(n for n in focus_names.values() if n) or "",
+                )
 
                 # 正文属于「尽力而为」：失败不影响送达判定，只提示用户去看概览。
                 # `_send_watch_comment` 内部已逐块收敛异常，这里的 try 是最后一道保险。
@@ -3570,12 +3870,18 @@ class Dota2Plugin(Star):
         heroes: dict[int, dict],
         focus_account_ids: int | list[int] | tuple[int, ...] | None = None,
         parsed: bool = True,
+        focus_names: dict[int, str] | None = None,
         *,
         with_parsed_note: bool = True,
     ) -> str:
         """生成比赛概览头部文本。
 
         ``focus_account_ids`` 可以是一位或多位焦点玩家，多位时逐个列出。
+
+        ``focus_names`` 是 ``{account_id: 昵称}``：焦点玩家**优先显示昵称**而不是
+        数字 ID。数据源返回的选手结构里昵称经常缺失（隐私设置会隐藏），此时
+        只有调用方手上的绑定/监听记录才有昵称，所以必须由调用方传进来。
+        昵称与数据源都没有时退化成 ``账号{id}``——裸数字在推送里没有可读性。
 
         ``parsed`` 参数**已不参与判定**（保留仅为兼容既有调用方）：完整度文案
         统一由 :func:`parsed_state` 从 ``match`` 推导，确保与 AI 提示词正文
@@ -3612,8 +3918,14 @@ class Dota2Plugin(Star):
                 win = player_win(player)
                 # 只有一位焦点玩家时沿用「焦点玩家」的措辞，多位时逐行列出来
                 label = "👤 焦点玩家" if len(focus_ids) == 1 else f"👤 焦点玩家 {index + 1}"
+                display = (
+                    (focus_names or {}).get(int(focus_id))
+                    or player.get("name")
+                    or player.get("personaname")
+                    or f"账号{focus_id}"
+                )
                 lines.append(
-                    f"{label}：{player.get('name') or focus_id} · "
+                    f"{label}：{display} · "
                     f"{hname(heroes, player.get('hero_id'))} · "
                     f"{player.get('kills', 0)}/{player.get('deaths', 0)}/{player.get('assists', 0)} "
                     f"{'✅胜' if win else '❌负'}"

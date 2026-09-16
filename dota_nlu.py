@@ -244,7 +244,57 @@ ANALYSIS_QUESTION_RE = re.compile(
     r"|推荐|值不值"
 )
 
+#: **指代某一局**的说法：「这一盘」「那把」「上一局」「刚才那场」「最后一把」。
+#: 出现这些词时，用户要的是**单场复盘**（``match``），即使他同时说了
+#: 「分析」——「详细分析这一盘」说的是一局，不是近期总结。
+#: 之前没有这条，``analyze`` 靠「分析」拿 4 分压过 ``match`` 的「这盘」3 分，
+#: 于是「详细分析这一盘」被翻译成「分析近期 1 场表现」，答非所问。
+DEICTIC_RE = re.compile(
+    r"(?:这|那|刚(?:才)?|上(?:一|个)?|最后|最近(?:的)?)\s*(?:一\s*)?(?:场|把|局|盘)"
+)
+
+#: **聚合 / 总结**说法：要的是「最近这段时间打得怎么样」，不是某一局。
+#: 与 :data:`DEICTIC_RE` 同时出现时以它为准（「最近十场里我上一把」仍算单场，
+#: 但「最近的表现」不是）。
+AGGREGATE_RE = re.compile(
+    r"近期|最近\s*[0-9十]+\s*(?:场|把|局|盘)|平均|场均|总体|整体|走势|起伏|"
+    r"表现|状态|发挥|水平|打法|风格|习惯|胜率|命中率|总结|总结下|"
+    r"问题在哪|该怎么改进|改进|提升|上分|练"
+)
+
+#: 明确表示「要看一下某一局」的动作词。只有指代、**没有动作词**的话多半是
+#: 在吐槽（「刚才那把真是气死我了」），不该被当成复盘请求。
+SINGLE_MATCH_ACTION_RE = re.compile(
+    r"分析|复盘|点评|评价|看看|看下|看一下|查|详细|具体|说说|讲讲|总结|回顾|拉一下|来一下"
+    r"|怎么样|如何|为啥|为什么|咋|什么情况"
+)
+
+
+def looks_like_single_match(text: str) -> bool:
+    """这句话是不是在指**某一局**（而不是近期总结）。
+
+    「详细分析这一盘」「复盘一下刚才那把」→ True；
+    「分析一下我最近的表现」「最近 20 场胜率多少」→ False。
+    """
+    src = text or ""
+    return bool(DEICTIC_RE.search(src)) and not AGGREGATE_RE.search(src)
+
+
+def wants_single_match(text: str) -> bool:
+    """用户是不是在**要求看**某一局（而不是随口提到）。
+
+    比 :func:`looks_like_single_match` 多一道动作词校验，用于「规则完全没
+    识别出意图」时决定要不要按单场复盘处理。
+    """
+    return looks_like_single_match(text) and bool(
+        SINGLE_MATCH_ACTION_RE.search(text or "")
+    )
+
 #: 意图 → 是否需要「目标玩家」参数
+#:
+#: 这里也包含 ``match``：它要的是比赛 ID（不是玩家），但缺参数时同样需要
+#: 提示用户怎么补。**早期漏了它**，于是「复盘一下」（没给 ID）会一路走到
+#: ``d2_match`` 被当成「用法不对」弹一整段命令帮助，而不是问一句「哪一盘」。
 INTENT_NEEDS_TARGET = {
     "bind",
     "unbind",
@@ -252,6 +302,7 @@ INTENT_NEEDS_TARGET = {
     "heroes",
     "matches",
     "analyze",
+    "match",
     "watch",
     "unwatch",
     "forceparse",
@@ -719,6 +770,11 @@ def parse(text: str) -> Intent | None:
         scores["match"] = scores.get("match", 0) + 5
 
     if not scores:
+        # 一个关键词都没踩中，但「帮我看看最后一把」这种说法确实是要看某一局。
+        # 只在**有明确动作词**时才认（否则「刚才那把真是气死我了」也会被
+        # 当成复盘请求）。
+        if wants_single_match(raw) and not ANALYSIS_QUESTION_RE.search(raw):
+            return _build_intent("match", raw, 0, match_id, False)
         return None
 
     # 「催解析 / 解析好了吗」这类问法里通常也带比赛 ID，而 ID 本身会给
@@ -731,10 +787,31 @@ def parse(text: str) -> Intent | None:
         best = "forceparse"
         return _build_intent(best, raw, scores[best], match_id, False)
 
+    if not scores:
+        # 一个关键词都没踩中，但「帮我看看最后一把」这种说法确实是要看某一局。
+        # 只在**有明确动作词**时才认（否则「刚才那把真是气死我了」也会被
+        # 当成复盘请求），并且必须先过分析型问句闸门。
+        if wants_single_match(raw) and not ANALYSIS_QUESTION_RE.search(raw):
+            return _build_intent("match", raw, 0, match_id, False)
+        return None
+
     best = max(scores, key=lambda name: (scores[name], name))
     if scores[best] < MIN_SCORE:
+        if wants_single_match(raw) and not ANALYSIS_QUESTION_RE.search(raw):
+            return _build_intent("match", raw, scores.get("match", 0), match_id, False)
         return None
     best_score = scores[best]
+
+    # 「刚才那把…」「这把…」这种只有指代、没有任何「要看」的动作词，
+    # 多半是在吐槽（「刚才那把真是气死我了」）而不是要复盘 —— 别自作主张
+    # 去问比赛 ID，交给闲聊兜底更合适。
+    if (
+        best == "match"
+        and not match_id
+        and DEICTIC_RE.search(raw)
+        and not wants_single_match(raw)
+    ):
+        return None
 
     # 分析型问句让位给闲聊兜底。
     #
@@ -746,6 +823,13 @@ def parse(text: str) -> Intent | None:
     # **只读查询**不在闸门里，被误判也只是多给一份数据，代价可控。
     if best in ANALYSIS_GATED_INTENTS and ANALYSIS_QUESTION_RE.search(raw):
         return None
+
+    # 「详细分析这一盘」这类：**分析**的是某一局，不是近期总结。
+    # 关键词打分只看词频（分析=4 > 这盘=3），必须靠指代特征纠偏，
+    # 否则用户会得到一份「近 1 场表现分析」，而不是他想要的复盘。
+    if best == "analyze" and looks_like_single_match(raw):
+        best = "match"
+        best_score = max(best_score, scores.get("match", 0))
 
     # 否定词把「绑定 / 监听」翻成取消动作
     flipped = False
@@ -802,24 +886,81 @@ def _build_intent(
 # ======================================================================
 
 CLASSIFIER_SYSTEM_PROMPT = (
-    "你是 Dota2 数据助手的意图分类器。只根据用户这句话判断他想用哪个功能，"
-    "不要回答他的问题，也不要编造数据。必须只输出一行 JSON。"
+    "你是 Dota2 数据助手的意图分类器。只根据用户这句话（以及给出的会话上下文）"
+    "判断他想用哪个功能，不要回答他的问题，也不要编造数据。必须只输出一行 JSON。"
 )
 
+#: 比赛 ID 的合理下界。模型偶尔会凭空编一个 ID 出来，凡是小于这个数
+#: 的一概不信（现役比赛 ID 都在 80 亿以上）。
+MIN_PLAUSIBLE_MATCH_ID = 1_000_000_000
 
-def build_classifier_prompt(text: str) -> str:
-    """构造给大模型的意图分类提示词。"""
+
+def render_context(
+    recent_lines: list[str] | None = None,
+    recent_matches: list[dict] | None = None,
+) -> str:
+    """把会话上下文渲染成给模型看的一段说明文字。
+
+    Args:
+        recent_lines: 最近的对话（由旧到新），每条形如 ``用户: xxx``。
+        recent_matches: 本会话最近提到过的比赛，每项含 ``match_id`` / ``desc``。
+    """
+    blocks: list[str] = []
+    if recent_lines:
+        blocks.append("本会话最近的对话（由旧到新）：\n" + "\n".join(recent_lines[-10:]))
+    if recent_matches:
+        rows = []
+        for item in list(recent_matches)[:5]:
+            mid = str(item.get("match_id") or "").strip()
+            desc = str(item.get("desc") or "").strip()
+            rows.append(f"- {mid}" + (f"：{desc}" if desc else ""))
+        if rows:
+            blocks.append(
+                "本会话最近提到过的比赛（由新到旧）：\n" + "\n".join(rows)
+            )
+    return "\n\n".join(blocks)
+
+
+def build_classifier_prompt(
+    text: str,
+    recent_lines: list[str] | None = None,
+    recent_matches: list[dict] | None = None,
+) -> str:
+    """构造给大模型的意图分类提示词。
+
+    ``recent_lines`` / ``recent_matches`` 是**消歧的关键**：用户说「这一盘」
+    「上面那局」时，光看这一句话根本无从判断是哪场，必须把会话里刚提过的
+    比赛一起给模型。
+    """
     options = "\n".join(
         f"- {name}: {label}" for name, label in INTENT_LABELS.items()
     )
-    return (
+    context = render_context(recent_lines, recent_matches)
+    parts = [
         f"可选功能：\n{options}\n"
-        "- none: 以上都不是（闲聊、问别的问题、意图不明确）\n\n"
-        "输出格式（只输出 JSON，不要解释）：\n"
-        '{"intent": "<功能名或 none>", "target": "<玩家昵称或账号ID，没有就空字符串>", '
-        '"count": <场次数字，没有就 0>, "match_id": <比赛ID数字，没有就 0>}\n\n'
-        f"用户说：{text}"
-    )
+        "- none: 以上都不是（闲聊、问别的问题、意图不明确）\n",
+    ]
+    if context:
+        parts.append(
+            "【会话上下文（用于理解『这一盘』『上面那局』这类指代）】\n"
+            f"{context}\n"
+        )
+        parts.append(
+            "判断规则：\n"
+            "1. 用户说「这一盘 / 这把 / 那局 / 上一把 / 刚才那场 / 最后一把」等指代某一局时，"
+            "输出 match，并把 match_id 填成上下文里对应的那一场；"
+            "**只许填上下文或原句里出现过的比赛 ID，绝不许自己编一个**。\n"
+            "2. 说「最近 N 场 / 近期表现 / 状态 / 打法 / 胜率」这类总结性要求 → analyze。\n"
+            "3. 只是在聊天、问别的、或看不出明确意图 → none。\n"
+            "4. match_id / count 没有就填 0，target 没有就填空字符串。\n"
+        )
+        parts.append(
+            "输出格式（只输出 JSON，不要解释）：\n"
+            '{"intent": "<功能名或 none>", "target": "<玩家昵称或账号ID，没有就空字符串>", '
+            '"count": <场次数字，没有就 0>, "match_id": <比赛ID数字，没有就 0>}\n'
+        )
+        parts.append(f"用户说：{text}")
+    return "\n".join(parts)
 
 
 def parse_classifier_reply(reply: str) -> Intent | None:
@@ -850,8 +991,15 @@ def parse_classifier_reply(reply: str) -> Intent | None:
     except (TypeError, ValueError):
         match_id = 0
 
+    # 模型编出来的比赛 ID 比认不出更糟——会去查一场根本不存在的比赛。
+    # 只认「合理量级」的数字，其余一律当作没有。
+    if match_id and match_id < MIN_PLAUSIBLE_MATCH_ID:
+        match_id = 0
+
     matched = re.search(r"\d{6,20}", target)
     if name == "match":
+        args = str(match_id) if match_id else (matched.group(0) if matched else "")
+    elif name == "forceparse":
         args = str(match_id) if match_id else (matched.group(0) if matched else "")
     elif name in {"help", "my", "bindings", "unbind", "watchlist", "llmtest", "datasource"}:
         args = ""
