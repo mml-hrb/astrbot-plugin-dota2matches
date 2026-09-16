@@ -142,6 +142,65 @@ PLATFORMS_WITHOUT_PROACTIVE_PUSH = {
 }
 
 # ======================================================================
+# 「会话已不可达」判定
+# ======================================================================
+#: 发送失败时，若错误信息里出现这些字样，说明**不是**临时故障，而是 bot
+#: 被移出群聊 / 被拉黑 / 账号被封 —— 这类情况重试多少次都不会恢复，
+#: 该会话下的监听留着只会让后台一直白跑（白白消耗大模型配额）。
+#:
+#: 匹配刻意从严：误删用户的监听是不可逆的，宁可漏判（还有「推送失败上限」
+#: 兜底，最多白试几次），也不能因为一句含糊的报错就清掉整个群的监听。
+UNREACHABLE_HINTS: tuple[tuple[str, str], ...] = (
+    # ——— 被移出群聊 / 群已解散 / bot 不是群成员 ———
+    ("不是群成员", "bot 已不是该群成员"),
+    ("不在该群", "bot 已不在该群"),
+    ("不在群内", "bot 已不在该群"),
+    ("已被移出", "bot 已被移出群聊"),
+    ("已被踢出", "bot 已被踢出群聊"),
+    ("被踢出群", "bot 已被踢出群聊"),
+    ("群不存在", "群聊不存在"),
+    ("群聊不存在", "群聊不存在"),
+    ("群已解散", "群聊已解散"),
+    ("group not found", "群聊不存在"),
+    ("not in group", "bot 已不在该群"),
+    ("not a member", "bot 已不是该群成员"),
+    ("is not a member of", "bot 已不是该群成员"),
+    # ——— 被拉黑 / 不再是好友 ———
+    # 用「拉黑」而不是「被拉黑」：平台文案五花八门（对方已将你拉黑 /
+    # 你已被拉黑 / 拉黑了该账号），统一按词根匹配。发送失败里出现「拉黑」
+    # 基本只可能是这一种含义，放宽是安全的。
+    ("拉黑", "已被对方拉黑"),
+    ("黑名单", "已被对方拉黑"),
+    ("不是好友", "已不是对方好友"),
+    ("不是对方好友", "已不是对方好友"),
+    ("请先添加对方为好友", "已不是对方好友"),
+    ("添加对方为好友", "已不是对方好友"),
+    ("blocked", "已被对方拉黑"),
+    # ——— 账号层面被封禁 ———
+    ("账号已被封禁", "账号被封禁"),
+    ("已被封禁", "账号被封禁"),
+    ("账号被限制", "账号被限制"),
+)
+
+
+def looks_unreachable(exc: BaseException | str | None) -> str | None:
+    """判断一次发送失败是否是「会话已不可达」。
+
+    Returns:
+        命中时给出一句人话原因（用于日志），否则 ``None``。
+    """
+    if exc is None:
+        return None
+    text = str(exc) if not isinstance(exc, str) else exc
+    if not text:
+        return None
+    lowered = text.lower()
+    for hint, reason in UNREACHABLE_HINTS:
+        if hint.lower() in lowered:
+            return reason
+    return None
+
+# ======================================================================
 # 「催解析 + 等解析」相关的常量
 # ======================================================================
 #: 单场查询里用来跳过等待的开关词：`/d2 单场 <id> skip`
@@ -414,6 +473,22 @@ class Dota2Plugin(Star):
         self._watch_task: asyncio.Task | None = None
         self._stopping = False
         self._next_poll_at = 0.0
+        #: 推送失败计数：``{match_id: {umo: 连续失败次数}}``。
+        #:
+        #: **这张表必须活在 pending 项之外。** pending 项在 :meth:`_finish` 里
+        #: 会被 pop 掉，而推送失败的会话基线不推进，下一轮会被重新发现、
+        #: 重新 :meth:`_queue_pending` —— 那会造出一个全新的 item。
+        #: 早先把计数挂在 item 上（``deliver_attempts``），于是每重建一次就
+        #: 归零，bot 账号掉线时表现为「后台无限重试」：
+        #: 重新入队 → 归零 → 再试满上限 → 再归零 …… 永不终止。
+        #:
+        #: 按 ``(match_id, umo)`` 计数而不是整场计数，是因为掉线的通常是**某个
+        #: 平台/会话**，另一个会话可能一切正常——不该让一个掉线的会话拖着整场
+        #: 比赛不放，也不该因为别人成功就让它无限重试。
+        #:
+        #: 整场比赛结束（:meth:`_finish`）或被队列淘汰时按 match_id 整体清除，
+        #: 因此不会无限增长。
+        self._watch_failures: dict[int, dict[str, int]] = {}
         #: 自然语言确认状态：``{(umo, uid): (intent_name, args, 过期时间戳)}``
         #: 群里说「绑定 xxx」这类多义指令时，先记下来等用户确认再执行。
         self._nlu_confirm: dict[tuple[str, str], tuple[str, str, float]] = {}
@@ -2233,7 +2308,7 @@ class Dota2Plugin(Star):
             f"· 推送目标：本会话\n"
             f"· 轮询间隔：{interval} 秒\n"
             f"· 已记录基线比赛：{baseline}（只有此后进行的新比赛才会推送）\n"
-            f"· 数据源提供详细数据后，会自动生成 AI 分析并发送到这里\n"
+            f"· 数据源收录比赛后，会将简报发送到这里\n"
             f"· 取消监听：`/d2 取消监听 {account_id}`"
             + platform_note
         )
@@ -2834,9 +2909,6 @@ class Dota2Plugin(Star):
                 "focuses": [],
                 #: 比赛还没被数据源收录的次数（收录是这里唯一要等的东西）
                 "wait_attempts": 0,
-                #: 投递尝试次数。数据都就绪、但标题始终发不出去时（例如平台侧一直
-                #: 报错），超过上限就放弃这场比赛，避免无限重试刷屏。
-                "deliver_attempts": 0,
                 "first_seen": time.time(),
                 "next_try_at": 0.0,
                 #: 是否正在处理中（防止并发投递同一场比赛）
@@ -2875,10 +2947,45 @@ class Dota2Plugin(Star):
             # 被丢弃的比赛不推进 last_match_id，下一轮会被重新发现，
             # 因此队列溢出只会推迟推送，不会静默漏推。
             self._pending.pop(oldest["key"], None)
+            # 让出的条目下轮会重新入队，它的失败计数留着毫无意义（而且会随
+            # 每次重新入队悄悄累积），一并清掉。
+            self._clear_watch_failures(int(oldest.get("match_id") or 0))
             logger.warning(
                 f"[dota2] 待推送队列已满（{max_pending}），"
                 f"暂时让出比赛 {oldest['match_id']}，稍后重新入队"
             )
+
+    # ------------------------------------------------------------------
+    # 推送失败计数
+    #
+    # 独立于 pending 项存在，因为 pending 项每次「重新入队」都是新对象，
+    # 挂在它上面的计数会被清零 —— 那正是掉线时无限重试的根因。
+    # ------------------------------------------------------------------
+
+    def _watch_deliver_limit(self) -> int:
+        """单会话单场比赛的推送失败上限（达到即放弃）。"""
+        return max(1, int(self.cfg("watch_max_deliver_attempts", 10)))
+
+    def _watch_fail_count(self, match_id: int, umo: str) -> int:
+        return int(self._watch_failures.get(int(match_id), {}).get(umo, 0))
+
+    def _bump_watch_failure(self, match_id: int, umo: str) -> tuple[int, bool]:
+        """累加「某会话推送某场比赛」的失败次数。
+
+        Returns:
+            ``(累计失败次数, 是否已达到上限)``。达到上限即意味着放弃——调用方
+            会把该会话标记为「已处理」并推进其监听基线，让它不再被重新发现，
+            从而终止重试循环。
+        """
+        match_id = int(match_id)
+        bucket = self._watch_failures.setdefault(match_id, {})
+        count = int(bucket.get(umo, 0)) + 1
+        bucket[umo] = count
+        return count, count >= self._watch_deliver_limit()
+
+    def _clear_watch_failures(self, match_id: int) -> None:
+        """整场比赛结束后清掉它的失败计数（防止这张表无限增长）。"""
+        self._watch_failures.pop(int(match_id), None)
 
     async def _process_pending(self) -> None:
         """处理待推送队列：等待详细数据就绪后生成分析并推送。"""
@@ -2914,10 +3021,30 @@ class Dota2Plugin(Star):
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
+                # 这里只接「漏出 _try_deliver 的意外」，正常情况下走不到。
+                # 同样要有上限：异常若是恒定复现（例如格式化代码有 bug），
+                # 不封顶就会每 5 分钟在后台空转一次，永远不停。
                 logger.error(f"[dota2] 推送比赛 {match_id} 失败：{e}", exc_info=True)
-                item["next_try_at"] = time.time() + 300
+                errors = int(item.get("error_attempts", 0)) + 1
+                item["error_attempts"] = errors
+                if errors >= 3:
+                    logger.error(
+                        f"[dota2] 比赛 {match_id} 连续 {errors} 次处理异常，放弃推送"
+                    )
+                    try:
+                        await self._finish(item, delivered_umos=set(), force_advance=True)
+                    except Exception as finish_err:  # noqa: BLE001
+                        logger.error(
+                            f"[dota2] 放弃比赛 {match_id} 时再次出错：{finish_err}"
+                        )
+                else:
+                    item["next_try_at"] = time.time() + 300
             finally:
                 item["processing"] = False
+
+            # `_finish` 可能已经把这一项 pop 掉了；此时再写字段没有意义
+            if self._pending.get(item.get("key")) is not item:
+                continue
 
     async def _try_deliver(
         self,
@@ -2964,26 +3091,34 @@ class Dota2Plugin(Star):
 
         delivered = await self._deliver(item, match)
 
-        # 数据已就绪但一条都没送出去：计数并在超过上限后放弃，避免无限重试。
-        # 注意这里只在「完全没送出去」时计数，正文失败不影响 delivered（见 _deliver）。
-        if not delivered:
-            item["deliver_attempts"] = int(item.get("deliver_attempts", 0)) + 1
-            max_deliver = max(1, int(self.cfg("watch_max_deliver_attempts", 10)))
-            if item["deliver_attempts"] > max_deliver:
-                logger.warning(
-                    f"[dota2] 比赛 {match_id} 连续 {item['deliver_attempts']} 次推送失败，"
-                    f"放弃该场（数据已就绪，可能是平台发送通道问题）"
-                )
-                await self._finish(item, delivered_umos=set(), force_advance=True)
-                return
+        # 连一个可推送的目标都没有（异常数据）：直接了结，不要每轮重新入队
+        if item.get("nothing_to_do"):
+            logger.warning(
+                f"[dota2] 比赛 {match_id} 没有可推送的目标会话，放弃推送"
+            )
+            await self._finish(item, delivered_umos=set(), force_advance=True)
+            return
 
-        await self._finish(item, delivered_umos=delivered)
+        # 连续失败达到上限的会话：放弃。``_finish`` 会推进它们的监听基线，
+        # 这样下一轮 _check_account 不会再发现这场比赛，重试循环到此终止。
+        # 计数在 :attr:`_watch_failures` 里，跨「重新入队」存活——早先挂在
+        # item 上的版本每次重建都归零，掉线时就是无限循环。
+        abandoned = set(item.get("abandoned_umos") or ())
+        if abandoned:
+            logger.warning(
+                f"[dota2] 比赛 {match_id} 放弃向 {len(abandoned)} 个会话推送"
+                f"（连续失败已达上限 {self._watch_deliver_limit()} 次，"
+                f"通常是 bot 账号掉线或平台发送通道异常）"
+            )
+
+        await self._finish(item, delivered_umos=delivered, abandoned_umos=abandoned)
 
     async def _finish(
         self,
         item: dict,
         delivered_umos: set[str],
         force_advance: bool = False,
+        abandoned_umos: set[str] | None = None,
     ) -> None:
         """结束一个待推送项，并推进已成功送达的监听者进度。
 
@@ -2994,9 +3129,14 @@ class Dota2Plugin(Star):
             item: 待推送项。
             delivered_umos: 推送成功的会话标识集合。
             force_advance: 主动放弃这场推送时置 True，避免每轮都重新入队空转。
+            abandoned_umos: 连续失败已达上限、被放弃的会话。它们并没有送达，
+                但**同样要推进基线**——否则「基线不动 → 下一轮重新发现 →
+                再失败」会一直转下去，这正是掉线时后台无限重试的形状。
+                放弃一场旧比赛，好过让队列永远卡在上面。
         """
         self._pending.pop(item.get("key"), None)
         match_id = int(item["match_id"])
+        abandoned = abandoned_umos or set()
 
         # 只有在生成这份报告时就已经纳入的焦点玩家，才能因为本次推送而推进进度。
         # 若某位焦点玩家是在报告生成之后才被并进这一项的（并发检查时的窄窗口），
@@ -3015,11 +3155,29 @@ class Dota2Plugin(Star):
                 leftovers.append(focus)
                 continue
             for target in focus.get("targets") or []:
-                if not force_advance and target.get("umo") not in delivered_umos:
+                umo = str(target.get("umo") or "")
+                if (
+                    not force_advance
+                    and umo not in delivered_umos
+                    and umo not in abandoned
+                ):
                     continue
                 watcher_id = str(target.get("watcher_id") or "")
                 if watcher_id:
                     updates[watcher_id] = match_id
+
+        # 还有会话既没送达、也没被放弃 ⇒ 它们要等下一轮补推。
+        # 只有在这种情况下才**必须**保留失败计数。若一律清除，下一轮重新入队时
+        # 计数就从零开始，上限永远达不到 —— 那正是掉线时无限重试的形状。
+        still_retrying = any(
+            str(target.get("umo") or "") not in delivered_umos
+            and str(target.get("umo") or "") not in abandoned
+            for focus in focuses
+            for target in (focus.get("targets") or [])
+        )
+        if force_advance or not still_retrying:
+            self._clear_watch_failures(match_id)
+
         if not updates and not leftovers:
             return
         if updates:
@@ -3058,8 +3216,11 @@ class Dota2Plugin(Star):
             进度——失败的会话保持原基线，下一轮会重新入队补推。
         """
         match_id = int(item["match_id"])
+        # 没有任何可推送目标时置位，让调用方直接了结这一项，而不是每轮空转
+        item.pop("nothing_to_do", None)
         focuses: list[dict] = item.get("focuses") or []
         if not focuses:
+            item["nothing_to_do"] = True
             return set()
 
         # 快照本次报告覆盖的焦点玩家：报告生成期间若又有新焦点被并入这一项，
@@ -3070,6 +3231,7 @@ class Dota2Plugin(Star):
             if int(focus.get("account_id") or 0)
         ]
         if not focus_ids:
+            item["nothing_to_do"] = True
             return set()
         focus_names = {
             int(focus["account_id"]): str(focus.get("name") or "")
@@ -3095,7 +3257,28 @@ class Dota2Plugin(Star):
                     }
         targets = list(per_umo.values())
         if not targets:
+            item["nothing_to_do"] = True
             return set()
+
+        # 已经放弃过的会话不再浪费一次大模型调用。正常流程里它们不会重新出现
+        # （放弃时基线已被推进），这里是给并发窗口兜底：同一场比赛可能被两个
+        # 监听者同时发现，其中一个刚放弃、另一个还没。
+        limit = self._watch_deliver_limit()
+        abandoned: set[str] = set()
+        active: list[dict] = []
+        for target in targets:
+            umo = str(target.get("umo") or "")
+            if umo and self._watch_fail_count(match_id, umo) >= limit:
+                abandoned.add(umo)
+                continue
+            active.append(target)
+        item["abandoned_umos"] = abandoned
+        if not active:
+            logger.warning(
+                f"[dota2] 比赛 {match_id} 的所有目标会话都已放弃，跳过本次推送"
+            )
+            return set()
+        targets = active
 
         # 短评只需要英雄名（把 hero_id 写成人话），不再拉道具与技能常量：
         # 那两次请求原先是为深度复盘准备的，短评用不上。
@@ -3153,11 +3336,27 @@ class Dota2Plugin(Star):
                 # 因此正文发送失败只记日志、不回退，绝不影响 delivered。
                 headline_ok = await self._send_to_session(umo, headline)
                 if not headline_ok:
-                    logger.warning(
-                        f"[dota2] 向 {umo} 推送比赛 {match_id} 的标题未送达，稍后重试"
-                    )
+                    # bot 账号掉线时这里会一直失败。次数达到上限就放弃这个会话：
+                    # 把它记进 abandoned，_finish 会推进它的基线，
+                    # 下一轮不再重新发现这场比赛 —— 重试循环就此终止。
+                    count, hit_limit = self._bump_watch_failure(match_id, umo)
+                    if hit_limit:
+                        abandoned.add(umo)
+                        item["abandoned_umos"] = set(abandoned)
+                        logger.warning(
+                            f"[dota2] 向 {umo} 推送比赛 {match_id} 连续失败 "
+                            f"{count} 次（上限 {limit}），放弃该会话的这场推送"
+                            f"（bot 账号可能已掉线）"
+                        )
+                    else:
+                        logger.warning(
+                            f"[dota2] 向 {umo} 推送比赛 {match_id} 的标题未送达"
+                            f"（第 {count}/{limit} 次），稍后重试"
+                        )
                     continue
 
+                # 送达即清零：偶发的一次失败不该累积成放弃
+                self._watch_failures.get(match_id, {}).pop(umo, None)
                 delivered.add(umo)
                 logger.info(f"[dota2] 比赛 {match_id} 的赛后短评已推送到 {umo}")
 
@@ -3261,8 +3460,87 @@ class Dota2Plugin(Star):
         )
 
     async def _send(self, umo: str, chain: MessageChain) -> bool | None:
-        """发送单条消息并归一化返回值（不同版本 AstrBot 的返回契约不一致）。"""
-        return await self.context.send_message(umo, chain)
+        """发送单条消息并归一化返回值（不同版本 AstrBot 的返回契约不一致）。
+
+        这里是全插件**唯一的发送出口**，因此「会话已不可达」的判定也放在这里：
+        无论是监听推送、指令回复还是提示消息，只要平台侧明确说「bot 已不是群成员 /
+        已被拉黑」，就顺势清理该会话下的监听。
+        """
+        try:
+            return await self.context.send_message(umo, chain)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            reason = looks_unreachable(e)
+            if reason:
+                # 这种失败重试多少次都不会恢复，别让它占用后续的推送轮次
+                await self._on_session_unreachable(umo, reason)
+            raise  # 交回上层按普通「发送失败」处理
+
+    async def _on_session_unreachable(self, umo: str, reason: str) -> None:
+        """bot 被移出群聊 / 被拉黑后，清掉该会话下的所有监听。
+
+        这些监听已经永远不可能送达了，留着只会让后台每轮都白跑一次
+        （还会白白消耗一次大模型配额）。判定由 :func:`looks_unreachable`
+        从严把关，误删不可逆，宁可漏判。
+        """
+        if not bool(self.cfg("watch_auto_unwatch_on_kick", True)):
+            logger.info(
+                f"[dota2] {umo} 疑似{reason}，"
+                f"但 watch_auto_unwatch_on_kick 已关闭，保留监听"
+            )
+            return
+
+        removed = 0
+        try:
+            removed = await self.store.remove_watchers_for_umo(umo)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[dota2] 清理 {umo} 的监听失败：{e}")
+
+        # 待推送队列里指向该会话的条目也要一并清掉，否则这一轮还会再试一次
+        dropped = self._drop_pending_for_umo(umo)
+        self._clear_watch_failures_for_umo(umo)
+
+        if removed or dropped:
+            logger.warning(
+                f"[dota2] 检测到 {reason}，已自动取消 {umo} 的 {removed} 条监听"
+                f"（并丢弃 {dropped} 项待推送）"
+            )
+        else:
+            logger.info(f"[dota2] 检测到 {reason}，{umo} 本就没有监听，无需清理")
+
+    def _drop_pending_for_umo(self, umo: str) -> int:
+        """从待推送队列里剔除某个会话，返回受影响的比赛数。
+
+        只摘掉这一个会话的投递目标；若某场比赛已经没有任何目标，整项作废。
+        """
+        affected: set[int] = set()
+        for key in list(self._pending.keys()):
+            item = self._pending.get(key)
+            if not isinstance(item, dict):
+                continue
+            focuses = item.get("focuses") or []
+            for focus in list(focuses):
+                targets = focus.get("targets") or []
+                kept = [t for t in targets if str(t.get("umo") or "") != umo]
+                if len(kept) == len(targets):
+                    continue
+                focus["targets"] = kept
+                affected.add(int(item.get("match_id") or 0))
+                if not kept:
+                    focuses.remove(focus)
+            if not focuses:
+                self._pending.pop(key, None)
+                self._clear_watch_failures(int(item.get("match_id") or 0))
+        return len(affected)
+
+    def _clear_watch_failures_for_umo(self, umo: str) -> None:
+        for match_id in list(self._watch_failures.keys()):
+            bucket = self._watch_failures.get(match_id)
+            if isinstance(bucket, dict) and umo in bucket:
+                bucket.pop(umo, None)
+                if not bucket:
+                    self._watch_failures.pop(match_id, None)
 
     async def _send_to_session(self, umo: str, text: str) -> bool:
         """发送推送标题，按 ``max_message_length`` 分块。

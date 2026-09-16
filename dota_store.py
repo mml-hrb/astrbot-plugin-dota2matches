@@ -253,6 +253,24 @@ class DotaStore:
     async def remove_watchers_for_account(self, umo: str, account_id: int) -> bool:
         return await self.remove_watcher(self.watcher_id(umo, account_id))
 
+    async def remove_watchers_for_umo(self, umo: str) -> int:
+        """删除某个会话下的**全部**监听项，返回删除条数。
+
+        给「bot 被移出群聊 / 被拉黑」用：这时该会话已经不可能再收到推送，
+        留着监听只会让后台一直白跑（还会白白消耗大模型配额）。
+        """
+        async with self._lock:
+            before = len(self._data["watchers"])
+            self._data["watchers"] = [
+                w
+                for w in self._data["watchers"]
+                if not (isinstance(w, dict) and w.get("umo") == umo)
+            ]
+            removed = before - len(self._data["watchers"])
+            if removed:
+                self._save_sync()
+        return removed
+
     async def update_watcher_last_match(self, wid: str, match_id: int) -> None:
         async with self._lock:
             watcher = self.get_watcher(wid)
