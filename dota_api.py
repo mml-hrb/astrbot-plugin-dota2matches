@@ -244,7 +244,7 @@ class OpenDotaClient:
         detail = (
             f"{type(last_error).__name__}: {last_error}" if last_error else "未知错误"
         )
-        raise OpenDotaError(f"请求 OpenDota 失败（{detail}）")
+        raise DataSourceUnavailableError(f"请求 OpenDota 失败（{detail}）")
 
     # ------------------------------------------------------------------
     # 英雄常量

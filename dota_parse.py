@@ -16,6 +16,11 @@ OpenDota 对一场比赛的收录与解析是两件独立的事：
 未解析时可以用 ``POST /request/{match_id}`` 主动催，之后只能轮询等待。
 本模块把「催 + 等」封装成 :func:`wait_for_parse`，调用方拿到
 :class:`ParseWaitResult` 再决定是继续分析还是放弃。
+
+**超时不等于放弃**：调用方应该在 :data:`FALLBACK_REASONS` 覆盖的结束原因下，
+用 ``result.match``（超时那一刻手上的那份数据）继续出「未解析版」报告——
+用户要的是「别干等十分钟」，而不是「十分钟后什么都没有」。
+:meth:`ParseWaitResult.fallback_text` 就是这种情况的过渡文案。
 """
 
 from __future__ import annotations
@@ -41,6 +46,15 @@ RESUBMIT_EVERY = 5
 
 #: 单次状态查询之间的最小间隔（秒），防止调用方传入过小的值打爆配额。
 MIN_CHECK_INTERVAL = 20
+
+#: 允许「超时后自动降级为未解析版报告」的结束原因。
+#:
+#: 只放 ``timeout`` —— 用户要的是「等到十分钟还没解析就不要再干等」，
+#: 而不是「无论什么情况都硬出一份报告」：
+#:
+#: * ``cancelled``：用户主动放弃等待，此时再自作主张出报告是违背意图的；
+#: * ``unavailable`` / ``error``：连比赛数据都拿不到，也无从降级。
+FALLBACK_REASONS = frozenset({"timeout"})
 
 
 @dataclass
@@ -109,6 +123,28 @@ class ParseWaitResult:
             "OpenDota 的解析队列较长时可能超过 10 分钟。你可以：\n"
             "· 稍后再用 `/d2 单场 " + str(mid) + "` 试一次（那时可能已经解析好）；\n"
             "· 或先用 `/d2 单场 " + str(mid) + " skip` 看基础数据版的复盘。"
+        )
+
+    def fallback_text(
+        self, match_id: int | None = None, *, limit_minutes: int = 0
+    ) -> str:
+        """放弃等待、**改用现有数据出报告**时的过渡文案。
+
+        与 :meth:`fail_text` 的区别：那边是「什么都不出了」，
+        这边是「不等了，但还是给你一份能看的东西」。
+
+        Args:
+            match_id: 比赛 ID，缺省用 ``self.match_id``。
+            limit_minutes: 配置的等待上限（分钟）。给 0 时按实际等待时长估算。
+        """
+        mid = match_id or self.match_id
+        limit = limit_minutes or max(1, round(self.waited / 60))
+        return (
+            f"⌛ 已等待 {limit} 分钟，比赛 {mid} 仍未完成解析，不再继续等解析了。\n"
+            "已自动改用现有数据生成复盘报告"
+            "（没有逐分钟经济、团战与出装日志，深度会明显弱于完整版）。\n"
+            f"· 稍后想补完整复盘：等 OpenDota 解析好之后再发一次 "
+            f"`/d2 单场 {mid}` 即可。"
         )
 
 

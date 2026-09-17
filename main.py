@@ -13,6 +13,8 @@
 import asyncio
 import functools
 import inspect
+import json
+import os
 import re
 import time
 from collections import deque
@@ -137,9 +139,15 @@ MAX_FOCUS_RECENT_CONTEXT = 4
 #: 用空格分隔，必须用顿号 / 逗号 / 分号 / 竖线 / 斜杠这类显式分隔符。
 FOCUS_SPLIT_RE = re.compile(r"[、,，;；|/]+")
 
-#: 已知「无法主动推送消息」的平台。这些平台只能被动回复，
-#: 因此比赛结束后的自动推送无法送达，需要在添加监听时就提醒用户。
-PLATFORMS_WITHOUT_PROACTIVE_PUSH = {
+#: 需要在**每个群单独开通**主动消息权限的平台。
+#:
+#: 这些平台走官方开放平台接口，主动消息不是「默认不行」，而是**要逐群开**：
+#: 没开时平台会回 `40034105 主动消息失败, 无权限`。因此添加监听时必须把
+#: 「去哪开」写清楚，否则用户只看到推送失败、不知道该动哪里。
+#:
+#: ⚠️ 别写成「这些平台不支持主动推送」——那是错的。本插件曾因为这句话，
+#: 把一个「群里没开开关」的问题排查了两天，还顺带去查了账号掉线与风控。
+PLATFORMS_NEEDING_PROACTIVE_SETUP = {
     "qq_official": "QQ 官方机器人",
     "qq_official_webhook": "QQ 官方机器人(Webhook)",
 }
@@ -301,8 +309,10 @@ HELP_TEXT = """🎮 Dota2 数据查询助手（数据来源：STRATZ / OpenDota 
 /d2 英雄 [目标]　　　　　　　 查看英雄使用统计
 /d2 战绩 [场次] [目标]　　　　 查看最近战绩（默认 20 场）
 /d2 分析 [场次] [目标]　　　　 AI 分析近期表现与打法风格
-/d2 单场 <比赛ID> [账号]　　　 AI 深度复盘单场比赛
-　　　　（未解析时会自动催解析并等待，最多 10 分钟）
+/d2 单场 <比赛ID> [焦点玩家]　　AI 深度复盘单场比赛
+　　　　（未解析时自动催解析并等待，最多 10 分钟；
+　　　　　等满仍未解析就自动改用现有数据出一份基础数据版报告）
+　　　　（加 skip 可跳过等待，立刻用现有数据出报告）
 /d2 催解析 <比赛ID>　　　　　 只催 OpenDota 解析这局，不等结果
 
 【监听】
@@ -349,8 +359,10 @@ HELP_TEXT = """🎮 Dota2 数据查询助手（数据来源：STRATZ / OpenDota 
 · OpenDota 收录一场比赛 ≠ 解析完这场比赛的录像。只有解析完成才有逐分钟
   经济、团战、出装这些数据，AI 复盘才有质量；
 · `/d2 单场 <比赛ID>` 遇到未解析的局会自动提交解析申请，之后每分钟检查一次，
-  解析完成就把报告发到本会话，最多等 10 分钟；等不及可以用
-  `/d2 单场 <比赛ID> skip` 直接用基础数据出报告；
+  解析完成就把报告发到本会话，最多等 10 分钟；**等满 10 分钟仍未解析时不会空手而归**
+  —— 会自动改用现有数据出一份基础数据版报告（报告头部会标注数据完整度），
+  等解析好之后再发一次 `/d2 单场 <比赛ID>` 就能拿到完整版；
+· 不想等就加 `skip`：`/d2 单场 <比赛ID> skip` 立刻用基础数据出报告；
 · 想先排上队、晚点再看，用 `/d2 催解析 <比赛ID>`。
 
 自然语言（不用记指令）：
@@ -368,6 +380,47 @@ HELP_TEXT = """🎮 Dota2 数据查询助手（数据来源：STRATZ / OpenDota 
   「dota2助手 对比一下目前监听的几个人谁最菜」（会读出监听名单与各人近期战绩）、
   「dota2助手 我想转辅助，该怎么练」（会结合你自己的英雄池与近期表现给建议）。
   这类回答同样需要模型可用；用 `/d2 帮助` 里列出的指令能拿到更结构化的报告。"""
+
+
+def _log_incoming_command(
+    handler_name: str, event: AstrMessageEvent, args: tuple = ()
+) -> None:
+    """把「收到某条指令」记进 AstrBot 日志（**在执行之前**记录）。
+
+    作用是把日志变成一条完整时间线：先看到「收到指令」，再看后面这条指令
+    自己打出来的拉取/推送日志，排障时不用猜「这次到底有没有收到请求」。
+
+    刻意做成模块级纯函数（不依赖 plugin 实例）：``take_over_event`` 也会被
+    测试用在假对象上，拿 ``self`` 取属性会平白引入一条崩溃路径。
+
+    只取 ``message_str`` 前 120 字，避免有人贴一长串内容把日志撑爆；
+    其余字段全部 ``getattr`` 兜底，缺了也不影响指令执行。
+    """
+    try:
+        umo = str(getattr(event, "unified_msg_origin", "") or "-")
+
+        raw = " ".join(str(getattr(event, "message_str", "") or "").split())
+        shown = raw[:120] + ("…" if len(raw) > 120 else "")
+
+        uid = ""
+        sender_getter = getattr(event, "get_sender_id", None)
+        if callable(sender_getter):
+            try:
+                uid = str(sender_getter())
+            except Exception:  # noqa: BLE001 - 取不到发送者不影响主流程
+                uid = ""
+
+        extra = ""
+        if args:
+            arg_text = " ".join(str(args[0]).split())
+            extra = f"｜参数「{arg_text[:80]}」"
+
+        logger.info(
+            f"[dota2] 收到指令 {handler_name}｜会话 {umo}｜用户 {uid or '-'}"
+            f"｜原文「{shown}」{extra}"
+        )
+    except Exception as e:  # noqa: BLE001 - 记日志失败绝不能影响指令本身
+        logger.debug(f"[dota2] 记录指令日志失败（可忽略）：{e}")
 
 
 def take_over_event(func=None, *, declinable: bool = False):
@@ -427,6 +480,20 @@ def take_over_event(func=None, *, declinable: bool = False):
     def decorate(func):
         @functools.wraps(func)
         async def wrapper(self, event: AstrMessageEvent, *args, **kwargs):
+            # 指令留痕：``declinable=False`` 的 handler 就是 ``@d2.command``
+            # 注册的真指令 —— 它们一被调用就必然接管，所以这里等价于
+            # 「收到 /d2 xxx 立刻记一笔，再执行」。
+            #
+            # 挂在装饰器里而不是逐个 handler 里，是为了不漏：新增指令时不必
+            # 记得加日志。同时它天然覆盖「自然语言委派」这条路径 ——
+            # ``d2_natural`` 识别出意图后会调用同一个被包装的 handler，
+            # 于是日志里能看到「自然语言识别 → 收到指令 d2_match」两步。
+            #
+            # ``declinable=True`` 只有全局自然语言监听器在用，它每条消息都会
+            # 跑一遍，记在这里会让日志被闲聊刷满，因此明确跳过。
+            if not declinable:
+                _log_incoming_command(func.__name__, event, args)
+
             #: 是否真的接管了这条消息（产出过至少一条结果）。
             handled = False
             try:
@@ -485,6 +552,13 @@ class Dota2Plugin(Star):
         self._watch_task: asyncio.Task | None = None
         self._stopping = False
         self._next_poll_at = 0.0
+        #: 已完成的轮询轮次（只用于日志：一眼能看出「监听循环还在不在跑」）。
+        #:
+        #: 之所以需要它：轮询成功且没有新比赛时，监听循环**一条日志都不打**
+        #: （STRATZ 客户端走标准库 urllib，不产生 httpx 访问日志），于是
+        #: 「日志十分钟没动静」既可能是正常静默、也可能是循环卡死，无法区分。
+        #: 有了轮次号，只要它还在涨就说明循环是活的。
+        self._poll_round = 0
         #: 推送失败计数：``{match_id: {umo: 连续失败次数}}``。
         #:
         #: **这张表必须活在 pending 项之外。** pending 项在 :meth:`_finish` 里
@@ -501,6 +575,41 @@ class Dota2Plugin(Star):
         #: 整场比赛结束（:meth:`_finish`）或被队列淘汰时按 match_id 整体清除，
         #: 因此不会无限增长。
         self._watch_failures: dict[int, dict[str, int]] = {}
+        #: 短评正文缓存：``{match_id: 正文}``。
+        #:
+        #: 短评在 :meth:`_deliver` 里是「先生成、后发送」，而重试走的是**整个**
+        #: :meth:`_deliver` —— 不缓存的话，一次发送失败就要重新调一次大模型。
+        #: 线上实测：一晚 7 场比赛各试满 10 次上限，约 70 次大模型调用全部
+        #: 浪费在同一个结果上（生成完就扔）。
+        #:
+        #: 与 :attr:`_watch_failures` 同理必须挂在实例上：pending 项每次
+        #: 「重新入队」都是新对象，挂在它上面的缓存活不过一轮。
+        #: 清理时机与失败计数完全一致（见 :meth:`_clear_watch_failures`），
+        #: 因此不会无限增长。
+        self._watch_comments: dict[int, str] = {}
+        #: 各会话最近一次发送失败的原因摘要：``{umo: "异常类型: 消息"}``。
+        #:
+        #: 只用于让「放弃推送」的日志说清**为什么**失败——早先那句
+        #: 「bot 账号可能已掉线」是写死的猜测，实测里真正的原因是平台
+        #: 无主动消息权限（40034105），会把排查方向整个带偏。
+        #: 按会话存（数量 = 会话数，很小），成功发送或会话不可达时清除。
+        self._last_send_error: dict[str, str] = {}
+        #: 会话场景记录：``{umo: "group" | "channel" | "friend"}``，**落盘**。
+        #:
+        #: 这份记录是为了修一个「日志说推送成功、群里却什么都没有」的坑：
+        #: QQ 官方适配器给「群消息主动发送」设了一道闸门 —— 必须知道这个会话
+        #: 是群（``_session_scene[会话] == "group"``）才允许发，它要靠这个区分
+        #: ``group_openid`` 与频道 ``channel_id``。而那份内存字典**只在收到入站
+        #: 消息时被写入**，且随进程重启清空。于是「重启后群里还没人说话」时，
+        #: 适配器会打印 ``skip send_by_session`` 后**直接返回**（不抛异常、
+        #: 也不返回假值），:meth:`_send` 拿到的是 True —— 插件记「已推送」，
+        #: 群里一条都没有。
+        #:
+        #: 所以这里自己记一份**入站时观测到**的场景并落盘：重启后即使群里
+        #: 静悄悄，也能把适配器缺的那条记录补回去。只记观测结果，不做猜测。
+        self._scene_records: dict[str, str] | None = None
+        #: 已经补登记并打过日志的会话，仅用于避免日志刷屏。
+        self._scene_seeded: set[str] = set()
         #: 自然语言确认状态：``{(umo, uid): (intent_name, args, 过期时间戳)}``
         #: 群里说「绑定 xxx」这类多义指令时，先记下来等用户确认再执行。
         self._nlu_confirm: dict[tuple[str, str], tuple[str, str, float]] = {}
@@ -646,6 +755,11 @@ class Dota2Plugin(Star):
     ) -> None:
         """后台任务：催解析 → 每分钟检查 → 解析完成后出复盘报告。
 
+        **超时不等于放弃**：等满配置的上限仍未解析时，只要手上还有这场比赛
+        的基础数据，就自动降级出一份「未解析版」复盘（见
+        :meth:`_parse_fallback_report`），而不是只回一句「放弃等待」。
+        真拿不到数据、或用户主动取消等待时才只发收尾通知。
+
         无论成功、超时还是异常，都会给用户一个明确的收尾消息。
         """
         options = self._parse_wait_options()
@@ -691,7 +805,23 @@ class Dota2Plugin(Star):
                 )
                 return
 
-        if not result.parsed or not result.match:
+        if not result.parsed:
+            # 等不到了，但**不等于什么都不给**：用超时那一刻手上的数据直接出
+            # 一份「未解析版」复盘（与 `/d2 单场 <id> skip` 同一条链路）。
+            # 拿不到数据、或用户是主动取消等待时才退回 fail_text。
+            if (
+                self.cfg("parse_fallback_unparsed", True)
+                and result.reason in dota_parse.FALLBACK_REASONS
+                and await self._parse_fallback_report(
+                    umo=umo,
+                    match_id=match_id,
+                    result=result,
+                    focus_ids=focus_ids,
+                    focus_names=focus_names,
+                    limit_minutes=minutes,
+                )
+            ):
+                return
             await self._parse_notify(umo, result.fail_text(match_id))
             return
 
@@ -707,6 +837,85 @@ class Dota2Plugin(Star):
             focus_ids=focus_ids,
             focus_names=focus_names,
         )
+
+    async def _parse_fallback_report(
+        self,
+        *,
+        umo: str,
+        match_id: int,
+        result: dota_parse.ParseWaitResult,
+        focus_ids: list[int],
+        focus_names: dict[int, str],
+        limit_minutes: int = 0,
+    ) -> bool:
+        """等待解析超时后的兜底：不再干等，直接用现有数据出一份复盘。
+
+        「等十分钟」解决的只是**数据完整度**，而不是「有没有复盘」——
+        基础数据（KDA、英雄、时长、经济占比、出装顺序之外的队伍构成…）
+        本来就在手，超时后用它出报告，比只回一句「放弃等待」有用得多。
+        这条链路与 `/d2 单场 <id> skip` 完全一致，
+        报告头部会照实标注「数据完整度：未解析」，不会拿基础数据冒充完整解析。
+
+        Returns:
+            是否真的产出了报告。返回 False 时调用方应发 ``fail_text``。
+        """
+        match = result.match if isinstance(result.match, dict) else None
+        if not (match or {}).get("players"):
+            # 超时那一刻手上没有可用数据（比如最后一次拉取正好失败）。
+            # 再补一次：拿不到就只能如实告知，绝不硬凑一份空壳报告。
+            try:
+                match = await self.api.get_match(match_id)
+            except OpenDotaError as e:
+                logger.warning(
+                    f"[dota2] 超时后补拉比赛 {match_id} 数据失败：{e}"
+                )
+                match = None
+            except Exception as e:  # noqa: BLE001 - 兜底链路同样不能崩
+                logger.warning(
+                    f"[dota2] 超时后补拉比赛 {match_id} 数据出错：{e}"
+                )
+                match = None
+
+        if not isinstance(match, dict) or not match.get("players"):
+            logger.info(
+                f"[dota2] 比赛 {match_id} 超时且拿不到数据，无法降级生成未解析版报告"
+            )
+            return False
+
+        # 边界：超时判定与这次补拉之间正好解析好了 —— 那就别用旧数据糊弄，
+        # 直接走完整复盘。
+        if dota_parse.parse_state(match).parsed:
+            logger.info(
+                f"[dota2] 比赛 {match_id} 在超时收尾时刚好解析完成，改出完整复盘"
+            )
+            await self._parse_notify(
+                umo,
+                f"✅ 比赛 {match_id} 已解析完成（刚好赶在收尾前），开始生成完整复盘…",
+            )
+            await self._analyze_match_data(
+                umo=umo,
+                match_id=match_id,
+                match=match,
+                focus_ids=focus_ids,
+                focus_names=focus_names,
+            )
+            return True
+
+        logger.info(
+            f"[dota2] 比赛 {match_id} 等待 {result.waited:.0f}s 仍未解析"
+            f"（原因 {result.reason}），自动降级为未解析版复盘"
+        )
+        await self._parse_notify(
+            umo, result.fallback_text(match_id, limit_minutes=limit_minutes)
+        )
+        await self._analyze_match_data(
+            umo=umo,
+            match_id=match_id,
+            match=match,
+            focus_ids=focus_ids,
+            focus_names=focus_names,
+        )
+        return True
 
     async def _on_parse_submit(self, umo: str, match_id: int, ok: bool) -> None:
         """催解析申请结果的通知。"""
@@ -1417,9 +1626,14 @@ class Dota2Plugin(Star):
         return [f"{'用户' if role == 'user' else '机器人'}: {text}" for role, text in rows]
 
     def _nlu_remember_match(
-        self, umo: str, match_id: Any, desc: str = "", log: bool = True
+        self,
+        umo: str,
+        match_id: Any,
+        desc: str = "",
+        log: bool = True,
+        start_time: Any = None,
     ) -> None:
-        """把一场比赛记进会话语境（供「这一盘」指代）。
+        """把一场比赛记进会话语境（供「这一盘」指代 + 闲聊兜底的时效判断）。
 
         Args:
             umo: 会话标识。
@@ -1427,6 +1641,10 @@ class Dota2Plugin(Star):
             desc: 一句话描述（谁 / 什么英雄 / 结果），越短越好。
             log: 是否顺带写一行会话日志。批量记录（战绩列表）时关掉，
                 否则一个列表会刷出好几行日志，把真正的对话挤没。
+            start_time: 这场比赛自己的**开赛时间戳**。闲聊兜底要拿它算
+                「昨天 / 今天」——**不能拿记录时刻顶替**：复盘一场三天前的
+                旧局时，记录时刻就是「现在」，用它会把旧局标成「今天」。
+                取不到就留空，渲染时如实写「时间未知」。
         """
         umo = str(umo or "")
         try:
@@ -1437,11 +1655,29 @@ class Dota2Plugin(Star):
             return
         bucket = self._nlu_recent_matches.setdefault(umo, deque(maxlen=8))
         # 同一场再次出现时提到最前面，保持「由新到旧」
+        previous: dict | None = None
         for row in list(bucket):
             if int(row.get("match_id") or 0) == mid:
                 bucket.remove(row)
+                previous = row
                 break
-        bucket.appendleft({"match_id": mid, "desc": (desc or "").strip(), "ts": time.time()})
+        # 同一场比赛可能被多次提到（推送 → 复盘 → 再问一次）。后一次没带
+        # 信息时不要把先前的覆盖成空：时间尤其如此，推送那次是唯一
+        # 手上握有 match 对象的时机。
+        resolved_start = start_time
+        if resolved_start is None and previous is not None:
+            resolved_start = previous.get("start_time")
+        resolved_desc = (desc or "").strip()
+        if not resolved_desc and previous is not None:
+            resolved_desc = str(previous.get("desc") or "")
+        bucket.appendleft(
+            {
+                "match_id": mid,
+                "desc": resolved_desc,
+                "start_time": resolved_start,
+                "ts": time.time(),
+            }
+        )
         if log:
             self._nlu_log_line(
                 umo, "bot", f"[提到比赛 {mid}]" + (f" {desc}" if desc else "")
@@ -1651,7 +1887,13 @@ class Dota2Plugin(Star):
         * 「dota2助手 对比一下目前监听的几个人谁最菜」
           —— 需要监听列表 + 每个人的近期战绩；
         * 「dota2助手 我要转辅助该怎么练」
-          —— 需要提问者自己的英雄池 + 近期表现。
+          —— 需要提问者自己的英雄池 + 近期表现；
+        * 「dota2助手 昨天群里开黑谁最牛逼」
+          —— 需要**会话语境**（监听推送过的比赛）+ 近期战绩 +
+            时间窗口（把统计收窄到昨天）+ 按 match_id 归并出的同场局。
+
+        上下文里永远带三样「坐标系」：当前时间、会话语境里的比赛列表、
+        以及（识别到时间词时的）时间窗口 —— 少了它们，数据再全也答不准。
 
         失败语义（很重要）：
 
@@ -1676,6 +1918,10 @@ class Dota2Plugin(Star):
                 user_id=uid,
                 watchers=self.store.list_watchers(umo),
                 bindings=list(self.store.list_bindings(umo).values()),
+                # 本会话近期的比赛（监听推送 / 复盘 / 查询提到过的）：
+                # 纯本地数据、零网络开销，永远注入。它带来的是「这个群
+                # 最近发生过什么」以及每场比赛自己的开赛时间。
+                recent_matches=self._nlu_recent_match_rows(umo, limit=8),
                 self_binding=binding,
                 recent_limit=int(
                     self.cfg("nlu_chat_context_matches", dota_chat.DEFAULT_RECENT_LIMIT)
@@ -1688,6 +1934,7 @@ class Dota2Plugin(Star):
                 ),
                 cache=self._chat_cache,
                 localizer=self._localize_heroes,
+                now=time.time(),
             )
         except Exception as e:  # noqa: BLE001 - 兜底失败也要放行，不能吞消息
             logger.error(f"[dota2] 闲聊兜底收集数据失败: {e}", exc_info=True)
@@ -1707,7 +1954,9 @@ class Dota2Plugin(Star):
         logger.info(
             f"[dota2] 闲聊兜底回答: {question[:48]!r} "
             f"needs={sorted(context.needs)} "
-            f"玩家数={len(context.snapshots)}"
+            f"玩家数={len(context.snapshots)} "
+            f"时间窗口={context.window.label if context.window else '-'} "
+            f"会话比赛={len(context.session_matches)}"
         )
         async for item in self._emit(event, reply, as_image=False):
             yield item
@@ -1742,6 +1991,11 @@ class Dota2Plugin(Star):
         text = dota_nlu.normalize(getattr(event, "message_str", "") or "")
         umo = event.unified_msg_origin
         uid = str(event.get_sender_id())
+
+        # 会话场景（群 / 频道 / 私聊）：**每条消息都记一次**，与后面有没有
+        # 被唤醒无关。QQ 官方适配器重启后会忘掉「哪个会话是群」，从而静默
+        # 丢弃主动推送；这份记录就是重新补回那条信息的唯一来源。
+        self._record_inbound_scene(event)
 
         # 会话语境：无论这条消息最终有没有被处理，都记一笔。
         # 后面用户说「上面那盘」「这一局」时全靠它消歧。
@@ -2174,7 +2428,11 @@ class Dota2Plugin(Star):
         # 才有得猜。列表本身已经列出了编号，用户照着报也行。
         for row in matches[:5]:
             self._nlu_remember_match(
-                event.unified_msg_origin, row.get("match_id"), name, log=False
+                event.unified_msg_origin,
+                row.get("match_id"),
+                name,
+                log=False,
+                start_time=row.get("start_time"),
             )
         title = f"📊 {name} 的最近 {len(matches)} 场比赛"
         if note:
@@ -2280,7 +2538,8 @@ class Dota2Plugin(Star):
         """AI 深度复盘单场比赛：/d2 单场 <比赛ID> [焦点玩家]
 
         未指定 skip 时，若该局尚未解析完成，会自动催解析并每分钟检查一次，
-        最多等 10 分钟（解析完成后再出复盘）。
+        最多等 10 分钟。等满仍未解析时**不会只回一句放弃**：只要手上还有这
+        场比赛的基础数据，就自动降级出一份「未解析版」复盘。
         """
         tokens = [token for token in re.split(r"\s+", str(args).strip()) if token]
         if not tokens or not re.fullmatch(r"\d{6,20}", tokens[0]):
@@ -2319,8 +2578,13 @@ class Dota2Plugin(Star):
                 return
             heroes = await self._heroes()
             items = await self._items()
-            # 记进会话语境：紧接着问「再详细说说这把」时不用再报 ID
-            self._nlu_remember_match(event.unified_msg_origin, match_id)
+            # 记进会话语境：紧接着问「再详细说说这把」时不用再报 ID。
+            # 顺带带上开赛时间 —— 闲聊兜底问「昨天那几盘」时要用它判断时效。
+            self._nlu_remember_match(
+                event.unified_msg_origin,
+                match_id,
+                start_time=match.get("start_time"),
+            )
         except OpenDotaError as e:
             yield event.plain_result(f"❌ 拉取比赛数据失败：{e}")
             return
@@ -2389,13 +2653,18 @@ class Dota2Plugin(Star):
             if self._start_parse_task(
                 event, match_id, focus_ids, focus_names, fresh=False
             ):
+                fallback_hint = (
+                    "仍未解析就自动改用现有数据出一份基础数据版的报告"
+                    if self.cfg("parse_fallback_unparsed", True)
+                    else "等不到会通知你"
+                )
                 yield event.plain_result(
                     f"🔍 比赛 {match_id} 数据完整度：{parse_state.describe()}\n"
                     f"AI 复盘依赖逐分钟经济、团战与出装数据，"
                     f"{'已提交催解析并' if self.cfg('parse_submit_request', True) else ''}"
                     f"开始等待：每 {_fmt_clock(seconds)} 检查一次，"
-                    f"最多等 {minutes} 分钟。\n"
-                    f"解析完成后会自动把复盘报告发到本会话，你可以先去忙别的。\n"
+                    f"最多等 {minutes} 分钟，{fallback_hint}。\n"
+                    f"报告出来后会自动发到本会话，你可以先去忙别的。\n"
                     f"（不想等待：`/d2 单场 {match_id} skip` 直接用基础数据出报告）"
                 )
                 return
@@ -2501,7 +2770,8 @@ class Dota2Plugin(Star):
                 f"📨 已向 OpenDota 提交比赛 {match_id} 的解析申请，任务已排队。\n"
                 f"当前状态：{state.describe()}\n\n"
                 f"解析通常需要几分钟到几十分钟。想拿到结果后自动出报告，"
-                f"用 `/d2 单场 {match_id}`（会每分钟检查一次，最多等 10 分钟）。"
+                f"用 `/d2 单场 {match_id}`（会每分钟检查一次，最多等 10 分钟；"
+                f"等满仍未解析会自动改用现有数据出一份基础数据版）。"
             )
         else:
             yield event.plain_result(
@@ -2586,15 +2856,25 @@ class Dota2Plugin(Star):
         self._start_watcher()
 
         interval = max(60, int(self.cfg("watch_interval", 180)))
-        platform_note = ""
-        platform_label = PLATFORMS_WITHOUT_PROACTIVE_PUSH.get(
+
+        # 平台预检：QQ 官方开放平台这类通道**可以**主动推送，但群聊里要逐群开启，
+        # 没开时平台直接回 `40034105 主动消息失败, 无权限`。这里先把「去哪开」
+        # 说清楚——否则用户只能看到推送失败，不知道该动哪里。
+        #
+        # 早期版本的提示写的是「当前平台不支持机器人主动发送消息」，那是**错的**，
+        # 会把排查方向带偏（这个坑本插件踩过两天：明明只是群里没开开关）。
+        platform_setup = ""
+        platform_label = PLATFORMS_NEEDING_PROACTIVE_SETUP.get(
             str(event.get_platform_name() or "")
         )
         if platform_label:
-            platform_note = (
-                f"\n\n⚠️ 注意：当前平台（{platform_label}）不支持机器人主动发送消息，"
-                f"比赛结束后可能无法自动推送到这里。\n"
-                f"建议改用支持主动消息的平台，或改用 `/d2 单场 <比赛ID>` 手动复盘。"
+            platform_setup = (
+                f"\n\n⚠️ 注意：{platform_label}要在**每个群单独**开启主动消息权限，"
+                f"否则比赛结束时推不进来。\n"
+                f"· 手机 QQ → 该群 → 群设置 → 机器人 → 选中本机器人 → "
+                f"打开「机器人主动在群聊内发言」\n"
+                f"· 只有群主能改，且 QQ 客户端需 9.2.90 以上才会看到这个开关\n"
+                f"· 私聊权限与群聊是分开的，私聊能发不代表群里能发"
             )
 
         yield event.plain_result(
@@ -2604,7 +2884,7 @@ class Dota2Plugin(Star):
             f"· 已记录基线比赛：{baseline}（只有此后进行的新比赛才会推送）\n"
             f"· 数据源收录比赛后，会将简报发送到这里\n"
             f"· 取消监听：`/d2 取消监听 {account_id}`"
-            + platform_note
+            + platform_setup
         )
 
     @d2.command("unwatch", alias={"取消监听", "取消订阅", "停止监听", "关闭监听", "取消关注"})
@@ -3059,12 +3339,18 @@ class Dota2Plugin(Star):
         """
         # 启动后稍等一会，避免与 AstrBot 自身的启动流程抢资源
         await asyncio.sleep(15)
+        logger.info(
+            f"[dota2] 监听循环已就绪：开始轮询（间隔 "
+            f"{max(60, int(self.cfg('watch_interval', 180)))} 秒，"
+            f"队列处理节拍 {PENDING_TICK_SECONDS} 秒）"
+        )
         while not self._stopping:
             try:
                 now = time.time()
                 if now >= self._next_poll_at:
                     poll_interval = max(60, int(self.cfg("watch_interval", 180)))
                     self._next_poll_at = now + poll_interval
+                    self._poll_round += 1
                     await self._check_watchers()
                 else:
                     await self._process_pending()
@@ -3079,6 +3365,7 @@ class Dota2Plugin(Star):
 
     async def _check_watchers(self) -> None:
         """检查所有被监听玩家是否有新比赛。"""
+        started = time.monotonic()
         watchers = self.store.list_watchers()
 
         if watchers:
@@ -3091,10 +3378,16 @@ class Dota2Plugin(Star):
             concurrency = max(1, int(self.cfg("watch_concurrency", 2)))
             semaphore = asyncio.Semaphore(concurrency)
 
-            async def _runner(account_id: int, group: list[dict]) -> None:
+            logger.info(
+                f"[dota2] 轮询第 {self._poll_round} 轮开始："
+                f"监听者 {len(watchers)} 位｜去重后 {len(groups)} 个玩家｜"
+                f"并发 {concurrency}｜待推送 {len(self._pending)} 场"
+            )
+
+            async def _runner(account_id: int, group: list[dict]) -> dict:
                 async with semaphore:
                     try:
-                        await self._check_account(account_id, group)
+                        return await self._check_account(account_id, group)
                     except asyncio.CancelledError:
                         raise
                     except Exception as e:  # noqa: BLE001
@@ -3102,24 +3395,69 @@ class Dota2Plugin(Star):
                             f"[dota2] 检查玩家 {account_id} 的新比赛失败：{e}",
                             exc_info=True,
                         )
+                        return {"account_id": account_id, "error": str(e)}
 
-            await asyncio.gather(
+            reports = await asyncio.gather(
                 *[_runner(account_id, group) for account_id, group in groups.items()]
+            )
+            self._log_poll_report(reports, started)
+        else:
+            logger.info(
+                f"[dota2] 轮询第 {self._poll_round} 轮："
+                f"当前没有监听者，跳过比赛列表拉取"
             )
 
         # 注意：即使当前一个监听者都没有，也要继续推进 pending 队列，
         # 否则队列里最后几场比赛会永远卡住（监听者被删掉时尤其明显）。
         await self._process_pending()
 
-    async def _check_account(self, account_id: int, watchers: list[dict]) -> None:
-        """检查单个玩家是否有新比赛，有则加入待推送队列。"""
+    def _log_poll_report(self, reports: list[Any], started: float) -> None:
+        """把一轮轮询的结果汇成一条日志（每轮只此一行，便于对齐时间线）。
+
+        之所以要汇总而不是只依赖 :meth:`_check_account` 里的逐玩家日志：
+        轮询最常被问到的两个问题是「循环还在跑吗」和「这轮到底拉了没有」。
+        一行里同时给出**轮次、拉取场数、新增场数、失败个数、队列长度、耗时**，
+        以及每个玩家的 ``场数/新增`` 明细，扫一眼就能回答，不用数行。
+        """
+        ok = [r for r in reports if isinstance(r, dict) and not r.get("error")]
+        failed = [r for r in reports if isinstance(r, dict) and r.get("error")]
+
+        fetched = sum(int(r.get("fetched") or 0) for r in ok)
+        queued = sum(int(r.get("queued") or 0) for r in ok)
+
+        detail = "、".join(
+            f"{r.get('account_id')}={r.get('fetched', 0)}场/新{r.get('queued', 0)}"
+            for r in ok
+        )
+
+        logger.info(
+            f"[dota2] 轮询第 {self._poll_round} 轮完成："
+            f"拉取 {fetched} 场｜新增 {queued} 场入队｜"
+            f"失败 {len(failed)} 个玩家｜待推送 {len(self._pending)} 场｜"
+            f"耗时 {time.monotonic() - started:.1f}s"
+            + (f"｜明细 {detail}" if detail else "")
+        )
+
+    async def _check_account(self, account_id: int, watchers: list[dict]) -> dict:
+        """检查单个玩家是否有新比赛，有则加入待推送队列。
+
+        返回值是一份「本轮体检报告」，交给 :meth:`_log_poll_report` 汇成
+        一条日志。**返回值只服务日志**，不参与任何业务判断——调用方
+        （含测试）忽略它也不会改变行为。
+        """
         try:
             matches = await self.api.get_player_matches(account_id, limit=8)
         except OpenDotaError as e:
             logger.warning(f"[dota2] 拉取玩家 {account_id} 比赛列表失败：{e}")
-            return
+            return {"account_id": account_id, "error": str(e)}
+
         if not matches:
-            return
+            # 空列表要单独记：它可能是「这人真的没打过」，也可能是数据源
+            # 抽风返回了空。不记的话，日志里这两种情况长得一模一样。
+            logger.info(f"[dota2] 玩家 {account_id}：数据源返回空列表（本轮无比赛）")
+            return {"account_id": account_id, "fetched": 0, "queued": 0}
+
+        latest = max(int(m.get("match_id") or 0) for m in matches)
 
         # 门槛取「进度最落后的那个监听者」：只要还有监听者没看过这场，就必须处理。
         # 之前用的是 max()，于是一旦有新监听者加入（它记录的基线是当下最新的比赛），
@@ -3129,7 +3467,13 @@ class Dota2Plugin(Star):
             match for match in matches if int(match.get("match_id") or 0) > floor
         ]
         if not new_matches:
-            return
+            return {
+                "account_id": account_id,
+                "fetched": len(matches),
+                "latest": latest,
+                "floor": floor,
+                "queued": 0,
+            }
         new_matches.sort(key=lambda m: int(m.get("match_id") or 0))
 
         # 被监听玩家自己的昵称（用于报告焦点玩家那一行），取第一个非空的
@@ -3174,7 +3518,16 @@ class Dota2Plugin(Star):
         if queued:
             logger.info(
                 f"[dota2] 玩家 {account_id} 发现 {queued} 场新比赛，已加入待推送队列"
+                f"（最新 {latest}，基线 {floor}）"
             )
+
+        return {
+            "account_id": account_id,
+            "fetched": len(matches),
+            "latest": latest,
+            "floor": floor,
+            "queued": queued,
+        }
 
     def _queue_pending(
         self,
@@ -3278,8 +3631,17 @@ class Dota2Plugin(Star):
         return count, count >= self._watch_deliver_limit()
 
     def _clear_watch_failures(self, match_id: int) -> None:
-        """整场比赛结束后清掉它的失败计数（防止这张表无限增长）。"""
-        self._watch_failures.pop(int(match_id), None)
+        """整场比赛结束后清掉它的失败计数与短评缓存（防止两张表无限增长）。
+
+        「整场结束」= 全部送达、或全部放弃、或被队列淘汰。这些时刻过后这场
+        比赛不会再被投递，留着计数和正文都没有意义。
+
+        短评缓存复用同一个清理时机，是因为两者的存活条件本来就相同：只要还有
+        会话在重试（``still_retrying``），两样都得留着；一旦没人重试，两样都该扔。
+        """
+        match_id = int(match_id)
+        self._watch_failures.pop(match_id, None)
+        self._watch_comments.pop(match_id, None)
 
     async def _process_pending(self) -> None:
         """处理待推送队列：等待详细数据就绪后生成分析并推送。"""
@@ -3292,6 +3654,12 @@ class Dota2Plugin(Star):
             if item.get("next_try_at", 0) <= now and not item.get("processing")
         ]
         if not due:
+            # 队列非空、但每一场都还没到重试时刻 —— 这正是「积压排队」的样子
+            # （早先那场被堵了 21 分钟的比赛就属于这种状态）。用 debug 记录，
+            # 免得每 30 秒刷一行 info。
+            logger.debug(
+                f"[dota2] 待推送队列 {len(self._pending)} 场，本刻均未到重试时间"
+            )
             return
 
         # 单轮内共享：一局比赛无论有多少位被监听的玩家参战，都只拉一次比赛详情、
@@ -3401,8 +3769,9 @@ class Dota2Plugin(Star):
         if abandoned:
             logger.warning(
                 f"[dota2] 比赛 {match_id} 放弃向 {len(abandoned)} 个会话推送"
-                f"（连续失败已达上限 {self._watch_deliver_limit()} 次，"
-                f"通常是 bot 账号掉线或平台发送通道异常）"
+                f"（连续失败已达上限 {self._watch_deliver_limit()} 次；"
+                f"常见原因：bot 掉线、群内无主动消息权限、账号被风控。"
+                f"各会话的末次失败原因见上一条日志）"
             )
 
         await self._finish(item, delivered_umos=delivered, abandoned_umos=abandoned)
@@ -3582,37 +3951,50 @@ class Dota2Plugin(Star):
             logger.error(f"[dota2] 推送比赛 {match_id} 时拉取英雄常量失败：{e}")
             heroes = {}
 
-        # 近期战绩：短评要靠它判断「这局是不是正常发挥」。
-        recent_blocks = await self._recent_summary_blocks(
-            match_id, focus_ids, focus_names, heroes
-        )
-        if len(focus_ids) > MAX_FOCUS_RECENT_CONTEXT:
-            logger.debug(
-                f"[dota2] 比赛 {match_id} 焦点玩家较多，仅前 "
-                f"{MAX_FOCUS_RECENT_CONTEXT} 位附带近期战绩"
-            )
-
-        prompt = build_watch_comment_prompt(
-            match=match,
-            heroes=heroes,
-            focus_account_ids=focus_ids,
-            focus_names=focus_names,
-            recent_blocks=recent_blocks,
-        )
-
         # 标题不带「数据完整度」：短评不依赖解析，写上去只会让人以为数据有问题。
         headline = self.match_headline(
             match, heroes, focus_ids, with_parsed_note=False, focus_names=focus_names
         )
 
-        # 大模型短评只生成一次，多个会话复用（避免重复消耗配额）。
+        # 大模型短评**整场只生成一次**：既在多个会话之间复用，也在多次重试之间复用。
         # 走 `_call_report_llm`：专用 API Key 优先，未配置时回退 AstrBot 提供商。
         # 系统提示词用短评专用版本——报告那套要求 Markdown 小标题与 800 字，
         # 会把「几句话」带成一篇小作文。
-        first_umo = targets[0]["umo"]
-        comment = await self._call_report_llm(
-            prompt, umo=first_umo, system_prompt=self._watch_comment_system_prompt()
-        )
+        #
+        # 命中缓存时连「拉近期战绩」都跳过：那是真实的网络请求，而正文已经生成
+        # 好了，重新拉一遍只是为拼一个不会再被使用的 prompt，纯属浪费。
+        comment = self._watch_comments.get(match_id)
+        if comment is not None:
+            logger.info(
+                f"[dota2] 比赛 {match_id} 复用已生成的短评，跳过本次大模型调用"
+            )
+        else:
+            # 近期战绩：短评要靠它判断「这局是不是正常发挥」。
+            recent_blocks = await self._recent_summary_blocks(
+                match_id, focus_ids, focus_names, heroes
+            )
+            if len(focus_ids) > MAX_FOCUS_RECENT_CONTEXT:
+                logger.debug(
+                    f"[dota2] 比赛 {match_id} 焦点玩家较多，仅前 "
+                    f"{MAX_FOCUS_RECENT_CONTEXT} 位附带近期战绩"
+                )
+
+            prompt = build_watch_comment_prompt(
+                match=match,
+                heroes=heroes,
+                focus_account_ids=focus_ids,
+                focus_names=focus_names,
+                recent_blocks=recent_blocks,
+            )
+            comment = await self._call_report_llm(
+                prompt,
+                umo=targets[0]["umo"],
+                system_prompt=self._watch_comment_system_prompt(),
+            )
+            # 只在真的生成成功时缓存：返回 None（模型不可用）必须留机会重试，
+            # 否则会把「模型临时抖动」钉死成「这场比赛永远没有短评」。
+            if comment:
+                self._watch_comments[match_id] = comment
 
         delivered: set[str] = set()
         for target in targets:
@@ -3640,7 +4022,7 @@ class Dota2Plugin(Star):
                         logger.warning(
                             f"[dota2] 向 {umo} 推送比赛 {match_id} 连续失败 "
                             f"{count} 次（上限 {limit}），放弃该会话的这场推送"
-                            f"（bot 账号可能已掉线）"
+                            f"{self._last_error_tail(umo)}"
                         )
                     else:
                         logger.warning(
@@ -3653,11 +4035,17 @@ class Dota2Plugin(Star):
                 self._watch_failures.get(match_id, {}).pop(umo, None)
                 delivered.add(umo)
                 logger.info(f"[dota2] 比赛 {match_id} 的赛后短评已推送到 {umo}")
-                # 记进会话语境：用户紧接着问「详细分析这一盘」时靠它消歧
+                # 记进会话语境：用户紧接着问「详细分析这一盘」时靠它消歧，
+                # 闲聊兜底问「昨天谁打得好」时也靠它 —— 这里是唯一拿到完整
+                # match 的时机，所以把英雄 / KDA / 胜负 / 时长一次写足，
+                # 并带上**比赛自己的开赛时间**（不能拿记录时刻顶替）。
                 self._nlu_remember_match(
                     umo,
                     match_id,
-                    "、".join(n for n in focus_names.values() if n) or "",
+                    dota_chat.describe_focus_result(
+                        match, heroes, focus_ids, focus_names
+                    ),
+                    start_time=match.get("start_time"),
                 )
 
                 # 正文属于「尽力而为」：失败不影响送达判定，只提示用户去看概览。
@@ -3759,23 +4147,206 @@ class Dota2Plugin(Star):
             match_id=match_id,
         )
 
+    # ------------------------------------------------------------------
+    # 会话场景记录（主动推送的前置条件，v2.2.5）
+    # ------------------------------------------------------------------
+    def _scene_records_path(self) -> Path:
+        """会话场景记录的落盘路径。"""
+        return Path(self.data_dir) / "proactive_scenes.json"
+
+    def _load_scene_records(self) -> dict[str, str]:
+        """读会话场景记录（首次访问时从磁盘加载，坏文件按空处理）。"""
+        if self._scene_records is not None:
+            return self._scene_records
+        records: dict[str, str] = {}
+        try:
+            path = self._scene_records_path()
+            if path.exists():
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    records = {
+                        str(key): str(value)
+                        for key, value in raw.items()
+                        if isinstance(value, str)
+                    }
+        except Exception as e:  # noqa: BLE001 - 记录读不出来不该影响推送
+            logger.warning(f"[dota2] 读取会话场景记录失败（按空处理）：{e}")
+        self._scene_records = records
+        return records
+
+    def _remember_scene(self, umo: str, scene: str) -> None:
+        """记下某个会话的场景（群 / 频道 / 私聊），变化时落盘。
+
+        只在**真的观测到**入站消息时调用（见 :meth:`_record_inbound_scene`），
+        所以这份记录是证据，不是猜测。
+        """
+        if not umo or scene not in ("group", "channel", "friend"):
+            return
+        records = self._load_scene_records()
+        if records.get(umo) == scene:
+            return
+        records[umo] = scene
+        try:
+            path = self._scene_records_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            os.replace(tmp, path)
+        except Exception as e:  # noqa: BLE001 - 落盘失败只影响下次重启，不影响本次
+            logger.warning(f"[dota2] 写入会话场景记录失败：{e}")
+
+    def _record_inbound_scene(self, event: AstrMessageEvent) -> None:
+        """从一条**入站消息**里识别会话场景并记下来。
+
+        判定依据是原始平台的报文对象，不是 umo —— AstrBot 把 QQ **频道**消息
+        也标成 ``GroupMessage``（``on_at_message_create`` 就是这么写的），
+        只看 umo 分不出群与频道；而群消息带 ``group_openid``、频道消息带
+        ``channel_id``，这个差别是可靠的。
+        """
+        try:
+            raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+            if raw is None:
+                return
+            if hasattr(raw, "group_openid"):
+                scene = "group"
+            elif hasattr(raw, "channel_id"):
+                scene = "channel"
+            else:
+                return
+            umo = str(getattr(event, "unified_msg_origin", "") or "")
+            self._remember_scene(umo, scene)
+        except Exception as e:  # noqa: BLE001 - 记场景失败绝不能影响这条消息的处理
+            logger.debug(f"[dota2] 记录会话场景失败（可忽略）：{e}")
+
+    def _ensure_proactive_scene(self, umo: str) -> None:
+        """发送前确认「适配器知道这个会话是群」，缺了就补登记。
+
+        背景（v2.2.5 修的就是它）：AstrBot 的 ``Context.send_message`` 最终
+        走到 ``platform.send_by_session``。QQ 官方适配器
+        （``qqofficial_platform_adapter._send_by_session_common``）里有这样一道闸门::
+
+            allow_group_proactive_send = (
+                session.message_type == GROUP_MESSAGE
+                and scene == "group"          # ← _session_scene 内存字典
+                and self._allow_group_proactive_send
+            )
+            if not msg_id and ... and not allow_group_proactive_send:
+                logger.warning("No cached msg_id for session: %s, skip send_by_session")
+                return                        # ← 静默丢弃，不抛异常也不返回 False
+
+        而 ``_session_scene`` 只在**收到入站消息**时写入，且随进程重启清空。
+        于是「重启后该群还没人说过话」时，所有主动推送都被这样悄悄丢掉，
+        插件这边却因为 ``send_message`` 返回 True 而记下「推送成功」。
+
+        2026-09-17 09:54 就是这么丢掉 7 场推送的（群里一条都没有，日志里
+        却全是「已推送到」）。因此这里在发送前把场景补登记回去。
+
+        用 ``remember_session_scene`` 而不是直接改私有字典：它是适配器的公开
+        方法（webhook 版适配器、WeCom 适配器都实现了同名方法），语义与适配器
+        自己收到群消息时做的事完全一致。若某个适配器没有这个方法，说明它不
+        需要这道闸门，直接跳过。
+
+        优先用**观测到**的记录；没有记录时按 umo 的 ``GroupMessage`` 推断为群
+        —— 这一步是推断而非证据，但代价可控（万一真是频道，平台会回一个
+        参数错误、计入失败次数后放弃，不会投递到错误的会话）。
+        """
+        try:
+            parts = str(umo).split(":", 2)
+            if len(parts) != 3 or parts[1] != "GroupMessage":
+                # 私聊不经过这道闸门，不用管
+                return
+            platform_id, session_id = parts[0], parts[2]
+            if not session_id:
+                return
+
+            platform = self._find_platform(platform_id)
+            remember = getattr(platform, "remember_session_scene", None)
+            if not callable(remember):
+                return
+
+            # 适配器自己已经记着（正常情况：群里刚有人说过话）就什么都不做
+            known = getattr(platform, "_session_scene", None)
+            if isinstance(known, dict) and known.get(session_id) == "group":
+                return
+
+            recorded = self._load_scene_records().get(umo)
+            if recorded is not None and recorded != "group":
+                # 明确记过是频道，那就不是「群主动发送」这条路，交回适配器自己判断
+                return
+
+            remember(session_id, "group")
+            if umo not in self._scene_seeded:
+                self._scene_seeded.add(umo)
+                origin = "按已知记录" if recorded else "按 GroupMessage 推断"
+                logger.info(
+                    f"[dota2] 主动推送前置：适配器里没有 {umo} 的场景记录"
+                    f"（通常是重启后该会话还没人发言），已{origin}补登记为群聊"
+                )
+        except Exception as e:  # noqa: BLE001 - 补登记失败不能拖垮真正的发送
+            logger.debug(f"[dota2] 补登记会话场景失败（可忽略）：{e}")
+
+    def _find_platform(self, platform_id: str):
+        """按平台实例 id 取回平台对象（与 ``Context.send_message`` 的匹配口径一致）。"""
+        manager = getattr(self.context, "platform_manager", None)
+        for inst in getattr(manager, "platform_insts", None) or []:
+            try:
+                if inst.meta().id == platform_id:
+                    return inst
+            except Exception:  # noqa: BLE001 - 个别平台取 meta 失败不该中断查找
+                continue
+        return None
+
     async def _send(self, umo: str, chain: MessageChain) -> bool | None:
         """发送单条消息并归一化返回值（不同版本 AstrBot 的返回契约不一致）。
 
         这里是全插件**唯一的发送出口**，因此「会话已不可达」的判定也放在这里：
         无论是监听推送、指令回复还是提示消息，只要平台侧明确说「bot 已不是群成员 /
         已被拉黑」，就顺势清理该会话下的监听。
+
+        发送前还会补一次会话场景登记（见 :meth:`_ensure_proactive_scene`）：
+        QQ 官方适配器在「不知道会话是不是群」时会**静默丢弃**消息却仍让
+        调用方以为成功，这一步是唯一能在不读平台内部状态的前提下绕过它的点。
         """
+        # 只对「群主动发送」这条路上的适配器有意义；其余平台这个方法不存在，
+        # 内部会直接跳过，不会带来额外开销。
+        self._ensure_proactive_scene(umo)
         try:
-            return await self.context.send_message(umo, chain)
+            result = await self.context.send_message(umo, chain)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
+            self._note_send_error(umo, f"{type(e).__name__}: {e}")
             reason = looks_unreachable(e)
             if reason:
                 # 这种失败重试多少次都不会恢复，别让它占用后续的推送轮次
                 await self._on_session_unreachable(umo, reason)
             raise  # 交回上层按普通「发送失败」处理
+
+        # 平台也可能用「返回 False 而不抛异常」表示失败，这条路径同样要记原因，
+        # 否则放弃时的日志只能写「无异常细节」，排查时依旧两眼一抹黑。
+        if result is False:
+            self._note_send_error(umo, "平台返回 False（未抛异常，无更多细节）")
+        else:
+            self._last_send_error.pop(umo, None)
+        return result
+
+    def _note_send_error(self, umo: str, detail: str) -> None:
+        """记下某会话最近一次发送失败的原因摘要，供「放弃推送」的日志引用。
+
+        早先那句「bot 账号可能已掉线」是写死的猜测：线上真实原因是平台
+        **无主动消息权限**（QQ 官方机器人 40034105），这句猜测把排查方向
+        整个带偏了。改成记录真实异常后，下次看日志就能直接分辨是掉线、
+        无权限还是被风控。
+        """
+        text = " ".join(str(detail).split())
+        self._last_send_error[umo] = text[:160]
+
+    def _last_error_tail(self, umo: str) -> str:
+        """把末次发送失败原因渲染成可直接拼进日志的尾巴（无则空串）。"""
+        detail = self._last_send_error.get(str(umo))
+        return f"，末次原因：{detail}" if detail else ""
 
     async def _on_session_unreachable(self, umo: str, reason: str) -> None:
         """bot 被移出群聊 / 被拉黑后，清掉该会话下的所有监听。
@@ -3800,6 +4371,8 @@ class Dota2Plugin(Star):
         # 待推送队列里指向该会话的条目也要一并清掉，否则这一轮还会再试一次
         dropped = self._drop_pending_for_umo(umo)
         self._clear_watch_failures_for_umo(umo)
+        # 这个会话的监听已经清空，留着它的失败原因没有意义
+        self._last_send_error.pop(umo, None)
 
         if removed or dropped:
             logger.warning(
