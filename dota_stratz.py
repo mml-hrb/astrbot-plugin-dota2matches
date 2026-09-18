@@ -160,6 +160,11 @@ class StratzClient:
     和 AstrBot 自带的 HTTP 栈产生版本冲突。请求跑在线程池里，不阻塞事件循环。
     """
 
+    #: 数据源身份标记，与 ``OpenDotaClient.SOURCE_KIND`` 配对使用：组合数据源
+    #: 靠它区分「哪一端是 OpenDota」，从而实现某些能力只走某一边
+    #: （例如 ``request_parse`` / ``get_hero_stats`` 是 OpenDota 独占）。
+    SOURCE_KIND = "stratz"
+
     #: 数据源名称，供日志与「当前数据源」提示使用
     name = "STRATZ"
     label = "STRATZ"

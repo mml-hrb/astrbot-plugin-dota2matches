@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from typing import Iterable
 
 # ======================================================================
 # 意图关键词表
@@ -105,6 +106,30 @@ INTENT_KEYWORDS: dict[str, dict[str, int]] = {
         "擅长英雄": 4,
         "绝活": 4,
         "拿手英雄": 4,
+    },
+    "wheelchair": {
+        "轮椅": 6,
+        "版本答案": 6,
+        "版本强势": 6,
+        "版本之子": 6,
+        "强势英雄": 5,
+        "版本英雄": 5,
+        "胜率最高": 5,
+        "胜率榜": 5,
+        "胜率排行": 5,
+        "英雄胜率": 5,
+        "最强英雄": 5,
+        "哪个英雄强": 5,
+        "什么英雄强": 5,
+        "上分英雄": 5,
+        "英雄强势": 5,
+        "练什么英雄": 5,
+        "超模": 5,
+        # 「上分」单独给 4 分：真实说法「推荐几个英雄给我上分」里
+        # 一个强特征词都没有，但意图很明确。它也会让「上分好难」这类
+        # 抱怨命中 —— 回一份版本强势榜并不算答非所问，可以接受。
+        "上分": 4,
+        "t0": 4,
     },
     "matches": {
         "战绩": 3,
@@ -232,6 +257,21 @@ ANALYSIS_GATED_INTENTS = frozenset(
     {"watch", "unwatch", "bind", "unbind", "watchlist", "my", "bindings"}
 )
 
+#: 「复合问题」判定用的**功能族**。一句话里命中两个以上不同族 = 用户一次
+#: 要两件事，例如「钢板最近打得怎么样，顺便推荐几个轮椅」（个人战绩 + 版本榜）、
+#: 「看看他的资料和英雄池」（两个不同的数据源）。规则打分只能挑一个交出去，
+#: 挑哪个都漏答一半，因此返回 ``None`` 交给带工具的兜底对话逐项查。
+#:
+#: 分族而不是直接数意图个数，是为了**不误伤同义说法**：
+#: ``analyze``（分析近期）与 ``matches``（看战绩）本来就是同一件事的两种问法，
+#: 「我最近发挥怎么样，分析一下」同时踩中两个词是常态，不该被当成复合问题。
+#: 同理 ``heroes`` / ``info`` 都属于「个人面板数据」，一起出现很自然。
+COMPOSITE_INTENT_GROUPS = (
+    frozenset({"wheelchair"}),
+    frozenset({"analyze", "matches"}),
+    frozenset({"heroes", "info"}),
+)
+
 #: 分析型问句特征：要的是**结论 / 对比 / 建议**，不是一条指令。
 #: 刻意写得很窄（带上具体搭配），避免误伤「我该怎么改进」这类
 #: 本来就该走 ``analyze`` 指令的说法。
@@ -317,6 +357,7 @@ INTENT_LABELS: dict[str, str] = {
     "bindings": "查看本会话所有人的绑定",
     "info": "查询玩家资料（段位 / 天梯分等）",
     "heroes": "查询玩家英雄池 / 常用英雄",
+    "wheelchair": "查看当前版本胜率最高的英雄（玩家口中的「轮椅」），带位置词或「我」时会结合该玩家的英雄池做推荐",
     "matches": "查询最近战绩列表",
     "analyze": "用 AI 分析近期表现与打法风格（需要指定场次时给出场次）",
     "match": "深度复盘某一场比赛（需要比赛 ID）",
@@ -802,6 +843,16 @@ def parse(text: str) -> Intent | None:
         return None
     best_score = scores[best]
 
+    # 复合问题：一句话里同时要**两件不同的事**（命中两个以上功能族）。
+    #
+    # 「钢板最近打得怎么样，顺便推荐几个轮椅」既要个人战绩、又要版本推荐；
+    # 「看看天鸽的英雄池，再讲讲版本什么英雄强」同理。规则打分只能挑一个
+    # 分高的交出去 —— 无论挑哪个都漏答一半，而且用户完全看不出是漏了。
+    # 返回 None 会把消息交给兜底对话，那边有工具，可以逐项查完再一起回答。
+    strong = {name for name, score in scores.items() if score >= MIN_SCORE}
+    if sum(1 for group in COMPOSITE_INTENT_GROUPS if strong & group) >= 2:
+        return None
+
     # 「刚才那把…」「这把…」这种只有指代、没有任何「要看」的动作词，
     # 多半是在吐槽（「刚才那把真是气死我了」）而不是要复盘 —— 别自作主张
     # 去问比赛 ID，交给闲聊兜底更合适。
@@ -842,6 +893,270 @@ def parse(text: str) -> Intent | None:
     return _build_intent(best, raw, best_score, match_id, flipped)
 
 
+#: 「查版本强势英雄」意图里的位置词。
+#:
+#: handler 侧（``dota_format.match_position``）还会再解析一次，这里留一份是
+#: 为了**别把它当成玩家昵称** —— 「这版本辅助哪个是轮椅」里根本没有昵称，
+#: 但目标抽取很容易把「辅助」抓成一个人。
+WHEELCHAIR_POSITION_WORDS = (
+    "核心", "大哥", "1号位", "一号位", "2号位", "二号位", "中单", "carry", "c位",
+    "三号位", "3号位", "劣单", "上单", "offlane", "前排", "肉盾",
+    "辅助", "酱油", "4号位", "四号位", "5号位", "五号位", "support", "挂件",
+)
+
+
+#: 「XX 的轮椅」句式：抽出「的」前面的昵称。
+#:
+#: 不能直接复用 :data:`TARGET_OF_RE` —— 那张名词表里根本没有「轮椅」，
+#: 「天鸽的轮椅」会被整句跳过，人就这么丢了。
+WHEELCHAIR_OWNER_RE = re.compile(
+    r"([^\s，。!！?？、,]{1,20}?)\s*(?:的|de)\s*"
+    r"(?:轮椅|版本答案|版本强势|版本英雄|强势英雄|"
+    r"胜率榜|胜率排行|上分英雄|最强英雄|t0)"
+)
+
+#: 出现在「的」前面、看着像昵称其实不是的版本 / 时间修饰。
+#: 少了这张表，「这版本的轮椅」会拿「这版本」去 OpenDota 搜一趟账号。
+WHEELCHAIR_SKIP_TARGETS = frozenset({
+    "这版本", "这个版本", "当前版本", "现在版本", "目前版本", "本版本",
+    "新版本", "版本", "这赛季", "本赛季", "这个赛季", "新赛季",
+    "现在", "目前", "今天", "明天", "昨天", "最近", "近期", "这", "那",
+})
+
+#: 出现这些词就说明是在给自己查（而不是给别人）
+WHEELCHAIR_SELF_WORDS = ("我", "自己", "本人", "咱", "俺")
+
+#: 简称反查的护栏：这些片段在原句里到处都是，绝不能当成昵称去搜账号。
+#: 少了它，「这版本哪个英雄是轮椅」里的「英雄」会去撞某个叫
+#: 「英雄联盟战神」的昵称 —— 白白出一份别人的个人推荐。
+WHEELCHAIR_FILLER_WORDS = frozenset({
+    "版本", "轮椅", "英雄", "强势", "胜率", "最高", "排行", "上分", "推荐",
+    "适合", "什么", "哪个", "哪些", "现在", "目前", "这版", "当前", "最强",
+    "答案", "怎么", "如何", "帮我", "看看", "一下", "厉害", "好用", "打钱",
+    "核心", "辅助", "中单", "大哥", "酱油", "前排", "肉盾", "三号", "号位",
+})
+
+
+#: 简称反查时单个片段的最大长度。名字再长也只会按这个窗口滑 ——
+#: 枚举是 O(长度² × 人数)，原句里一个没标点的长句能有几十字。
+MAX_PIECE_LEN = 12
+
+
+def match_session_name(value: str, names: Iterable[str]) -> str:
+    """在本会话名单里认人：**精确优先，其次简称反查**。
+
+    这是「这句话里说的是谁」的唯一权威实现 —— 轮椅参数构造（
+    :func:`build_wheelchair_args`）与兜底对话的工具取数
+    （``dota_tools`` 的 ``player`` 参数）都走它。两份实现一定会漂移，
+    到时候同一个昵称在指令里认得出、在工具里认不出，很难查。
+
+    返回命中的**名单原名**（不是片段）：调用方多半要拿它去查 account_id，
+    用原名查最省事。认不出来返回空串 —— **绝不猜**。
+
+    Args:
+        value: 用户原话（或模型给的参数）。
+        names: 本会话名单（已绑定 / 已监听玩家的 ``personaname``）。
+    """
+    text = str(value or "")
+    if not text.strip():
+        return ""
+    lowered = text.lower()
+    pool = [str(item).strip() for item in (names or ()) if str(item).strip()]
+    # 1) 名单里的全名**原样出现在原句里**，长名优先（「钢板不锈」先于「钢板」）
+    for name in sorted(set(pool), key=len, reverse=True):
+        if len(name) >= 2 and name.lower() in lowered:
+            return name
+    # 2) 反过来查：群里有事只会喊简称，而名单存的是完整 Steam 昵称。
+    #    命中片段后再映射回名单原名。
+    piece = _wheelchair_pool_hit(text, tuple(pool))
+    if not piece:
+        return ""
+    piece_low = piece.lower()
+    for name in sorted(set(pool), key=len):
+        if piece_low in name.lower():
+            return name
+    return piece
+
+
+def _wheelchair_pool_hit(value: str, names: tuple[str, ...]) -> str:
+    """名单反查：Steam 昵称常带一堆前后缀，而用户张口只会喊简称。
+
+    真实名单里就躺着「你刚才确实说了【钢板】对吧」这种名字 —— 群里喊的是
+    「钢板」。正着匹配（名字 in 原句）永远对不上，于是反过来做：把原句切成
+    2~4 字的片段，看哪一段落在某个名单名字里。
+
+    三条护栏缺一不可：
+
+    * 片段不能是功能词（见 :data:`WHEELCHAIR_FILLER_WORDS`）与位置词；
+    * 长的片段优先 —— 「钢板不锈」比「钢板」更具体；
+    * 同一长度的片段若撞上**两个不同的人**，整段放弃：这种时候猜谁都是错。
+
+    返回命中的片段本身（不是名单里的全名）：用户喊的就是这个名字，
+    handler 拿它去 OpenDota 搜反而更容易命中那个账号。
+    """
+    lowered = [str(item).strip().lower() for item in (names or ())]
+    lowered = [name for name in lowered if len(name) >= 2]
+    if not lowered:
+        return ""
+
+    candidates: dict[str, set[str]] = {}
+    for chunk in re.findall(r"[\w\u4e00-\u9fff]{2,}", str(value or "").lower()):
+        # 同一个 chunk 里只保留「对得上人的最长片段」；这一层命中了就
+        # 不必再切更短的片段（「illyasviel」命中后不用再看「illy」）。
+        local: dict[str, set[str]] = {}
+        for size in range(min(len(chunk), MAX_PIECE_LEN), 1, -1):
+            for start in range(0, len(chunk) - size + 1):
+                piece = chunk[start:start + size]
+                if piece in WHEELCHAIR_FILLER_WORDS:
+                    continue
+                if piece in WHEELCHAIR_POSITION_WORDS:
+                    continue
+                matched = {name for name in lowered if piece in name}
+                if matched:
+                    local.setdefault(piece, set()).update(matched)
+            if local:
+                break
+        if local:
+            candidates = local
+            break
+
+    if not candidates:
+        return ""
+    # 同长度的候选必须指向**同一个人**：指向两个人说明原句有歧义，
+    # 猜谁都是错的。同一人的多个重叠片段（英文长昵称常发生）则是安全的。
+    longest = max(len(piece) for piece in candidates)
+    picks = {piece: who for piece, who in candidates.items() if len(piece) == longest}
+    everyone: set[str] = set()
+    for who in picks.values():
+        everyone |= who
+    if len(everyone) != 1:
+        return ""
+    piece = min(picks, key=lambda item: str(value or "").lower().find(item))
+    # 还原成原句里的大小写：用户怎么喊就怎么交给后续搜账号，别硬转小写
+    raw = str(value or "")
+    at = raw.lower().find(piece)
+    return raw[at:at + len(piece)] if at != -1 else piece
+
+
+def _wheelchair_target_ok(candidate: str) -> bool:
+    """候选玩家名是否可信：位置词 / 版本词 / 虚词一律挡掉。
+
+    宁可返回空（退回「只看榜单」），也不能拿「这版本」去搜账号 ——
+    那不仅白跑一次网络请求，还会回一句「没找到『这版本』这个账号」。
+    """
+    name = (candidate or "").strip()
+    if not name or name in TARGET_STOPWORDS:
+        return False
+    if name in WHEELCHAIR_SKIP_TARGETS:
+        return False
+    if "版本" in name or "赛季" in name:
+        return False
+    if name.lower() in WHEELCHAIR_POSITION_WORDS:
+        return False
+    return len(name) >= 2
+
+
+def _wheelchair_position(value: str, lowered: str, *, exclude: str = "") -> str:
+    """取句子里**最先出现**的位置词。
+
+    原来是「按元组顺序谁先命中取谁」，句子里同时出现两个位置词时
+    （「辅助和核心哪个是轮椅」）结果取决于别名表的排布；改成按出现
+    位置取，稳定且可解释。
+
+    ``exclude`` 传已识别出的玩家名：整段落在名字里的位置词要忽略 ——
+    玩家昵称叫「小辅助」「前排队友」的不少，把名字的一半当位置过滤，
+    榜单会莫名其妙少一批人（而且是静默的，看不出来）。
+    """
+    ex = (exclude or "").strip().lower()
+    ex_at = lowered.find(ex) if ex else -1
+    picked = ""
+    best_at = len(lowered) + 1
+    for word in WHEELCHAIR_POSITION_WORDS:
+        at = lowered.find(word)
+        if at == -1 or at >= best_at:
+            continue
+        if ex_at != -1 and ex_at <= at and at + len(word) <= ex_at + len(ex):
+            continue
+        best_at, picked = at, word
+    return picked
+
+
+def build_wheelchair_args(
+    text: str,
+    *,
+    llm_target: str = "",
+    known_names: tuple[str, ...] = (),
+) -> str:
+    """拼「查版本强势英雄」的参数串：``[位置] [玩家]``。
+
+    玩家这一项按**可信度由高到低**依次尝试，前一步拿到就不再往下走：
+
+    1. 本会话名单（:func:`match_session_name`）—— 已绑定 / 已监听的人，
+       先按全名**原样出现在原句里**匹配，对不上再按**简称反查**：
+       昵称常带一堆前后缀，群里只会喊简称，「钢板」得对上
+       「你刚才确实说了【钢板】对吧」。命中后返回的是**名单里的原名**
+       （不是用户喊的那个片段）：main 侧会先拿它去本会话名单里换
+       account_id，换不到才联网搜 —— 用完整原名搜反而比片段更唯一。
+    2. ``llm_target`` —— 分类模型给的 target。它能看见会话语境，所以有价值，
+       但它会把「辅助」这类位置词填进 target，必须过 :func:`_wheelchair_target_ok`
+       的安检，否则 handler 会拿「辅助」去搜账号。
+    3. :data:`WHEELCHAIR_OWNER_RE` —— 「天鸽的轮椅」这种句式。
+    4. 句子里的账号 ID（32 位 account_id / 64 位 SteamID，至少 6 位数字，
+       所以「1号位」里的 1 不会误伤）。
+    5. 「我 / 自己 / 本人」⇒ ``"我"``，由 handler 解析成当前会话的绑定。
+
+    都没有就只返回位置词（或空串），由 handler 出纯榜单 —— **不猜人**。
+    """
+    value = str(text or "")
+    lowered = value.lower()
+
+    target = ""
+    # 1) 本会话名单：先精确命中全名，再按简称反查（同一份实现，见
+    #    match_session_name —— 工具层解析 player 参数走的也是它）
+    matched_name = match_session_name(value, known_names)
+    if matched_name:
+        target = matched_name
+
+    # 2) 分类模型给的 target（先认「我」，再按昵称安检）
+    llm_position = ""
+    if not target:
+        raw_llm = str(llm_target or "").strip()
+        if raw_llm in WHEELCHAIR_SELF_WORDS:
+            target = "我"
+        elif raw_llm.lower() in WHEELCHAIR_POSITION_WORDS:
+            # 模型把位置词填进了 target：那当然不是人，但它的**意图**是对的
+            # （用户问的就是辅助位），白白丢掉太可惜，接过来当位置用。
+            llm_position = raw_llm.lower()
+        else:
+            candidate = _clean_target(raw_llm)
+            if _wheelchair_target_ok(candidate):
+                target = candidate
+
+    # 3) 「XX 的轮椅」
+    if not target:
+        found = WHEELCHAIR_OWNER_RE.search(value)
+        if found:
+            candidate = _clean_target(found.group(1))
+            if _wheelchair_target_ok(candidate):
+                target = candidate
+
+    # 4) 账号 ID
+    if not target:
+        digits = re.search(r"\d{6,20}", value)
+        if digits:
+            target = digits.group(0)
+
+    # 5) 「我 / 自己」= 当前会话的绑定
+    if not target and any(word in value for word in WHEELCHAIR_SELF_WORDS):
+        target = "我"
+
+    # 位置在玩家名之后算：先把人认准，才知道哪些「位置词」其实长在名字里。
+    # 原句里没有位置词时，接受模型填进 target 的那个（见上面的 llm_position）。
+    position = _wheelchair_position(value, lowered, exclude=target) or llm_position
+
+    return " ".join(part for part in (position, target) if part)
+
+
 def _build_intent(
     name: str,
     text: str,
@@ -851,6 +1166,11 @@ def _build_intent(
 ) -> Intent:
     """按意图拼装传给 handler 的参数串。"""
     detail = f"score={score}" + (" (negated)" if flipped else "")
+
+    if name == "wheelchair":
+        # 这里先出一版参数；真正的权威版本由 main 侧统一重建（它拿得到
+        # 本会话的绑定 / 监听名单，能把「天鸽的轮椅」对上号）。
+        return Intent(name, build_wheelchair_args(text), score, "rule", detail)
 
     if name == "match":
         args = str(match_id) if match_id else ""
@@ -952,11 +1272,20 @@ def build_classifier_prompt(
             "**只许填上下文或原句里出现过的比赛 ID，绝不许自己编一个**。\n"
             "2. 说「最近 N 场 / 近期表现 / 状态 / 打法 / 胜率」这类总结性要求 → analyze。\n"
             "3. 只是在聊天、问别的、或看不出明确意图 → none。\n"
-            "4. match_id / count 没有就填 0，target 没有就填空字符串。\n"
+            "4. 问「版本强势英雄 / 轮椅 / 胜率最高」这类问题（含「哪个英雄好上分」）"
+            "→ wheelchair。他要是说了**想给谁看**，把那个人填进 target："
+            "说「我 / 自己 / 给我 / 帮我」时 target 填「我」，只问榜单、没提人就留空。"
+            "「辅助 / 核心 / 中单 / 三号位」这类是位置词，**不要**填进 target。\n"
+            "5. 一句话里**同时要好几件事**（例如「钢板最近打得怎么样，顺便给他推荐几个轮椅」"
+            "既要战绩又要英雄推荐；「看看大家谁强，再看版本榜」既要对比又要榜单）→ "看
+            "**不要**只挑一个功能填，一律填 none：插件那边会带着工具逐项查完再一起回答，"
+            "只填一个反而会漏答一半。\n"
+            "6. match_id / count 没有就填 0，target 没有就填空字符串。\n"
         )
         parts.append(
             "输出格式（只输出 JSON，不要解释）：\n"
-            '{"intent": "<功能名或 none>", "target": "<玩家昵称或账号ID，没有就空字符串>", '
+            '{"intent": "<功能名或 none>", "target": "<玩家昵称或账号ID；'
+            '想给说话人自己看就填「我」，没有就空字符串>", '
             '"count": <场次数字，没有就 0>, "match_id": <比赛ID数字，没有就 0>}\n'
         )
         parts.append(f"用户说：{text}")

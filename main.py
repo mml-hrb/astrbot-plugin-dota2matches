@@ -30,6 +30,7 @@ try:  # 插件目录被作为包加载时的相对导入
         LLMRequestError,
         OpenAICompatibleClient,
         WATCH_COMMENT_SYSTEM_PROMPT,
+        build_hero_pick_prompt,
         build_recent_analysis_prompt,
         build_single_match_analysis_prompt,
         build_watch_comment_prompt,
@@ -49,14 +50,21 @@ try:  # 插件目录被作为包加载时的相对导入
         build_match_data_text,
         fmt_ago,
         fmt_duration,
+        fmt_wan,
+        format_hero_meta_board,
+        format_hero_meta_footer,
         format_hero_stats,
         format_match_list,
         format_player_profile,
         format_summary_block,
+        hero_meta_note,
+        hero_meta_rows,
         hname,
+        match_position,
         mode_text,
         normalize_focus_ids,
         parsed_state,
+        pick_heroes_for_player,
         player_win,
         rank_text,
         summarize_hero_history,
@@ -66,6 +74,7 @@ try:  # 插件目录被作为包加载时的相对导入
     from . import dota_chat
     from . import dota_nlu
     from . import dota_parse
+    from . import dota_tools
     from . import dota_zh
 except ImportError:  # 兜底：以普通模块方式加载时（把插件目录加入 sys.path）
     import os
@@ -76,6 +85,7 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
         LLMRequestError,
         OpenAICompatibleClient,
         WATCH_COMMENT_SYSTEM_PROMPT,
+        build_hero_pick_prompt,
         build_recent_analysis_prompt,
         build_single_match_analysis_prompt,
         build_watch_comment_prompt,
@@ -95,14 +105,21 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
         build_match_data_text,
         fmt_ago,
         fmt_duration,
+        fmt_wan,
+        format_hero_meta_board,
+        format_hero_meta_footer,
         format_hero_stats,
         format_match_list,
         format_player_profile,
         format_summary_block,
+        hero_meta_note,
+        hero_meta_rows,
         hname,
+        match_position,
         mode_text,
         normalize_focus_ids,
         parsed_state,
+        pick_heroes_for_player,
         player_win,
         rank_text,
         summarize_hero_history,
@@ -113,6 +130,7 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
     import dota_chat  # type: ignore[no-redef]
     import dota_nlu  # type: ignore[no-redef]
     import dota_parse  # type: ignore[no-redef]
+    import dota_tools  # type: ignore[no-redef]
     import dota_zh  # type: ignore[no-redef]
 
 try:
@@ -307,6 +325,10 @@ HELP_TEXT = """🎮 Dota2 数据查询助手（数据来源：STRATZ / OpenDota 
 【查询】
 /d2 资料 [目标]　　　　　　　 查看玩家资料与段位
 /d2 英雄 [目标]　　　　　　　 查看英雄使用统计
+/d2 轮椅 [位置] [目标]　　　　 当前版本胜率最高的英雄（也就是「轮椅」）
+　　　　　　　　　　　　　　　 加上昵称或「我」，会结合他的英雄池与近期
+　　　　　　　　　　　　　　　 表现，从强势英雄里挑出适合他的；位置可填
+　　　　　　　　　　　　　　　 核心 / 中单 / 三号位 / 辅助
 /d2 战绩 [场次] [目标]　　　　 查看最近战绩（默认 20 场）
 /d2 分析 [场次] [目标]　　　　 AI 分析近期表现与打法风格
 /d2 单场 <比赛ID> [焦点玩家]　　AI 深度复盘单场比赛
@@ -1405,7 +1427,11 @@ class Dota2Plugin(Star):
     # 目标解析
     # ==================================================================
     async def _resolve_account(
-        self, target: str, in_match_players: list[dict] | None = None
+        self,
+        target: str,
+        in_match_players: list[dict] | None = None,
+        *,
+        umo: str = "",
     ) -> tuple[int, str]:
         """把用户输入解析成 ``(account_id, personaname)``。
 
@@ -1415,6 +1441,9 @@ class Dota2Plugin(Star):
                 10 个人里精确匹配；命中唯一就直接采用。OpenDota 上重名昵称
                 极多（例如「大魔导师马化腾」有 5 个同名账号），只靠全局搜索
                 会让这些玩家永远解析不出来，而复盘场景下本局选手就是天然消歧器。
+            umo: 会话标识。给了就先在**本会话名单**（已绑定 / 已监听）里找 ——
+                零网络开销，而且不会像全局搜索那样被重名账号绊住。自然语言
+                入口给的昵称常来自名单（「钢板」「天鸽」），走这一步最稳。
 
         Raises:
             TargetNotFoundError: 找不到唯一确定的玩家。
@@ -1423,6 +1452,12 @@ class Dota2Plugin(Star):
         target = (target or "").strip()
         if not target:
             raise TargetNotFoundError("没有指定玩家。")
+
+        # 本会话名单优先：名字本来就是查这个账号查出来的，不必再搜一次
+        if umo:
+            hit = self._session_account_of(umo, target)
+            if hit:
+                return hit
 
         # 支持直接粘贴 Steam 个人主页链接
         match = re.search(r"/profiles/(\d{15,20})", target)
@@ -1560,6 +1595,7 @@ class Dota2Plugin(Star):
         "bindings": "d2_bindings",
         "info": "d2_info",
         "heroes": "d2_heroes",
+        "wheelchair": "d2_wheelchair",
         "matches": "d2_matches",
         "analyze": "d2_analyze",
         "match": "d2_match",
@@ -1795,6 +1831,77 @@ class Dota2Plugin(Star):
             return False, None
         return True, dota_nlu.parse_classifier_reply(reply)
 
+    def _nlu_session_players(self, umo: str) -> list[dict]:
+        """本会话里「有名字的人」：已绑定 + 已监听，按 account_id 去重。
+
+        同一张表服务三处：自然人名解析（「钢板」是谁）、工具参数里的
+        ``player``、以及给模型看的「可查玩家」清单。**去重是必要的**：
+        一个人既绑定又被监听时会同时出现在两张表里，重复出现会让模型
+        以为有两个人，也可能让「只点名了一个人」的判断失效。
+        """
+        rows: list[dict] = []
+        seen: set[int] = set()
+        try:
+            for info in (self.store.list_bindings(umo) or {}).values():
+                account_id = int(info.get("account_id") or 0)
+                if not account_id or account_id in seen:
+                    continue
+                seen.add(account_id)
+                rows.append(
+                    {
+                        "name": str(info.get("personaname") or f"账号{account_id}"),
+                        "account_id": account_id,
+                        "relation": "绑定",
+                    }
+                )
+            for watcher in self.store.list_watchers(umo) or []:
+                account_id = int(watcher.get("account_id") or 0)
+                if not account_id or account_id in seen:
+                    continue
+                seen.add(account_id)
+                rows.append(
+                    {
+                        "name": str(watcher.get("personaname") or f"账号{account_id}"),
+                        "account_id": account_id,
+                        "relation": "监听",
+                    }
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[dota2] 取本会话名单失败: {e}")
+        return rows
+
+    def _nlu_known_names(self, umo: str) -> list[str]:
+        """本会话里「有名字的人」的昵称列表。
+
+        用来把自然语言里提到的昵称对上号。「天鸽的轮椅」这种句子里没有
+        「XX 的战绩」那种句式标记，纯靠正则抽人名很容易抽错；而这些名字
+        是当初真去 OpenDota 查出来的，直接拿来做精确匹配最稳。
+        """
+        return [row["name"] for row in self._nlu_session_players(umo)]
+
+    def _session_account_of(self, umo: str, name: str) -> tuple[int, str] | None:
+        """把名字（含简称）对到本会话名单里的账号，命中返回 ``(id, 名字)``。
+
+        这是「认出是谁」之后**不联网**拿到 account_id 的唯一入口：
+        名单里的名字本来就是查这个账号查出来的，再拿名字去 OpenDota 搜一次
+        纯属多余，而且昵称重名极多，搜出来很可能歧义报错。
+        """
+        text = str(name or "").strip()
+        if not text:
+            return None
+        players = self._nlu_session_players(umo)
+        if not players:
+            return None
+        matched = dota_nlu.match_session_name(
+            text, tuple(row["name"] for row in players)
+        )
+        if not matched:
+            return None
+        for row in players:
+            if row["name"] == matched:
+                return int(row["account_id"]), str(row["name"])
+        return None
+
     def _nlu_sanitize_llm_intent(
         self, intent: dota_nlu.Intent, text: str, umo: str
     ) -> bool:
@@ -1876,6 +1983,235 @@ class Dota2Plugin(Star):
                     return value
         return None
 
+    # ------------------------------------------------------------------
+    # 兜底对话：工具调用（一次回答可以调多个功能）
+    # ------------------------------------------------------------------
+    def _chat_tools_available(self) -> bool:
+        """工具模式是否可用。
+
+        需要三件事同时成立：配置里开着工具、开着 LLM 分析、且**插件专用
+        模型通道**配好了 Key。走 AstrBot 的 provider 时不带工具：那条通道
+        只暴露了 ``text_chat``（纯文本进出），不同 AstrBot 版本对工具的支持
+        差异很大，硬塞参数会直接报错。没有专用 Key 时退回单轮带数据的回答，
+        功能不会消失，只是模型不能自己追加查询。
+        """
+        if not self.cfg("nlu_chat_tools", True):
+            return False
+        if not self.cfg("enable_llm_analysis", True):
+            return False
+        return self._dedicated_client() is not None
+
+    def _nlu_chat_focus(self, question: str, umo: str) -> list[int]:
+        """问题只点名了**一个**人、又没有横向对比语义时，返回那个人的账号。
+
+        用途是省掉一轮全量取数：监听列表可能有六七个人，而问「钢板最近
+        打得怎么样」时把所有人拉一遍，既慢又费接口配额。判据**宁可漏**：
+        漏了只是多拉几个人的数据（结果仍然正确），错了则会让模型手上的
+        数据缺人、答出「他没打」这种假结论。
+
+        * 出现「谁 / 对比 / 大家 / 开黑 / 最菜」这类多人词 → 不收窄；
+        * 原句里命中两个及以上名单昵称（「钢板和天鸽最近怎么样」）→ 不收窄。
+        """
+        text = str(question or "")
+        if not text or dota_chat.MULTI_PLAYER_HINT_RE.search(text):
+            return []
+        players = self._nlu_session_players(umo)
+        if not players:
+            return []
+        hits = [
+            row
+            for row in players
+            if dota_nlu.match_session_name(text, (str(row.get("name") or ""),))
+        ]
+        if len(hits) != 1:
+            return []
+        return [int(hits[0]["account_id"])]
+
+    async def _fetch_chat_matches(self, account_id: int, limit: int) -> list[dict]:
+        """拉近期对局，**复用闲聊兜底的缓存**。
+
+        工具与预取经常查同一个账号（「钢板最近怎么样」会先被预取一次，
+        模型再调一次 query_matches）—— 共用一份缓存才不会把同一个账号
+        查两遍。缓存里只放纯数据，key 与 :func:`dota_chat.collect_chat_context`
+        保持一致：``(account_id, limit)``。
+        """
+        account = int(account_id or 0)
+        size = max(1, int(limit or 1))
+        if not account:
+            raise OpenDotaError("没有指定玩家账号。")
+        key = (account, size)
+        now = time.time()
+        entry = self._chat_cache.get(key)
+        if entry and now - entry[0] < dota_chat.DEFAULT_CACHE_TTL:
+            return [row for row in entry[1] if isinstance(row, dict)]
+        result = await self.api.get_player_matches_enriched(account, size)
+        matches = result[0] if isinstance(result, tuple) else result
+        rows = [row for row in (matches or []) if isinstance(row, dict)]
+        if rows:
+            self._chat_cache[key] = (now, list(rows))
+        return rows
+
+    async def _nlu_resolve_person(
+        self, umo: str, event: AstrMessageEvent, raw: Any
+    ) -> tuple[int, str]:
+        """把工具参数里的「查谁」解析成 ``(account_id, 显示名)``。
+
+        顺序由便宜到贵：本人 → 本会话名单（**零网络开销**）→ 联网搜索。
+        名单这一步是关键：「钢板」这种简称在 OpenDota 上搜出三五个重名账号
+        是常事，而名单里的账号是当初真查出来的，直接用就行。
+        """
+        text = str(raw or "").strip()
+        if not text or text.lower() in dota_nlu.WHEELCHAIR_SELF_WORDS or text in {
+            "我的",
+            "me",
+            "my",
+        }:
+            binding, _note = self._effective_binding(event)
+            if not binding:
+                raise TargetNotFoundError(
+                    "提问者还没有绑定账号，不知道要查谁。"
+                    '可以让 TA 用「我的战绩」前先绑定，或直接说出昵称。'
+                )
+            account_id = int(binding.get("account_id") or 0)
+            return account_id, str(binding.get("personaname") or f"账号{account_id}")
+
+        hit = self._session_account_of(umo, text)
+        if hit:
+            return hit
+
+        timeout = float(self.cfg("nlu_chat_tool_timeout", dota_tools.DEFAULT_TOOL_TIMEOUT) or 0)
+        try:
+            return await asyncio.wait_for(
+                self._resolve_account(text), timeout=max(5.0, timeout / 2)
+            )
+        except asyncio.TimeoutError as e:
+            raise TargetNotFoundError(
+                f"按昵称「{text}」搜索账号超时。"
+                "本会话里绑定或监听过的人可以直接用昵称查，其他昵称建议给账号 ID。"
+            ) from e
+
+    def _nlu_chat_tool_ctx(self, event: AstrMessageEvent) -> dota_tools.ToolContext:
+        umo = event.unified_msg_origin
+        timeout = float(
+            self.cfg("nlu_chat_tool_timeout", dota_tools.DEFAULT_TOOL_TIMEOUT)
+            or dota_tools.DEFAULT_TOOL_TIMEOUT
+        )
+        return dota_tools.ToolContext(
+            api=self.api,
+            cfg=self.cfg,
+            heroes=self._heroes,
+            resolve_player=lambda raw: self._nlu_resolve_person(umo, event, raw),
+            session_players=lambda: self._nlu_session_players(umo),
+            fetch_matches=self._fetch_chat_matches,
+            now=time.time(),
+            timeout=timeout,
+        )
+
+    async def _nlu_chat_agent(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        system_prompt: str,
+    ) -> tuple[str | None, str]:
+        """带工具的多轮问答。
+
+        流程就是标准的 function calling 循环：把问题与工具清单发给模型，
+        它要么直接作答、要么要求调用若干工具；执行完把结果作为 ``role=tool``
+        的消息回填，进入下一轮。上限由 ``nlu_chat_tool_rounds`` 与
+        ``nlu_chat_tool_max_calls`` 双重把关 —— 没有上限的话，一个含糊的
+        问题能让模型把数据源查个底朝天。
+
+        Returns:
+            ``(回答, 工具调用轨迹)``。回答为 ``None`` 表示这条链路没能产出
+            内容（没配 Key、模型报错等），调用方回落到单轮带数据的回答。
+        """
+        client = self._dedicated_client()
+        if client is None:
+            return None, ""
+
+        tool_ctx = self._nlu_chat_tool_ctx(event)
+        tools = dota_tools.build_tool_specs()
+        rounds = max(1, int(self.cfg("nlu_chat_tool_rounds", 3) or 3))
+        max_calls = max(1, int(self.cfg("nlu_chat_tool_max_calls", 6) or 6))
+        temperature = float(self.cfg("llm_temperature", 0.7) or 0)
+        max_tokens = int(self.cfg("llm_max_tokens", 0) or 0) or None
+
+        messages: list[dict] = [
+            {
+                "role": "system",
+                "content": (system_prompt or "").strip()
+                + "\n\n"
+                + dota_tools.TOOL_GUIDE,
+            },
+            {"role": "user", "content": prompt},
+        ]
+        used = 0
+        answer = ""
+        for round_index in range(rounds):
+            try:
+                reply = await client.chat_with_tools(
+                    messages,
+                    tools,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            except Exception as e:  # noqa: BLE001 - 失败回落单轮，不能吞消息
+                logger.error(
+                    f"[dota2] 兜底工具对话第 {round_index + 1} 轮失败: {e}"
+                )
+                return (answer or None), "; ".join(tool_ctx.trace)
+
+            if not reply.has_tool_calls:
+                answer = reply.content or answer
+                break
+
+            # 这是**必须**回填的一条：assistant 侧带 tool_calls 的消息 +
+            # 每个 tool_call_id 对应的结果，缺一条多数服务会直接 400。
+            messages.append(reply.assistant_message())
+            answer = reply.content or answer
+            for call in reply.tool_calls:
+                if used >= max_calls:
+                    result = (
+                        "[本次回答的工具调用次数已达上限，这次查询没有执行。"
+                        "请基于已拿到的数据作答。]"
+                    )
+                    tool_ctx.trace.append(f"{call.name}(跳过：超过上限)")
+                else:
+                    result = await dota_tools.run_tool(
+                        call.name, call.arguments_raw, tool_ctx
+                    )
+                    used += 1
+                messages.append(
+                    {"role": "tool", "tool_call_id": call.id, "content": result}
+                )
+        else:
+            # 轮数用尽仍在要求调工具：把工具收走，明确要一个收口回答。
+            # 继续给工具只会让它一直查下去，永远不给答案。
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "（本轮查询的工具调用次数已用完，请立刻基于已拿到的数据"
+                        "给出最终回答，不要再请求调用工具。）"
+                    ),
+                }
+            )
+            try:
+                final = await client.chat_with_tools(
+                    messages,
+                    [],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                answer = final.content or answer
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"[dota2] 兜底工具对话收口失败: {e}")
+
+        trace = "; ".join(tool_ctx.trace)
+        if trace:
+            logger.info(f"[dota2] 兜底工具调用: {trace}")
+        return (answer or None), trace
+
     async def _nlu_chat_reply(self, event: AstrMessageEvent, question: str):
         """闲聊兜底：没识别出指令时，带着插件内部数据让模型回答。
 
@@ -1910,6 +2246,10 @@ class Dota2Plugin(Star):
         umo = event.unified_msg_origin
         uid = str(event.get_sender_id())
         binding, _note = self._effective_binding(event)
+        # 工具模式可用时，问题若只点名了一个人（且没有横向对比语义），
+        # 就只拉那个人的数据 —— 监听列表六七个人全拉一遍纯属浪费。
+        tools_on = self._chat_tools_available()
+        focus = self._nlu_chat_focus(question, umo) if tools_on else []
         try:
             context = await dota_chat.collect_chat_context(
                 self.api,
@@ -1923,6 +2263,7 @@ class Dota2Plugin(Star):
                 # 最近发生过什么」以及每场比赛自己的开赛时间。
                 recent_matches=self._nlu_recent_match_rows(umo, limit=8),
                 self_binding=binding,
+                focus_accounts=focus,
                 recent_limit=int(
                     self.cfg("nlu_chat_context_matches", dota_chat.DEFAULT_RECENT_LIMIT)
                 ),
@@ -1944,9 +2285,18 @@ class Dota2Plugin(Star):
         system_prompt = dota_chat.build_chat_system_prompt(
             str(self.cfg("nlu_chat_system_prompt", "") or "")
         )
-        reply = await self._call_report_llm(
-            prompt, umo=umo, system_prompt=system_prompt
-        )
+        # 先走「带工具的多轮问答」：一句复合问题（既看战绩又要推荐英雄）
+        # 靠意图分类只能二选一，只有让模型自己按需追加查询才能都答上。
+        # 这条路走不通（没配专用 Key / 模型报错）时，回落到原来的单轮
+        # 带数据回答 —— 功能不会因为模型不支持工具就消失。
+        reply: str | None = None
+        trace = ""
+        if tools_on:
+            reply, trace = await self._nlu_chat_agent(event, prompt, system_prompt)
+        if not reply:
+            reply = await self._call_report_llm(
+                prompt, umo=umo, system_prompt=system_prompt
+            )
         if not reply:
             logger.info("[dota2] 闲聊兜底：模型不可用，消息交回默认大模型")
             return
@@ -1955,8 +2305,10 @@ class Dota2Plugin(Star):
             f"[dota2] 闲聊兜底回答: {question[:48]!r} "
             f"needs={sorted(context.needs)} "
             f"玩家数={len(context.snapshots)} "
+            f"收窄={focus or '-'} "
             f"时间窗口={context.window.label if context.window else '-'} "
-            f"会话比赛={len(context.session_matches)}"
+            f"会话比赛={len(context.session_matches)} "
+            f"工具调用={len([x for x in trace.split('; ') if x]) if trace else 0}次"
         )
         async for item in self._emit(event, reply, as_image=False):
             yield item
@@ -2055,9 +2407,26 @@ class Dota2Plugin(Star):
         # 就是结论，再让关键词翻案等于把上面那段白做。
         if not consulted:
             intent = dota_nlu.parse(effective)
+        # 「查版本强势英雄」的重点是**给谁看**，而这一步最容易丢人：
+        # 现场日志取证 —— 「dota2助手，帮我推荐几个轮椅」被模型正确判成
+        # wheelchair，但 target 是空的，于是只出了一份通用榜单，没有个人推荐。
+        # 原因有二：模型不把「帮我」当成「我」，而「天鸽的轮椅」这类句子
+        # 在规则里也压根没抽昵称。这里统一用规则重建一次参数（模型 / 关键词
+        # 两条路径共用同一份构造），顺带把位置词从 target 里摘出去。
+        if intent is not None and intent.name == "wheelchair":
+            rebuilt = dota_nlu.build_wheelchair_args(
+                effective,
+                llm_target=intent.args,
+                known_names=tuple(self._nlu_known_names(umo)),
+            )
+            if rebuilt != (intent.args or ""):
+                logger.info(
+                    f"[dota2] 自然语言：轮椅参数由 {intent.args!r} 重建为 {rebuilt!r}"
+                )
+            intent.args = rebuilt
+
         if intent is None:
-            # 没识别出内置指令。分两种情况：
-            #
+            # 没识别出内置指令。分两种情况：            #
             # a) 用户写了唤醒词 —— 这是**明确点名**插件。此时直接把消息
             #    扔回默认大模型是浪费：默认大模型看不到本会话的监听列表、
             #    绑定关系与战绩数据，只能反问或编造。改为由插件带着这些
@@ -2387,6 +2756,144 @@ class Dota2Plugin(Star):
 
         text = format_hero_stats(name, hero_rows, heroes)
         for chunk in self._chunk_text(text):
+            yield event.plain_result(chunk)
+
+    # ==================================================================
+    # 指令：版本强势英雄（「轮椅」榜）
+    # ==================================================================
+    @d2.command(
+        "wheelchair",
+        alias={"轮椅", "版本英雄", "强势英雄", "胜率榜", "版本答案"},
+    )
+    @take_over_event
+    async def d2_wheelchair(self, event: AstrMessageEvent, args: GreedyStr):
+        """当前版本强势英雄榜：/d2 轮椅 [位置] [昵称|账号ID|我]
+
+        不带玩家时只出客观榜单；写了昵称（或「我」）才追加个人适配推荐，
+        因为它要额外拉英雄池与近期对局、还要过一次模型。
+        """
+        tokens = [token for token in re.split(r"\s+", str(args).strip()) if token]
+        position = ""
+        if tokens:
+            matched = match_position(tokens[0])
+            if matched:
+                position = matched
+                tokens = tokens[1:]
+        target = " ".join(tokens).strip()
+        if target in {"我", "自己", "我的", "本人", "me", "my"}:
+            # 「我」= 当前会话的绑定账号（没绑的话下面会提示怎么绑）
+            target, want_personal = "", True
+        else:
+            want_personal = bool(target)
+
+        try:
+            hero_stats = await self.api.get_hero_stats()
+            heroes = await self._heroes()
+            patch = await self.api.get_latest_patch()
+        except OpenDotaError as e:
+            yield event.plain_result(f"❌ 查询失败：{e}")
+            return
+
+        if not hero_stats:
+            yield event.plain_result(
+                "没有拿到版本英雄数据（数据源可能暂时不可用），稍后再试。"
+            )
+            return
+
+        rows, meta = hero_meta_rows(
+            hero_stats,
+            position=position,
+            min_pick=int(self.cfg("hero_meta_min_pick", 0) or 0),
+        )
+        board = format_hero_meta_board(
+            rows,
+            meta,
+            heroes,
+            patch=patch,
+            top=max(1, int(self.cfg("hero_meta_board_size", 10) or 10)),
+            hot_top=max(0, int(self.cfg("hero_meta_hot_size", 5) or 0)),
+            cold_top=max(0, int(self.cfg("hero_meta_cold_size", 3) or 0)),
+        )
+        for chunk in self._chunk_text(board):
+            yield event.plain_result(chunk)
+
+        if not want_personal:
+            yield event.plain_result(format_hero_meta_footer(meta))
+            return
+
+        # ---------- 个人适配 ----------
+        if target:
+            try:
+                # 带上 umo：本会话名单里的名字（自然语言入口给的简称也经它
+                # 归一成名单原名）直接换 account_id，省掉一次全局昵称搜索 ——
+                # OpenDota 上重名账号太多，搜索既有歧义风险又慢。
+                account_id, name = await self._resolve_account(
+                    target, umo=event.unified_msg_origin
+                )
+            except OpenDotaError as e:
+                yield event.plain_result(f"⚠️ 没找到「{target}」这个账号：{e}")
+                return
+        else:
+            binding, _note = self._effective_binding(event)
+            if not binding:
+                yield event.plain_result(self._no_binding_reply())
+                return
+            account_id = int(binding.get("account_id") or 0)
+            name = binding.get("personaname") or f"账号{account_id}"
+
+        yield event.plain_result(f"⏳ 正在结合 {name} 的英雄池与近期表现筛选…")
+
+        limit = self._clamp_count(None)
+        try:
+            hero_rows = await self.api.get_player_heroes(account_id)
+            matches, _economy = await self.api.get_player_matches_enriched(
+                account_id, limit
+            )
+            try:
+                profile = await self.api.get_player(account_id) or {}
+                wl = await self.api.get_player_wl(account_id)
+            except OpenDotaError as e:
+                logger.warning(f"[dota2] 补充玩家资料失败: {e}")
+                profile, wl = {}, {}
+        except OpenDotaError as e:
+            yield event.plain_result(f"❌ 拉取 {name} 的数据失败：{e}")
+            return
+
+        if not hero_rows and not matches:
+            yield event.plain_result(
+                f"没有查到 {name} 的英雄池与近期对局，做不了个人适配。"
+            )
+            return
+
+        header = f"🎯 {name} 的版本轮椅（在版本强势英雄里挑适合他的）"
+        prompt = build_hero_pick_prompt(
+            account_id=account_id,
+            profile_data=profile,
+            wl=wl,
+            hero_rows=hero_rows,
+            matches=matches,
+            meta_rows=rows,
+            meta=meta,
+            heroes=heroes,
+            patch=patch,
+        )
+        report = await self._generate_report(event, prompt)
+        if report:
+            yield event.plain_result(header)
+            async for item in self._emit(event, report, as_image=True):
+                yield item
+            return
+
+        # 模型不可用：退回纯数据交叉的规则版，不硬凑一段分析
+        fallback = pick_heroes_for_player(rows, hero_rows, matches, heroes)
+        if not fallback:
+            yield event.plain_result(
+                f"{header}\n\n"
+                "没筛出合适的：他的英雄池里没有版本强势英雄，"
+                "近期记录也不足以判断他常打的位置。"
+            )
+            return
+        for chunk in self._chunk_text(f"{header}\n\n{fallback}"):
             yield event.plain_result(chunk)
 
     # ==================================================================

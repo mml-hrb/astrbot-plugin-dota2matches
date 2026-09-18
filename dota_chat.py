@@ -603,6 +603,18 @@ def hero_label(heroes: dict[int, dict], hero_id: Any) -> str:
     return f"英雄#{hid}"
 
 
+#: 出现这些词说明用户在问**多个人**（横向对比 / 群体排名），取数不能收窄到一个人。
+#: 用于「兜底对话工具模式」下的按需取数：只点名了一个人、又没有这些词时，
+#: 只拉那个人的数据就够了 —— 监听列表里六七个人全拉一遍纯属浪费配额和时间。
+#:
+#: ⚠️ 别把「几个 / 哪个」这类**也修饰物**的词收进来：「推荐几个轮椅英雄」
+#: 里说的是英雄数量，不是人数 —— 收窄被它挡住过一次（实测发现）。
+MULTI_PLAYER_HINT_RE = re.compile(
+    r"谁|哪[个些]|对比|比较|大家|各位|全部|全都|所有人|每个人|群里|开黑|一起|"
+    r"排名|排行|最菜|最强|最好|最差|几人|几位|几个人|我们"
+)
+
+
 def detect_needs(
     question: str, *, names: Iterable[str] = (), has_self: bool = False
 ) -> set[str]:
@@ -1548,6 +1560,7 @@ async def collect_chat_context(
     self_binding: dict | None = None,
     bindings: Iterable[dict] = (),
     recent_matches: Iterable[dict] = (),
+    focus_accounts: Iterable[int] | None = None,
     recent_limit: int = DEFAULT_RECENT_LIMIT,
     max_players: int = DEFAULT_MAX_PLAYERS,
     timeout: float = DEFAULT_FETCH_TIMEOUT,
@@ -1566,6 +1579,9 @@ async def collect_chat_context(
         bindings: 本会话的绑定列表（展示用）。
         recent_matches: 本会话近期涉及过的比赛（监听推送 / 复盘 / 战绩查询），
             形如 ``{match_id, desc, start_time}``。纯本地数据，直接注入。
+        focus_accounts: 只取这几个账号的数据（``account_id`` 列表）。
+            调用方在「问题只点名了一个人、且没有横向对比语义」时用它收窄范围，
+            省掉一轮无用请求。留空表示按常规规则取（本人 + 监听列表）。
         cache: 可选的战绩缓存 ``{(account_id, limit): (时间戳, 快照)}``，
             由调用方持有，跨消息复用；不传则不缓存。
         now: 回答时刻（时间戳）。测试可传入固定值，生产不传即取当前时间。
@@ -1636,6 +1652,23 @@ async def collect_chat_context(
                 "被监听",
             )
         )
+
+    # ---- 收窄到指定的人（工具模式下的按需取数）----
+    # 这一步必须在 candidates 建好之后、英雄表与战绩之前：省的是网络请求，
+    # 晚一步做就白拉了。收窄是调用方**主动**决定的（问题只点名了一个人），
+    # 所以不该再往上下文里塞「还有 N 位没取数据」——那句话会让模型以为
+    # 数据被截断了，从而不敢下结论。
+    wanted = [int(acc) for acc in (focus_accounts or []) if _as_int(acc)]
+    if wanted:
+        by_account = {account: (account, name, relation) for account, name, relation in candidates}
+        focused = [by_account[acc] for acc in wanted if acc in by_account]
+        if focused:
+            candidates = focused
+            skipped = 0
+            ctx.notes.append(
+                "本次只取了问题里**点名提到**的那位玩家的数据"
+                "（其他成员的数据没有拉取）。"
+            )
 
     if skipped:
         ctx.notes.append(

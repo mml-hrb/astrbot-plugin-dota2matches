@@ -26,6 +26,15 @@ BASE_URL = "https://api.opendota.com/api"
 #: 英雄常量缓存有效期（秒）
 HERO_CACHE_TTL = 12 * 3600
 
+#: 英雄版本胜率（``/heroStats``）缓存有效期（秒）。
+#:
+#: 该接口返回的是**最近 7 天滚动窗口**的聚合统计，分钟级变化没有意义，
+#: 但也不能缓存太久——版本更新当天玩家会关心最新数据。3 小时是个折中。
+HERO_STATS_CACHE_TTL = 3 * 3600
+
+#: 补丁表（``/constants/patch``）缓存有效期（秒）。补丁几个月才动一次。
+PATCH_CACHE_TTL = 12 * 3600
+
 #: recentMatches 接口的硬上限（OpenDota 固定最多只返回最近 20 场）
 RECENT_MATCHES_LIMIT = 20
 
@@ -110,6 +119,12 @@ class RateLimiter:
 class OpenDotaClient:
     """OpenDota API 客户端。"""
 
+    #: 数据源身份标记。有些能力只归属某一端（如 ``request_parse``、
+    #: ``get_hero_stats``），组合里要按**类型**定位而不能按 primary/secondary
+    #: 定位 —— 否则用户切换 ``data_source_priority`` 后会静默失效。
+    #: 用显式标记而不是 ``isinstance``：打桩/包装类同样能声明身份。
+    SOURCE_KIND = "opendota"
+
     def __init__(
         self,
         api_key: str = "",
@@ -131,6 +146,12 @@ class OpenDotaClient:
         #: 技能常量（id → 技能名）。None 表示还没拉过；空 dict 表示拉过但失败。
         self._ability_cache: dict[int, str] | None = None
         self._ability_cache_at = 0.0
+        #: 英雄版本胜率原始行（``/heroStats``）。同上：None 未拉过、空 list 拉过但失败。
+        self._hero_stats_cache: list[dict] | None = None
+        self._hero_stats_cache_at = 0.0
+        #: 最新补丁（``/constants/patch`` 的最后一项）
+        self._patch_cache: dict | None = None
+        self._patch_cache_at = 0.0
 
     # ------------------------------------------------------------------
     # 底层请求
@@ -557,6 +578,72 @@ class OpenDotaClient:
         data = await self._request("/benchmarks", params={"hero_id": int(hero_id)})
         return data if isinstance(data, dict) else {}
 
+    # ------------------------------------------------------------------
+    # 英雄版本胜率（「轮椅」榜单的数据源）
+    # ------------------------------------------------------------------
+    async def get_hero_stats(self, force: bool = False) -> list[dict]:
+        """获取「当前版本」各英雄的公开对局统计。
+
+        数据取自 OpenDota ``GET /heroStats``，它按**最近 7 天滚动窗口**聚合
+        全部分段的公开对局。窗口长度是实测出来的：每个英雄的 ``pub_pick``
+        恰好等于 ``pub_pick_trend`` 里 7 项之和。
+
+        每行除了总胜负，还带：
+
+        * ``pub_pick`` / ``pub_win``：全分段公开对局；
+        * ``1_pick`` … ``7_pick`` 及对应 ``_win``：**按水平分档**的样本
+          （数字越大分段越高；第 8 档实测恒为 0，不可用，调用方要跳过）；
+        * ``pub_pick_trend`` / ``pub_win_trend``：逐日样本，用来算近期走向；
+        * ``roles``、``primary_attr``、``localized_name``：定位与显示名。
+
+        .. note::
+           这个窗口是**滚动 7 天**，不是严格按补丁切分。补丁刚发布的头几天，
+            窗口里会混着上个版本的对局 —— 调用方必须把这一点如实告诉用户
+           （见 :func:`dota_format.hero_meta_note`），不能宣称「本版本精确统计」。
+        """
+        now = time.time()
+        if (
+            not force
+            and self._hero_stats_cache is not None
+            and now - self._hero_stats_cache_at < HERO_STATS_CACHE_TTL
+        ):
+            return self._hero_stats_cache
+
+        data = await self._request("/heroStats", timeout=max(30, self.timeout))
+        rows = [row for row in (data or []) if isinstance(row, dict)]
+        # 负缓存：失败时也记时间戳，避免每次查询都白跑一趟
+        self._hero_stats_cache = rows
+        self._hero_stats_cache_at = now
+        return rows
+
+    async def get_latest_patch(self) -> dict:
+        """获取 OpenDota 记录的最新补丁，形如 ``{"name": "7.41", "date": ..., "id": 60}``。
+
+        只用来给用户**标注版本号**。拿不到就返回空字典 —— 此时报告里只写
+        「最近 7 天」而不写版本名，绝不猜一个版本号糊弄过去。
+        """
+        now = time.time()
+        if self._patch_cache is not None and now - self._patch_cache_at < PATCH_CACHE_TTL:
+            return self._patch_cache
+
+        try:
+            data = await self._request("/constants/patch", timeout=max(30, self.timeout))
+        except OpenDotaError as e:
+            logger.debug(f"[dota2] 补丁表获取失败，本次不标注版本号：{e}")
+            data = []
+
+        latest: dict = {}
+        if isinstance(data, list):
+            rows = [row for row in data if isinstance(row, dict) and row.get("name")]
+            if rows:
+                # 接口按时间升序返回；仍显式排序一次，避免顺序假设哪天失效
+                rows.sort(key=lambda row: str(row.get("date") or ""))
+                latest = rows[-1]
+        # 失败也写缓存（空 dict）：接口真挂时不能每次查询都重试一遍退避
+        self._patch_cache = latest
+        self._patch_cache_at = now
+        return latest
+
     @staticmethod
     def is_parsed(match: dict | None) -> bool:
         """判断一场比赛是否已经具备逐分钟级别的解析数据。
@@ -658,6 +745,20 @@ _FALLBACK_METHODS: tuple[str, ...] = (
 #: （这位玩家就是没打过），把它列进来会让每次查询都白跑一趟后备源，既慢
 #: 又浪费额度。
 _EMPTY_TRIGGERS_FALLBACK: tuple[str, ...] = ("get_match",)
+
+
+def is_opendota_source(source: Any) -> bool:
+    """判断某个数据源是不是 OpenDota（用于「能力只归属某一端」的定位）。
+
+    优先看对方显式声明的 :attr:`SOURCE_KIND`；没有声明时退回 ``isinstance``，
+    这样既支持打桩/包装类主动标身份，也不会漏掉没标过的真客户端。
+    """
+    if source is None:
+        return False
+    kind = getattr(source, "SOURCE_KIND", "")
+    if kind:
+        return str(kind).strip().lower() == "opendota"
+    return isinstance(source, OpenDotaClient)
 
 
 class FallbackDataSource:
@@ -805,16 +906,70 @@ class FallbackDataSource:
     async def request_parse(self, match_id: int) -> bool:
         """提交解析申请。
 
-        OpenDota 独占能力，STRATZ 不支持主动提交，因此**固定走后备**
-        （即 OpenDota），避免在 STRATZ 通道下返回 False 让等待流程误判。
+        OpenDota 独占能力（STRATZ 不支持主动提交，只能等它自己排队），
+        因此固定路由到 **OpenDota 那一端**，避免在 STRATZ 通道下返回 False
+        让等待流程误判。
+
+        .. note::
+           早先这里写的是「转发到 ``self.secondary``」，并假设后备源就是
+           OpenDota。这个假设**只在 ``data_source_priority=stratz`` 时成立**：
+           线上配置是 ``opendota``，此时 secondary 是 STRATZ，于是催解析会被
+           转发给一个永远返回 False 的实现 —— 也就是说**从未真正提交过**。
+           现在改为按类型定位 OpenDota（见 :meth:`_opendota_side`），
+           与数据源优先级配置解耦。
         """
-        method = getattr(self.secondary, "request_parse", None)
+        method = getattr(self._opendota_side(), "request_parse", None)
         if method is None:
             return False
         try:
             return await method(match_id)
         except OpenDotaError:
             return False
+
+    # ------------------------------------------------------------------
+    # 只在某一端存在的能力：按类型定位，不走「主源优先」
+    # ------------------------------------------------------------------
+    def _opendota_side(self) -> Any:
+        """找出数据源组合里的 OpenDota 客户端；没有则返回 ``None``。
+
+        按**类型**而不是「primary / secondary」定位：哪个是 OpenDota 取决于
+        ``data_source_priority`` 配置，写死某一端会在用户切换优先级后静默失效。
+        """
+        for source in (self.primary, self.secondary):
+            if is_opendota_source(source):
+                return source
+        return None
+
+    async def get_hero_stats(self, *args: Any, **kwargs: Any) -> list[dict]:
+        """英雄版本胜率：**固定走 OpenDota**。
+
+        为什么不做「主源优先」：``/heroStats`` 是 OpenDota 的**公开聚合接口**，
+        不需要 Key、不消耗解析额度，返回最近 7 天全分段的样本（实测每个英雄
+        最少也有两万场，样本充足）。STRATZ 侧要拿到同等口径得拼一个参数敏感的
+        GraphQL 查询、还要花额度，收益不成正比。这与 :meth:`request_parse`
+        「能力只归属某一边」的处理方式一致。
+
+        组合里没有 OpenDota 时抛 :class:`DataSourceUnavailableError`，
+        由上层如实提示，不静默返回空榜。
+        """
+        source = self._opendota_side()
+        method = getattr(source, "get_hero_stats", None)
+        if method is None:
+            raise DataSourceUnavailableError("当前数据源组合里没有可用的 OpenDota")
+        return await method(*args, **kwargs)
+
+    async def get_latest_patch(self, *args: Any, **kwargs: Any) -> dict:
+        """最新补丁号，同 :meth:`get_hero_stats` 固定走 OpenDota。
+
+        拿不到就返回空字典（只影响报告里那行版本标注），不作为错误上报。
+        """
+        method = getattr(self._opendota_side(), "get_latest_patch", None)
+        if method is None:
+            return {}
+        try:
+            return await method(*args, **kwargs)
+        except OpenDotaError:
+            return {}
 
     async def close(self) -> None:
         """关闭两端数据源。"""

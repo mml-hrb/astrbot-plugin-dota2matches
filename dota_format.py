@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import datetime
 import time
 from collections import Counter
 from typing import Any
@@ -2177,7 +2178,13 @@ def format_hero_stats(
     heroes: dict[int, dict],
     top: int = 12,
 ) -> str:
-    """按英雄维度展示玩家统计。"""
+    """按英雄维度展示玩家统计。
+
+    这里**不展示「最近使用」**：唯一的时间来源是 ``/players/{id}/heroes``
+    的 ``last_played``，而该字段实测系统性陈旧（见 :func:`recent_hero_usage`
+    的说明），照抄会把「昨天刚打过」的英雄标成「3 年前用过」。
+    要近期时效请走 :func:`recent_hero_usage`（需要近期对局列表）。
+    """
     rows = summarize_hero_history(hero_rows)
     if not rows:
         return f"没有查询到 {player_name} 的英雄使用记录。"
@@ -2191,10 +2198,558 @@ def format_hero_stats(
         lines.append(
             f"{index:>2}. {hname(heroes, row['hero_id'])}　{row['games']} 场 "
             f"{row['win']} 胜　胜率 {row['winrate']:.1f}%"
-            + (f"　（最近使用 {fmt_ago(row['last_played'])}）" if row["last_played"] else "")
         )
     if len(rows) > top:
         lines.append(f"... 以及另外 {len(rows) - top} 个英雄")
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------
+# 英雄版本胜率（「轮椅」榜）
+# ----------------------------------------------------------------------
+
+#: 官方英雄定位 → 中文。取值就是 ``/heroStats`` 里的 ``roles``。
+HERO_ROLE_ZH: dict[str, str] = {
+    "Carry": "核心",
+    "Support": "辅助",
+    "Initiator": "先手",
+    "Durable": "耐久",
+    "Disabler": "控制",
+    "Nuker": "爆发",
+    "Escape": "灵动",
+    "Pusher": "推进",
+}
+
+#: 主属性 → 中文。Dota 现在还有「全才」英雄（``all``）。
+HERO_ATTR_ZH: dict[str, str] = {
+    "str": "力量",
+    "agi": "敏捷",
+    "int": "智力",
+    "all": "全才",
+}
+
+#: 口语位置词 → 内部类目。
+#:
+#: .. warning::
+#:   ``roles`` 是**官方英雄定位**，不是分路统计。用它推位置只能是近似：
+#:   带 ``Carry`` 的通常走 1/2 号位、带 ``Support`` 的通常走 4/5 号位，
+#:   但一个常年打辅助的力量英雄同样带 ``Durable``，会被归进「三号位」。
+#:   所以报告里必须写明这是「按官方定位近似」，不能让人当成分路数据。
+POSITION_ALIASES: dict[str, tuple[str, ...]] = {
+    "core": (
+        "核心", "大哥", "1号位", "一号位", "2号位", "二号位", "中单", "carry", "c位",
+    ),
+    "offlane": ("三号位", "3号位", "劣单", "上单", "offlane", "前排", "肉盾"),
+    "support": (
+        "辅助", "酱油", "4号位", "四号位", "5号位", "五号位", "support", "挂件",
+    ),
+}
+
+#: 内部类目 → 给人看的名字
+POSITION_LABELS: dict[str, str] = {
+    "core": "核心（1/2 号位）",
+    "offlane": "三号位",
+    "support": "辅助（4/5 号位）",
+}
+
+
+def fmt_wan(value: Any) -> str:
+    """把大数字缩写成「49.3 万」（中文场景比 ``k`` 好读）。"""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if abs(num) >= 10000:
+        return f"{num / 10000:.1f} 万"
+    return f"{num:.0f}"
+
+
+def match_position(text: str) -> str:
+    """认出参数里的位置词，返回 ``core`` / ``offlane`` / ``support``。
+
+    只做**整词**匹配（去掉空白后与别名完全相等）。不这样做的话，
+    「中」这种单字会把玩家昵称咬掉一块 —— 而这个参数位也可能是昵称。
+    """
+    token = "".join(str(text or "").split()).lower()
+    if not token:
+        return ""
+    for position, aliases in POSITION_ALIASES.items():
+        if token in aliases:
+            return position
+    return ""
+
+
+def _in_position(roles: list[str], position: str) -> bool:
+    """按官方定位粗略判断英雄是否属于某个位置类目。
+
+    用**互斥**判定，而不是「挂了某个标签就算」：官方 ``roles`` 里不少英雄同时
+    挂着 ``Carry`` 与 ``Support``（骷髅王两个都有），只看「含 Carry」会让两边
+    的榜单混进同一个英雄。这里要求标签**不冲突**才收 —— 宁可漏掉几个打法兼容
+    的英雄，也不能把辅助英雄摆进核心榜榜首。
+    """
+    if not position:
+        return True
+    values = {str(role) for role in (roles or [])}
+    is_carry = "Carry" in values
+    is_support = "Support" in values
+    if position == "core":
+        return is_carry and not is_support
+    if position == "support":
+        return is_support and not is_carry
+    if position == "offlane":
+        # 三号位没有对应标签，只能用「耐久 / 先手」近似；
+        # 带核心或辅助标签的一律排除，否则幽鬼会被当成三号位。
+        return (
+            ("Durable" in values or "Initiator" in values)
+            and not is_carry
+            and not is_support
+        )
+    return True
+
+
+#: 趋势至少要多少样本才给结论。几百场的胜率波动纯属噪声，
+#: 拿去说「某某正在变强」会误导人。
+TREND_MIN_SAMPLES = 200
+
+
+def hero_meta_rows(
+    hero_stats: list[dict],
+    *,
+    position: str = "",
+    min_pick: int | None = None,
+) -> tuple[list[dict], dict[str, Any]]:
+    """把 ``/heroStats`` 的原始行整理成可排序的榜单行。
+
+    只使用 ``pub_pick`` / ``pub_win``（全分段公开对局）与它们的逐日趋势。
+
+    .. note::
+       接口还带 ``1_pick`` … ``7_pick`` 这套**分档**字段，但项目里**不启用**：
+       实测各档的样本分布与真实天梯分布对不上（且第 8 档恒为 0），
+       编号到段位的映射无法验证。与其猜一个映射去误导人，不如不用。
+
+    Args:
+        hero_stats: ``/heroStats`` 的原始返回。
+        position: ``core`` / ``offlane`` / ``support``，空串表示不过滤。
+        min_pick: 最小场次门槛；``None`` 或 ``<=0`` 表示按样本中位数自适应
+            （版本刚发布时总样本会骤降，写死门槛会出空榜）。
+
+    Returns:
+        ``(rows, meta)``。``rows`` 按胜率降序；``meta`` 是口径信息，供渲染与
+        提示词标注使用。
+    """
+    rows: list[dict] = []
+    for raw in hero_stats or []:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            hero_id = int(raw.get("id"))
+        except (TypeError, ValueError):
+            continue
+        roles = [str(role) for role in (raw.get("roles") or [])]
+        if not _in_position(roles, position):
+            continue
+        pick = int(raw.get("pub_pick") or 0)
+        win = int(raw.get("pub_win") or 0)
+        if pick <= 0:
+            continue
+
+        wins_trend = [int(value or 0) for value in (raw.get("pub_win_trend") or [])]
+        picks_trend = [int(value or 0) for value in (raw.get("pub_pick_trend") or [])]
+        recent_winrate: float | None = None
+        trend: float | None = None
+        if len(wins_trend) >= 4 and len(picks_trend) == len(wins_trend):
+            recent_pick = sum(picks_trend[-3:])
+            recent_win = sum(wins_trend[-3:])
+            early_pick = sum(picks_trend[:-3])
+            early_win = sum(wins_trend[:-3])
+            if recent_pick >= TREND_MIN_SAMPLES and early_pick >= TREND_MIN_SAMPLES:
+                recent_winrate = recent_win / recent_pick
+                trend = recent_winrate - early_win / early_pick
+
+        rows.append(
+            {
+                "hero_id": hero_id,
+                "npc": str(raw.get("name") or ""),
+                "english_name": str(raw.get("localized_name") or ""),
+                "roles": roles,
+                "attr": str(raw.get("primary_attr") or ""),
+                "pick": pick,
+                "win": win,
+                "winrate": win / pick,
+                "recent_winrate": recent_winrate,
+                "trend": trend,
+            }
+        )
+
+    picks_sorted = sorted(row["pick"] for row in rows)
+    median = picks_sorted[len(picks_sorted) // 2] if picks_sorted else 0
+    if min_pick is None or int(min_pick) <= 0:
+        # 中位数的 10%：剔掉「两万场」这种冷门小样本，同时保住主流英雄。
+        # 写死绝对量的门槛（例如 2 万场）会在版本刚发布时出空榜，
+        # 所以再压一个 200 场的绝对下限，随样本总量自动缩放。
+        threshold = max(200, int(median * 0.1))
+        threshold_source = "auto"
+    else:
+        threshold = int(min_pick)
+        threshold_source = "config"
+
+    kept = [row for row in rows if row["pick"] >= threshold]
+    kept.sort(key=lambda row: (-row["winrate"], -row["pick"]))
+    meta: dict[str, Any] = {
+        "window_days": 7,
+        "threshold": threshold,
+        "threshold_source": threshold_source,
+        "median_pick": median,
+        "heroes_total": len(hero_stats or []),
+        "heroes_pool": len(rows),
+        "heroes_kept": len(kept),
+        "total_pick": sum(row["pick"] for row in kept),
+        "position": position,
+    }
+    return kept, meta
+
+
+def hero_meta_note(meta: dict[str, Any], patch: dict | None = None) -> str:
+    """渲染口径说明（含版本号与「窗口混版本」提醒）。"""
+    days = int(meta.get("window_days") or 7)
+    total_pick = int(meta.get("total_pick") or 0)
+    # 位置过滤时「过门槛数 / 全部英雄数」会误导（分母是全英雄），
+    # 所以分母用位置内的候选数。
+    pool = int(meta.get("heroes_pool") or meta.get("heroes_total") or 0)
+    parts = [
+        f"📊 口径：最近 {days} 天全分段公开对局",
+        f"{meta.get('heroes_kept', 0)}/{pool} 个英雄过门槛",
+        f"约 {fmt_wan(total_pick / 10)}场",
+    ]
+    position = str(meta.get("position") or "")
+    if position:
+        parts.append(f"位置：{POSITION_LABELS.get(position, position)}")
+
+    threshold = int(meta.get("threshold") or 0)
+    source = str(meta.get("threshold_source") or "auto")
+    if source == "config":
+        gate = f"门槛 ≥ {fmt_wan(threshold)}场（配置）"
+    else:
+        gate = f"门槛 ≥ {fmt_wan(threshold)}场（按样本中位数自适应）"
+
+    lines = ["　· ".join(parts), f"　{gate}"]
+
+    # ⚠️ 统计窗口是「滚动 7 天」，不是按补丁切 —— 补丁刚发布时窗口里混着旧版本
+    patch_name = str((patch or {}).get("name") or "")
+    patch_date = str((patch or {}).get("date") or "")
+    if patch_name:
+        fresh = _patch_age_days(patch_date)
+        if fresh is not None and fresh < days:
+            lines.append(
+                f"　⚠️ 补丁 {patch_name} 才发布 {fresh} 天，而统计窗口是最近 {days} 天，"
+                "数据里混着上个版本的对局，只作参考。"
+            )
+    return "\n".join(lines)
+
+
+def _patch_age_days(patch_date: str) -> int | None:
+    """补丁发布日期距今天数；解析不了返回 ``None``（不猜）。"""
+    text = str(patch_date or "").strip()
+    if not text:
+        return None
+    import datetime
+
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d"):
+        try:
+            when = datetime.datetime.strptime(text[: len(fmt) + 6], fmt).replace(
+                tzinfo=datetime.timezone.utc
+            )
+        except ValueError:
+            continue
+        delta = datetime.datetime.now(datetime.timezone.utc) - when
+        return max(0, int(delta.total_seconds() // 86400))
+    return None
+
+
+def hero_meta_label(row: dict, heroes: dict[int, dict] | None = None) -> str:
+    """英雄显示名：优先用已本地化的常量表，回退到接口自带的英文名。"""
+    if heroes:
+        name = hname(heroes, row.get("hero_id"))
+        if name and not name.startswith("英雄#"):
+            return name
+    return str(row.get("english_name") or f"英雄#{row.get('hero_id')}")
+
+
+def _hero_meta_line(row: dict, heroes: dict[int, dict] | None, index: int) -> str:
+    """榜单的一行：`` 1. 冥魂大帝　54.9%　50.6 万场　力量·核心/耐久　↑0.3``"""
+    roles = "/".join(
+        HERO_ROLE_ZH.get(role, role) for role in (row.get("roles") or [])[:3]
+    )
+    tags = "·".join(
+        part
+        for part in (
+            HERO_ATTR_ZH.get(row.get("attr") or "", ""),
+            roles,
+        )
+        if part
+    )
+    trend = row.get("trend")
+    if trend is None:
+        trend_text = ""
+    else:
+        delta = trend * 100
+        if abs(delta) < 0.2:
+            trend_text = "　→持平"
+        else:
+            arrow = "↑" if delta > 0 else "↓"
+            trend_text = f"　{arrow}{abs(delta):.1f}"
+    return (
+        f"{index:>2}. {hero_meta_label(row, heroes)}　{row['winrate'] * 100:.1f}%"
+        f"　{fmt_wan(row['pick'])}场"
+        + (f"　{tags}" if tags else "")
+        + trend_text
+    )
+
+
+def format_hero_meta_board(
+    rows: list[dict],
+    meta: dict[str, Any],
+    heroes: dict[int, dict] | None = None,
+    *,
+    patch: dict | None = None,
+    top: int = 10,
+    hot_top: int = 5,
+    cold_top: int = 5,
+) -> str:
+    """渲染「版本轮椅榜」：胜率最高 + 热门里最横的 + 垫底的。
+
+    Args:
+        rows: :func:`hero_meta_rows` 的输出（已按胜率降序）。
+        meta: 同上的口径信息。
+        heroes: 英雄常量表（用于中文名）。
+        patch: 最新补丁信息，用来标注版本号。
+        top: 胜率榜长度。
+        hot_top: 「热门里最横的」条数。
+        cold_top: 「悠着点」条数，``0`` 表示不显示。
+    """
+    if not rows:
+        return "没有拿到英雄版本数据（数据源可能暂时不可用），稍后再试。"
+
+    position = str(meta.get("position") or "")
+    patch_name = str((patch or {}).get("name") or "")
+    title = f"🏆 版本轮椅榜 · {patch_name}" if patch_name else "🏆 版本轮椅榜"
+    if position:
+        title += f"（{POSITION_LABELS.get(position, position)}）"
+
+    lines = [title, hero_meta_note(meta, patch), ""]
+
+    hottest = rows[:top]
+    lines.append(f"【胜率最高 TOP {len(hottest)}】")
+    for index, row in enumerate(hottest, start=1):
+        lines.append(_hero_meta_line(row, heroes, index))
+
+    # 「悠着点」要保住「真正的垫底」这个语义，所以**先算它**，再让「热门」避开它。
+    # 反过来（热门先挑、垫底再避开热门）会出问题：位置筛选后池子本来就小
+    # （三号位只过门槛 15 个），「热门」那段会把整个池子都扫进去，于是一批
+    # 胜率 44~46% 的英雄同时出现在「热门里最横的」和「悠着点」两段 —— 用户
+    # 看到同一批名字被两头点名，只会觉得榜单坏了。谁更该说真话？
+    # 「悠着点」的职责就是点名最差的三个，让位给「热门」就等于说谎。
+    shown = {row["hero_id"] for row in hottest}
+    cold: list[dict] = []
+    if cold_top > 0:
+        cold = [row for row in rows if row["hero_id"] not in shown][-cold_top:]
+        cold.reverse()
+        shown |= {row["hero_id"] for row in cold}
+
+    # 「轮椅」的本义是「大家都在玩、而且真的能赢」：只看胜率会把
+    # 冷门绝活英雄（样本小、胜率高）顶上榜首，那不是轮椅。这里从**场次最高**
+    # 的一批里再筛胜率，两层都满足才是真·轮椅。
+    hot: list[dict] = []
+    hot_pool_size = 0
+    if hot_top > 0:
+        hot_pool_size = max(15, len(rows) // 5)
+        by_pick = sorted(rows, key=lambda row: -row["pick"])[:hot_pool_size]
+        hot = [row for row in by_pick if row["hero_id"] not in shown]
+        hot.sort(key=lambda row: -row["winrate"])
+        hot = hot[:hot_top]
+
+    if hot:
+        lines.append("")
+        # 池子本身不到扫描条数时，说「场次前 N 名」会让人以为还有更热门的没被算进来
+        scope = (
+            f"全部 {len(rows)} 个过门槛英雄"
+            if hot_pool_size >= len(rows)
+            else f"场次前 {hot_pool_size} 名"
+        )
+        lines.append(f"【热门里最横的】（{scope}中胜率最高）")
+        for index, row in enumerate(hot, start=1):
+            lines.append(_hero_meta_line(row, heroes, index))
+
+    if cold:
+        lines.append("")
+        lines.append("【悠着点】（胜率垫底，非绝活慎选）")
+        for index, row in enumerate(cold, start=1):
+            lines.append(_hero_meta_line(row, heroes, index))
+
+    return "\n".join(lines).rstrip()
+
+
+def format_hero_meta_footer(meta: dict[str, Any]) -> str:
+    """榜单尾部提示（告诉用户还能怎么用）。"""
+    return (
+        "💡 想按位置看，用 `/d2 轮椅 辅助`（或 核心 / 三号位）；\n"
+        "想看自己该练哪个，用 `/d2 轮椅 我`（或 `/d2 轮椅 <昵称>`）。"
+    )
+
+
+#: 判断「最近还在玩」的天数门槛
+RECENT_PLAY_DAYS = 30
+
+#: 「他玩过这个英雄」至少要几场才算有效样本。低于此的只作参考，
+#: 不能据此下「他擅长 / 不擅长」的结论（1 场 100% 和 1 场 0% 都不是信息）。
+MIN_HERO_SAMPLE_GAMES = 3
+
+
+def recent_hero_usage(
+    matches: list[dict], days: int = RECENT_PLAY_DAYS
+) -> tuple[dict[int, int], dict[int, int]]:
+    """从**近期对局列表**统计每个英雄的出场次数与最近一次开赛时间。
+
+    Returns:
+        ``(counts, latest)``：``counts[hero_id]`` 是出场次数，
+        ``latest[hero_id]`` 是最近一次开赛时间戳。``days <= 0`` 表示不按时间过滤。
+
+    **为什么不用 ``/players/{id}/heroes`` 的 ``last_played``**（实测取证）：
+    该字段**系统性陈旧**，不能用来判断「最近还在玩吗」。实测账号 153659639
+    近 20 场打过的 18 个英雄，池内 ``last_played`` **全部**早于实际出场
+    （主宰的真实最近出场是 2026-09-13，池内写 2024-07-26），整个池子里
+    最新的 ``last_played`` 停在 69 天前 —— 而那个账号三天前还在打。
+    用它分类会把当下最常玩的英雄判成「很久没动」，进而给出反向建议。
+
+    近期对局是我们自己拉的，时间取自比赛本身的 ``start_time``，
+    以它为准才是可辩护的口径。
+    """
+    counts: dict[int, int] = {}
+    latest: dict[int, int] = {}
+    now = time.time()
+    for match in matches or []:
+        try:
+            hero_id = int(match.get("hero_id"))
+        except (TypeError, ValueError):
+            continue
+        start = int(match.get("start_time") or 0)
+        if days > 0 and start and (now - start) > days * 86400:
+            continue
+        counts[hero_id] = counts.get(hero_id, 0) + 1
+        if start > latest.get(hero_id, 0):
+            latest[hero_id] = start
+    return counts, latest
+
+#: 从主力英雄推断玩家偏好时，一个标签至少要在几个英雄上出现
+ROLE_HINT_MIN = 2
+
+
+def _player_role_hints(
+    pool: list[dict], heroes: dict[int, dict] | None, limit: int = 8
+) -> set[str]:
+    """从主力英雄的官方定位反推玩家偏好标签。
+
+    一个英雄的 ``roles`` 不能说明什么（很多英雄横跨好几种定位），但**一批**
+    主力英雄反复出现的标签（≥ :data:`ROLE_HINT_MIN` 个）就足以说明他平时
+    在玩哪一类。
+    """
+    counter: dict[str, int] = {}
+    for row in (pool or [])[:limit]:
+        info = (heroes or {}).get(row.get("hero_id")) or {}
+        for role in info.get("roles") or []:
+            key = str(role)
+            counter[key] = counter.get(key, 0) + 1
+    return {role for role, count in counter.items() if count >= ROLE_HINT_MIN}
+
+
+def pick_heroes_for_player(
+    meta_rows: list[dict],
+    hero_rows: list[dict],
+    matches: list[dict],
+    heroes: dict[int, dict] | None = None,
+    *,
+    top: int = 3,
+    board_size: int = 30,
+) -> str:
+    """规则版推荐：在版本强势英雄里，按「他已经会什么」挑几个出来。
+
+    这是大模型不可用时的降级方案，只做**数据交叉**、不做主观解读：
+
+    * **已经在玩**：他玩过 ≥3 场，且出现在近期对局里；
+    * **会玩但没动了**：玩过 ≥3 场，但近期对局里没出现；
+    * **没玩过但定位相近**：版本榜靠前，且官方定位与他主力英雄的标签有交集。
+
+    三类都只在版本榜 ``board_size`` 名以内挑，不碰榜外英雄 —— 与提示词里
+    对模型的要求共用同一条口径。全空时返回空串，由调用方决定怎么措辞。
+
+    「近期」以 :func:`recent_hero_usage` 从 ``matches`` 现算，**不用**
+    ``/players/{id}/heroes`` 的 ``last_played``（实测该字段系统性陈旧，
+    详见该函数说明）。
+    """
+    pool = summarize_hero_history(hero_rows)
+    if not meta_rows:
+        return ""
+    by_id = {row["hero_id"]: row for row in meta_rows}
+    rank_index = {row["hero_id"]: rank for rank, row in enumerate(meta_rows, start=1)}
+    board_ids = [row["hero_id"] for row in meta_rows[:board_size]]
+    played = {row["hero_id"]: row for row in pool}
+    recent_counts, _recent_latest = recent_hero_usage(matches)
+    split = f"最近 {len(matches)} 场" if matches else "近期"
+
+    playing: list[tuple[int, dict, dict]] = []
+    idle: list[tuple[int, dict, dict]] = []
+    for hero_id in board_ids:
+        entry = played.get(hero_id)
+        if entry is None or entry["games"] < MIN_HERO_SAMPLE_GAMES:
+            continue
+        fresh = recent_counts.get(hero_id, 0) > 0
+        (playing if fresh else idle).append((rank_index[hero_id], by_id[hero_id], entry))
+
+    hints = _player_role_hints(pool, heroes)
+    never: list[tuple[int, dict, dict | None]] = []
+    for hero_id in board_ids:
+        if hero_id in played:
+            continue
+        row = by_id[hero_id]
+        if hints and not (set(row.get("roles") or []) & hints):
+            continue
+        never.append((rank_index[hero_id], row, None))
+
+    playing.sort(key=lambda item: item[0])
+    idle.sort(key=lambda item: item[0])
+    never.sort(key=lambda item: item[0])
+
+    def render(rank: int, row: dict, entry: dict | None) -> str:
+        name = hero_meta_label(row, heroes)
+        if entry:
+            hero_id = row["hero_id"]
+            mine = f"你玩过 {entry['games']} 场，胜率 {entry['winrate']:.0f}%"
+            hits = recent_counts.get(hero_id, 0)
+            mine += f"（{split}出场 {hits} 次）" if hits else f"（{split}未出现）"
+        else:
+            mine = "你没用过"
+        return f"  {name} — 版本第 {rank}（{row['winrate'] * 100:.1f}%）· {mine}"
+
+    sections: list[tuple[str, list]] = [
+        ("【已经在玩、版本又强】", playing[:top]),
+        ("【会玩但最近没动】", idle[:top]),
+        ("【没玩过、定位相近】", never[:top]),
+    ]
+    lines: list[str] = []
+    for title, items in sections:
+        if not items:
+            continue
+        if lines:
+            lines.append("")
+        lines.append(title)
+        lines.extend(render(rank, row, entry) for rank, row, entry in items)
+
+    if not lines:
+        return ""
+    lines.append("")
+    lines.append(
+        "（未启用大模型分析，以上只做了数据交叉，没有额外解读）"
+    )
     return "\n".join(lines)
 
 

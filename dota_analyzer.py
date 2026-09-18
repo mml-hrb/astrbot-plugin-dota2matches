@@ -13,22 +13,31 @@ import asyncio
 import json
 import urllib.error
 import urllib.request
+from dataclasses import dataclass, field
 from typing import Any
 
 from astrbot.api import logger
 
 try:  # 插件目录被作为包加载时的相对导入
     from .dota_format import (
+        HERO_ATTR_ZH,
+        HERO_ROLE_ZH,
+        MIN_HERO_SAMPLE_GAMES,
+        POSITION_LABELS,
         build_match_data_text,
         fmt_ago,
         fmt_duration,
         fmt_timestamp,
+        fmt_wan,
         format_summary_block,
+        hero_meta_label,
         hname,
         match_quality_block,
         mode_text,
         normalize_focus_ids,
         player_win,
+        rank_text,
+        recent_hero_usage,
         summarize_hero_history,
         summarize_matches,
         to_steam_id64,
@@ -39,16 +48,24 @@ except ImportError:  # 兜底：以普通模块方式加载时，把插件目录
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from dota_format import (  # type: ignore[no-redef]
+        HERO_ATTR_ZH,
+        HERO_ROLE_ZH,
+        MIN_HERO_SAMPLE_GAMES,
+        POSITION_LABELS,
         build_match_data_text,
         fmt_ago,
         fmt_duration,
         fmt_timestamp,
+        fmt_wan,
         format_summary_block,
+        hero_meta_label,
         hname,
         match_quality_block,
         mode_text,
         normalize_focus_ids,
         player_win,
+        rank_text,
+        recent_hero_usage,
         summarize_hero_history,
         summarize_matches,
         to_steam_id64,
@@ -308,6 +325,263 @@ def build_recent_analysis_prompt(
     return "\n".join(lines)
 
 
+#: OpenDota 的 ``lane_role`` → 中文分路
+LANE_ROLE_ZH: dict[int, str] = {
+    1: "优势路",
+    2: "中路",
+    3: "劣势路",
+    4: "野区",
+}
+
+#: 「版本强势英雄 → 哪些适合他」的输出结构
+HERO_PICK_FORMAT = """请严格按照以下结构输出（Markdown 二级标题）：
+
+## 一句话结论
+（直接说这位玩家这版本该玩什么，一句话，不要铺垫）
+
+## 已经在玩、版本又强（直接上分）
+## 会玩但最近没怎么用（值得捡起来）
+## 没玩过、但位置对得上（可以练）
+## 这版本别碰
+
+每个英雄写成一行：**英雄名** · 版本胜率 xx.x% · 他自己的数据 · 一句话理由。
+
+硬性要求：
+
+1. **只能从上文给出的版本榜里挑英雄**。不要在榜外推荐，更不要凭印象编造胜率或英雄名。
+2. 每条推荐都要同时给出「版本数据」与「他的数据」；哪一项没有就如实写「无数据」，
+   不要用近似数字凑。**判断「他玩过没有」一律以「版本榜前 N 名里他玩过的」那一节为准**
+   （英雄池表被按场次截断了，不能因为没出现在那张表里就说他「无数据」）。
+3. 第三类（没玩过）的依据只能是他近期的分路分布，措辞用「位置对得上」，
+   不能写成「他很擅长」。
+4. 「已经在玩」这类里，如果某个英雄他自己的胜率明显低于 50%，要点出来。
+5. 任何一类确实没有合适对象，就写「暂无」，不要为了凑结构硬填。
+6. 「近 N 场出场」列统计的是我另外拉取的最近对局：写「未出现」只说明**这批对局里没打**，
+   不代表他没玩过这个英雄，别写成「从没玩过」；判断玩没玩过仍以上面那节为准。
+7. 他标注「样本不足」的英雄（场次太少）不要拿来下「他擅长 / 他不擅长」的结论，
+   最多说「样本太少，参考价值有限」。
+8. 总长度 500 字以内，不要复述我给你的表格。"""
+
+
+def _lane_role_text(matches: list[dict]) -> str:
+    """统计近期比赛的分路分布。缺 ``lane_role`` 的场次单独计数，不猜。"""
+    counts: dict[int, int] = {}
+    unknown = 0
+    for match in matches or []:
+        try:
+            lane = int(match.get("lane_role"))
+        except (TypeError, ValueError):
+            unknown += 1
+            continue
+        if lane not in LANE_ROLE_ZH:
+            unknown += 1
+            continue
+        counts[lane] = counts.get(lane, 0) + 1
+    if not counts:
+        return "数据缺失"
+    parts = [
+        f"{LANE_ROLE_ZH[lane]} {count} 场"
+        for lane, count in sorted(counts.items(), key=lambda item: -item[1])
+    ]
+    if unknown:
+        parts.append(f"（另有 {unknown} 场无分路数据）")
+    return "、".join(parts)
+
+
+def build_hero_pick_prompt(
+    *,
+    account_id: int,
+    profile_data: dict,
+    wl: dict,
+    hero_rows: list[dict],
+    matches: list[dict],
+    meta_rows: list[dict],
+    meta: dict,
+    heroes: dict[int, dict],
+    patch: dict | None = None,
+    board_size: int = 25,
+    pool_size: int = 20,
+) -> str:
+    """构造「版本强势英雄里，哪些适合他」的提示词。
+
+    三层数据缺一不可：
+
+    1. **版本榜**（客观）：最近 7 天各英雄的胜率与场次；
+    2. **他的英雄池**（熟练度）：各英雄场次 / 胜率 / 上次使用，并**逐条标注**
+       该英雄在版本榜里的名次 —— 逼模型去做交叉，而不是凭印象挑；
+    3. **他的近期表现**（当前状态）：逐场 KDA / GPM 与分路分布。
+
+    模型只负责「挑与解释」：所有数字都由这里给定，提示词里也明确禁止它在
+    榜外推荐或编造胜率。这样即便模型换了一个，结论也不会飘。
+    """
+    board = list(meta_rows[:board_size])
+    board_index = {
+        row["hero_id"]: rank for rank, row in enumerate(meta_rows, start=1)
+    }
+    rows = summarize_hero_history(hero_rows)
+
+    lines: list[str] = []
+    lines.append(
+        "请从下面这份「当前版本强势英雄」榜单里，挑出最适合这位玩家上手的英雄，"
+        "并给出理由。"
+    )
+    lines.append("")
+
+    # ---- 口径 ----
+    lines.append("=== 数据口径 ===")
+    days = int(meta.get("window_days") or 7)
+    lines.append(
+        f"统计窗口: 最近 {days} 天全分段公开对局（滚动窗口，不是严格按补丁切分）"
+    )
+    patch_name = str((patch or {}).get("name") or "")
+    if patch_name:
+        lines.append(f"版本: {patch_name}（OpenDota 记录的最新补丁）")
+    lines.append(f"样本门槛: 单英雄 ≥ {int(meta.get('threshold') or 0)} 场")
+    position = str(meta.get("position") or "")
+    if position:
+        lines.append(f"榜单范围: 已按位置筛选为 {POSITION_LABELS.get(position, position)}")
+    lines.append("")
+
+    # ---- 版本榜 ----
+    lines.append(f"=== 版本强势英雄（按胜率倒序，前 {len(board)} 名）===")
+    lines.append("排名 | 英雄 | 胜率 | 场次 | 主属性 | 官方定位 | 近 3 天走势")
+    for rank, row in enumerate(board, start=1):
+        attr = HERO_ATTR_ZH.get(row.get("attr") or "", row.get("attr") or "-")
+        roles = "/".join(
+            HERO_ROLE_ZH.get(role, role) for role in (row.get("roles") or [])[:3]
+        )
+        trend = row.get("trend")
+        trend_text = "无数据" if trend is None else f"{trend * 100:+.1f} 个百分点"
+        lines.append(
+            f"{rank} | {hero_meta_label(row, heroes)} | {row['winrate'] * 100:.1f}% | "
+            f"{row['pick']} | {attr} | {roles} | {trend_text}"
+        )
+    lines.append("")
+
+    # ---- 玩家 ----
+    lines.append("=== 这位玩家 ===")
+    lines.append(_player_headline(profile_data, account_id, matches))
+    rank_tier = (profile_data or {}).get("rank_tier")
+    if rank_tier:
+        lines.append(f"段位: {rank_text(rank_tier)}")
+    wins = int(wl.get("win") or 0)
+    loses = int(wl.get("lose") or 0)
+    if wins + loses:
+        lines.append(
+            f"生涯总战绩: {wins + loses} 场 · {wins} 胜 {loses} 负 · "
+            f"胜率 {wins / (wins + loses) * 100:.1f}%"
+        )
+    lines.append("")
+
+    # ---- 英雄池（与版本榜交叉标注）----
+    # 时效列用**近期对局现算**的出场次数，不用 /players/{id}/heroes 的
+    # last_played：实测该字段系统性陈旧（池内最新值停在 69 天前，而玩家三天前
+    # 还在打），照抄会让模型以为他「很久没动」，进而把当下最常玩的英雄
+    # 归到「会玩但没怎么用」里。
+    recent_counts, _recent_latest = recent_hero_usage(matches)
+    recent_label = f"近 {len(matches)} 场出场" if matches else "近期出场"
+    lines.append(f"=== 他的英雄池（按场次倒序，前 {pool_size}）===")
+    if rows:
+        lines.append(f"英雄 | 场次 | 胜率 | {recent_label} | 与版本榜的关系")
+        for row in rows[:pool_size]:
+            hero_id = row["hero_id"]
+            rank = board_index.get(hero_id)
+            if rank is None:
+                relation = "不在版本榜内"
+            else:
+                hit = meta_rows[rank - 1]
+                mark = "★" if rank <= board_size else ""
+                relation = f"{mark}版本榜第 {rank} 名（胜率 {hit['winrate'] * 100:.1f}%）"
+            hits = recent_counts.get(hero_id, 0)
+            fresh_text = f"{hits} 次" if hits else "未出现"
+            lines.append(
+                f"{hname(heroes, hero_id)} | {row['games']} | {row['winrate']:.1f}% | "
+                f"{fresh_text} | {relation}"
+            )
+    else:
+        lines.append("（没有查到英雄池数据）")
+    lines.append("")
+
+    # ---- 版本榜 ∩ 他的英雄池 ----
+    # 英雄池表按**场次**截断到前 N。实测的坑：玩家玩过 24 场的版本榜第 1 名
+    # （冥魂大帝）排不进前 20，模型看到的资料里就没有它，于是如实写「无数据」，
+    # 甚至把它归到「没玩过、可以练」—— 而规则版（用完整池）明确写着「玩过 24 场」。
+    # 同一份数据两条链路给出互相矛盾的结论，说明**给的视图不对**。
+    # 所以这里改按**版本榜名次**再列一遍交叉结果：凡是榜内他玩过的都在这里，
+    # 模型不需要在截断的英雄池里碰运气。
+    played = {row["hero_id"]: row for row in rows}
+    crossed = [
+        (rank, row, played[row["hero_id"]])
+        for rank, row in enumerate(board, start=1)
+        if row["hero_id"] in played
+    ]
+    lines.append(f"=== 版本榜前 {len(board)} 名里他玩过的（按版本榜名次排）===")
+    if crossed:
+        lines.append(f"版本排名 | 英雄 | 版本胜率 | 他的场次 | 他的胜率 | {recent_label}")
+        for rank, row, entry in crossed:
+            hits = recent_counts.get(row["hero_id"], 0)
+            fresh_text = f"{hits} 次" if hits else "未出现"
+            games = int(entry["games"])
+            # 1 场 0% 和 1 场 100% 都不是信息，标出来免得模型当成「他不擅长 / 是他的绝活」
+            mine_text = (
+                f"{games}（样本不足）"
+                if games < MIN_HERO_SAMPLE_GAMES
+                else str(games)
+            )
+            # 与上方版本榜用同一个取名口径，免得同一行英雄在两处叫法不一致
+            lines.append(
+                f"{rank} | {hero_meta_label(row, heroes)} | "
+                f"{row['winrate'] * 100:.1f}% | {mine_text} | "
+                f"{entry['winrate']:.1f}% | {fresh_text}"
+            )
+        lines.append(
+            "（这一节是按版本榜列的，与上面「英雄池」表的截断无关；"
+            "没有出现在这一节里的版本榜英雄，他一场都没玩过）"
+        )
+    else:
+        lines.append("（版本榜前若干名里，他一个都没玩过）")
+    lines.append("")
+
+    # ---- 近期表现 ----
+    lines.append(f"=== 他最近 {len(matches)} 场（从最近往前）===")
+    if matches:
+        lines.append("英雄 | 结果 | K/D/A | GPM | 分路 | 时间")
+        for match in matches:
+            try:
+                lane_text = LANE_ROLE_ZH.get(int(match.get("lane_role")), "未知")
+            except (TypeError, ValueError):
+                lane_text = "未知"
+            lines.append(
+                f"{hname(heroes, match.get('hero_id'))} | "
+                f"{'胜' if player_win(match) else '负'} | "
+                f"{match.get('kills', 0)}/{match.get('deaths', 0)}/"
+                f"{match.get('assists', 0)} | "
+                f"{match.get('gold_per_min') or '-'} | {lane_text} | "
+                f"{fmt_timestamp(match.get('start_time'))}"
+            )
+        win_count = sum(1 for match in matches if player_win(match))
+        lines.append(
+            f"近期汇总: {len(matches)} 场 · {win_count} 胜 "
+            f"{len(matches) - win_count} 负 · 胜率 "
+            f"{win_count / len(matches) * 100:.1f}%"
+        )
+        gpm_values = [
+            int(match.get("gold_per_min"))
+            for match in matches
+            if match.get("gold_per_min")
+        ]
+        if gpm_values:
+            lines.append(f"场均 GPM: {sum(gpm_values) / len(gpm_values):.0f}")
+        lines.append(f"分路分布: {_lane_role_text(matches)}")
+    else:
+        lines.append("（没有查到近期对局）")
+    lines.append("")
+
+    lines.append("=== 输出要求 ===")
+    lines.append(HERO_PICK_FORMAT)
+    return "\n".join(lines)
+
+
 def build_single_match_analysis_prompt(
     match: dict,
     heroes: dict[int, dict],
@@ -552,8 +826,13 @@ class OpenAICompatibleClient:
             payload["max_tokens"] = int(max_tokens)
         return payload
 
-    def _request_sync(self, payload: dict) -> str:
-        """同步发一次请求（由 :meth:`chat` 放进线程池执行）。"""
+    def _post_sync(self, payload: dict) -> dict:
+        """同步发一次请求并返回解析好的 JSON 对象。
+
+        由 :meth:`chat` / :meth:`chat_with_tools` 放进线程池执行。
+        拆出这一层是因为**工具的返回体不能只取正文**：``tool_calls``
+        与 ``finish_reason`` 都要读出来做下一步决策。
+        """
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers = {
             "Content-Type": "application/json",
@@ -599,11 +878,15 @@ class OpenAICompatibleClient:
         except json.JSONDecodeError as e:
             raise LLMRequestError(f"返回体不是合法 JSON：{raw[:200]}") from e
 
-        return self.parse_response(data)
+        return data
+
+    def _request_sync(self, payload: dict) -> str:
+        """同步发一次请求并取出正文（由 :meth:`chat` 放进线程池执行）。"""
+        return self.parse_response(self._post_sync(payload))
 
     @staticmethod
-    def parse_response(data: dict) -> str:
-        """从返回体里取出正文，兼容几种常见的字段布局。"""
+    def parse_message(data: dict) -> dict:
+        """从返回体里取出 ``choices[0].message``（不做任何字段裁剪）。"""
         # 有些服务在 200 里塞 error
         if isinstance(data, dict) and data.get("error"):
             err = data["error"]
@@ -615,11 +898,24 @@ class OpenAICompatibleClient:
             raise LLMRequestError(f"返回体里没有 choices：{str(data)[:200]}")
 
         first = choices[0] or {}
-        message = first.get("message") or {}
+        message = first.get("message")
+        if not isinstance(message, dict):
+            # 少数实现把结果放在 delta / text 里
+            message = first.get("delta") if isinstance(first.get("delta"), dict) else {}
+            if not message and first.get("text"):
+                message = {"role": "assistant", "content": first.get("text")}
+        if not isinstance(message, dict):
+            raise LLMRequestError(f"返回体里没有 message：{str(first)[:200]}")
+        return message
+
+    @staticmethod
+    def parse_response(data: dict) -> str:
+        """从返回体里取出正文，兼容几种常见的字段布局。"""
+        message = OpenAICompatibleClient.parse_message(data)
         text = message.get("content")
         if text is None:
-            # 少数实现把结果放在 text / delta 里
-            text = first.get("text") or (first.get("delta") or {}).get("content")
+            # 少数实现把结果放在顶层 text 里（delta 已在 parse_message 里兜过）
+            text = message.get("text")
         if isinstance(text, list):
             # 多模态返回：拼接其中的文本片段
             text = "".join(
@@ -657,3 +953,172 @@ class OpenAICompatibleClient:
             max_tokens=max_tokens,
         )
         return await asyncio.to_thread(self._request_sync, payload)
+
+    # ------------------------------------------------------------------
+    # 工具调用（Function Calling）通道
+    # ------------------------------------------------------------------
+    def build_tool_payload(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        tool_choice: Any = "auto",
+    ) -> dict:
+        """组装带 ``tools`` 的请求体。
+
+        ``messages`` 是**完整的对话历史**（system / user / assistant /
+        tool 四种角色），不由本方法拼装 —— 多轮工具调用的上下文必须原样
+        带着走，少一条消息模型就会重复调工具或答非所问。
+        """
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [dict(m) for m in (messages or [])],
+            "stream": False,
+        }
+        if tools:
+            payload["tools"] = tools
+            if tool_choice is not None:
+                payload["tool_choice"] = tool_choice
+        if temperature is not None:
+            payload["temperature"] = float(temperature)
+        if max_tokens:
+            payload["max_tokens"] = int(max_tokens)
+        return payload
+
+    @staticmethod
+    def parse_tool_reply(data: dict) -> "ToolReply":
+        """把返回体解析成 :class:`ToolReply`（正文 + 工具调用请求）。"""
+        message = OpenAICompatibleClient.parse_message(data)
+        content = message.get("content")
+        if isinstance(content, list):
+            content = "".join(
+                part.get("text", "") for part in content if isinstance(part, dict)
+            )
+        calls: list[ToolCall] = []
+        for item in message.get("tool_calls") or []:
+            if not isinstance(item, dict):
+                continue
+            function = item.get("function")
+            if not isinstance(function, dict):
+                function = {}
+            name = str(function.get("name") or "").strip()
+            if not name:
+                continue
+            raw = function.get("arguments")
+            if not isinstance(raw, str):
+                # 少数实现直接给对象，统一转成字符串，回填时必须原样
+                raw = json.dumps(raw if raw is not None else {}, ensure_ascii=False)
+            calls.append(
+                ToolCall(
+                    id=str(item.get("id") or "").strip(),
+                    name=name,
+                    arguments_raw=raw,
+                )
+            )
+        choices = data.get("choices") if isinstance(data, dict) else None
+        finish = ""
+        if choices and isinstance(choices[0], dict):
+            finish = str(choices[0].get("finish_reason") or "")
+        return ToolReply(
+            content=(content or "").strip(),
+            tool_calls=calls,
+            raw_message=message,
+            finish_reason=finish,
+        )
+
+    async def chat_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        tool_choice: Any = "auto",
+    ) -> "ToolReply":
+        """带工具的一轮对话。
+
+        与 :meth:`chat` 的区别是**返回整个 message**：调用方要看
+        ``tool_calls`` 决定接下来执行哪些工具，执行完再把结果作为
+        ``role=tool`` 的消息追加进 ``messages`` 继续下一轮。
+
+        Raises:
+            LLMRequestError: 缺少 key/model、网络异常或返回体不可解析。
+        """
+        if not self.api_key:
+            raise LLMRequestError("未配置 API Key")
+        if not self.model:
+            raise LLMRequestError("未配置模型名称")
+
+        payload = self.build_tool_payload(
+            messages,
+            tools,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tool_choice=tool_choice,
+        )
+        data = await asyncio.to_thread(self._post_sync, payload)
+        return self.parse_tool_reply(data)
+
+
+@dataclass
+class ToolCall:
+    """模型要求调用的一次工具。"""
+
+    id: str
+    name: str
+    #: 模型给的参数，**原样保留的 JSON 字符串**（回填给模型时必须一字不改）
+    arguments_raw: str = ""
+
+    @property
+    def arguments(self) -> dict:
+        """把参数字符串解析成字典；不是合法 JSON 时返回空字典。"""
+        raw = (self.arguments_raw or "").strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def to_payload(self) -> dict:
+        """转成回填 ``messages`` 用的 assistant 侧结构。"""
+        return {
+            "id": self.id,
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "arguments": self.arguments_raw or "{}",
+            },
+        }
+
+
+@dataclass
+class ToolReply:
+    """一轮带工具的模型回复。"""
+
+    content: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    raw_message: dict = field(default_factory=dict)
+    finish_reason: str = ""
+
+    @property
+    def has_tool_calls(self) -> bool:
+        return bool(self.tool_calls)
+
+    def assistant_message(self) -> dict:
+        """回填进 ``messages`` 的 assistant 消息。
+
+        只保留 ``role`` / ``content`` / ``tool_calls`` 三个字段：部分服务
+        （DeepSeek 的 ``reasoning_content`` 是典型）明确要求**不要把推理
+        内容带回下一轮**，原样回填会被拒或产生莫名其妙的效果。
+        """
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": self.content or "",
+        }
+        if self.tool_calls:
+            message["tool_calls"] = [call.to_payload() for call in self.tool_calls]
+        return message
