@@ -272,6 +272,54 @@ COMPOSITE_INTENT_GROUPS = (
     frozenset({"heroes", "info"}),
 )
 
+#: 「先查出是谁、再为他做点什么」型两步请求的**前半句特征**：在求一个人。
+TWO_STEP_WHO_RE = re.compile(r"谁|哪[个位些]")
+
+#: 两步请求的**后半句特征**：用第三人称承接前半句问出来的那个人。
+#:
+#: ``(?<!其)`` 是为了躲开「其他 / 其余」—— 它们天天出现在群聊里，
+#: 一放开就会把大量单功能问句误判成两步请求。
+THIRD_PARTY_RE = re.compile(r"(?<!其)他|她")
+
+
+def _strong_intents(text: str) -> set[str]:
+    """这句话里**踩到阈值**的意图名（与 :func:`parse` 的打分口径一致）。"""
+    scores = _score_all(text)
+    if extract_match_id(text):
+        scores["match"] = scores.get("match", 0) + 5
+    return {name for name, score in scores.items() if score >= MIN_SCORE}
+
+
+def looks_composite(text: str) -> bool:
+    """这句话是不是**一次要好几件事**（单 label 必然漏答一半）。
+
+    两类信号，命中任一即为复合：
+
+    1. **命中两个以上功能族** —— 「钢板最近打得怎么样，顺便推荐几个轮椅」
+       既要个人战绩又要版本榜。规则打分只能挑一个交出去，挑哪个都漏。
+    2. **两步指代** —— 前半句用疑问词求一个「人」，后半句用「他 / 她」承接：
+       「昨天群里谁输得最惨？给他找两个轮椅让他翻身」。
+
+    第 2 条是**必须的**，不是锦上添花：这类句子里前半句的「谁输得最惨」
+    在关键词表里根本不是一个意图（没有任何关键词命中它），所以只看功能族
+    永远抓不到 —— 而它恰恰是真实用户最常说的那种复合句。换句话说，
+    后来那句「给他…」才是唯一能说明「前面那一问没答完」的线索。
+
+    .. important::
+
+       这是**唯一**的复合判定入口，规则路径与模型路径都必须走它。
+       上一版只在 :func:`parse` 里判，而 ``parse`` 只在「模型没问成」时
+       才被执行 —— 模型正常工作时（``via=llm``）护栏形同虚设，
+       现场日志里复合问题照样被单 label 吃掉。
+    """
+    raw = normalize(text)
+    if not raw:
+        return False
+    if TWO_STEP_WHO_RE.search(raw) and THIRD_PARTY_RE.search(raw):
+        return True
+    strong = _strong_intents(raw)
+    return sum(1 for group in COMPOSITE_INTENT_GROUPS if strong & group) >= 2
+
 #: 分析型问句特征：要的是**结论 / 对比 / 建议**，不是一条指令。
 #: 刻意写得很窄（带上具体搭配），避免误伤「我该怎么改进」这类
 #: 本来就该走 ``analyze`` 指令的说法。
@@ -843,14 +891,18 @@ def parse(text: str) -> Intent | None:
         return None
     best_score = scores[best]
 
-    # 复合问题：一句话里同时要**两件不同的事**（命中两个以上功能族）。
+    # 复合问题：一句话里同时要**两件不同的事**。
     #
     # 「钢板最近打得怎么样，顺便推荐几个轮椅」既要个人战绩、又要版本推荐；
-    # 「看看天鸽的英雄池，再讲讲版本什么英雄强」同理。规则打分只能挑一个
-    # 分高的交出去 —— 无论挑哪个都漏答一半，而且用户完全看不出是漏了。
-    # 返回 None 会把消息交给兜底对话，那边有工具，可以逐项查完再一起回答。
-    strong = {name for name, score in scores.items() if score >= MIN_SCORE}
-    if sum(1 for group in COMPOSITE_INTENT_GROUPS if strong & group) >= 2:
+    # 「昨天群里谁输得最惨？给他找两个轮椅」既要先查出是谁、又要给他推荐。
+    # 规则打分只能挑一个分高的交出去 —— 无论挑哪个都漏答一半，而且用户
+    # 完全看不出是漏了。返回 None 会把消息交给兜底对话，那边有工具，
+    # 可以逐项查完再一起回答。
+    #
+    # 判据本身在 :func:`looks_composite`（模型路径也用同一份，见 main 的
+    # ``_nlu_sanitize_llm_intent``）—— **两条路径必须共用同一个判定**，
+    # 各写一份一定会漂移。
+    if looks_composite(raw):
         return None
 
     # 「刚才那把…」「这把…」这种只有指代、没有任何「要看」的动作词，
@@ -1277,9 +1329,12 @@ def build_classifier_prompt(
             "说「我 / 自己 / 给我 / 帮我」时 target 填「我」，只问榜单、没提人就留空。"
             "「辅助 / 核心 / 中单 / 三号位」这类是位置词，**不要**填进 target。\n"
             "5. 一句话里**同时要好几件事**（例如「钢板最近打得怎么样，顺便给他推荐几个轮椅」"
-            "既要战绩又要英雄推荐；「看看大家谁强，再看版本榜」既要对比又要榜单）→ "看
-            "**不要**只挑一个功能填，一律填 none：插件那边会带着工具逐项查完再一起回答，"
-            "只填一个反而会漏答一半。\n"
+            "既要战绩又要英雄推荐；「昨天群里谁输得最惨？给他找两个轮椅让他翻身」"
+            "既要先查出是谁、又要给他推荐）→ **不要**只挑一个功能填，一律填 none："
+            "插件那边会带着工具逐项查完再一起回答，只填一个反而会漏答一半。\n"
+            "5b. 判断「要好几件事」的一个可靠信号：后半句用**他 / 她**承接前半句"
+            "问出来的那个人（「谁输得最惨？**给他**找两个轮椅」）。只要出现这种"
+            "「先问是谁、再为 TA 做事」的结构，就是两件事，一律填 none。\n"
             "6. match_id / count 没有就填 0，target 没有就填空字符串。\n"
         )
         parts.append(

@@ -1912,11 +1912,28 @@ class Dota2Plugin(Star):
 
         模型再聪明也会犯错，而有些错误的代价不对称：
 
+        * **判成复合问题里的一半**。「昨天群里谁输得最惨？给他找两个轮椅让他
+          翻身」被判成 wheelchair —— 前半句「谁输得最惨」被静默丢掉，而且
+          因为句子里没点名玩家，连轮椅都是不带人的通用榜单。这类句子必须
+          整条交给兜底对话逐项查，不能只执行一半 ⇒ 整个丢弃；
         * 把「对比一下监听的几个人谁最菜」判成「添加监听」→ 会真的往监听
           列表里加人，是改数据的动作，宁可交给闲聊兜底 ⇒ 整个丢弃；
         * 凭空编一个比赛 ID → 会去查一场不存在的比赛。这种**只丢 ID**，
           意图本身保留，后面的语境解析（推送过 / 复盘过的那一场）还能救回来。
+
+        .. important::
+
+           复合判定（:func:`dota_nlu.looks_composite`）**必须放在这里**，
+           不能只放在 :func:`dota_nlu.parse` 里 —— ``parse`` 只在「模型没问成」
+           时才执行，而实际跑的是模型路径（日志里的 ``via=llm``）。
+           上一版把护栏加在规则层，结果就是现场照样漏答。
         """
+        if dota_nlu.looks_composite(text or ""):
+            logger.info(
+                f"[dota2] 自然语言：复合问题（模型判为 {intent.name}），"
+                "单个功能覆盖不全，改交给兜底对话逐项查"
+            )
+            return True
         if intent.name in {"bind", "unbind", "watch", "unwatch"} and (
             dota_nlu.ANALYSIS_QUESTION_RE.search(text or "")
         ):
@@ -2177,10 +2194,15 @@ class Dota2Plugin(Star):
                     )
                     tool_ctx.trace.append(f"{call.name}(跳过：超过上限)")
                 else:
+                    # 被短路的工具（同一工具已连续失败到上限）是零成本的，
+                    # **不占配额** —— 数据源挂掉时前几次短路要是把预算吃光，
+                    # 还能用的工具就轮不上了，用户白等一场。
+                    counted = not dota_tools.is_disabled(call.name, tool_ctx)
                     result = await dota_tools.run_tool(
                         call.name, call.arguments_raw, tool_ctx
                     )
-                    used += 1
+                    if counted:
+                        used += 1
                 messages.append(
                     {"role": "tool", "tool_call_id": call.id, "content": result}
                 )

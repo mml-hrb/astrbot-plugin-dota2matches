@@ -74,6 +74,18 @@ DEFAULT_TOOL_TIMEOUT = 30.0
 #: 战绩类工具一次最多取多少场
 MAX_MATCHES_PER_CALL = 50
 
+#: 同一个工具**连续失败**多少次之后就不再真的执行、直接短路。
+#:
+#: 起因是一次真实故障（2026-09-18，OpenDota 大面积 521/500）：模型为了回答
+#: 「昨天群里谁输得最惨」逐个玩家调 `query_matches`，6 个人各超时 30 秒，
+#: 合计沉默 194 秒，还把调用预算烧光，导致真正想要的 `recommend_heroes`
+#: 一次都没轮到。数据源整体挂掉时，重试同一个工具不会有任何新结果 ——
+#: 必须让它**快速失败并说清楚**，把剩下的预算留给别的工具。
+#:
+#: 取 2 而不是 1：单次失败可能只是这一个账号 / 这一次网络抖动，
+#: 立刻禁用会让一次偶发失败白白废掉一个工具。
+MAX_TOOL_FAILURES = 2
+
 
 @dataclass
 class ToolContext:
@@ -100,6 +112,10 @@ class ToolContext:
     timeout: float = DEFAULT_TOOL_TIMEOUT
     #: 工具调用日志（每次调用追加一条，供排障取证）
     trace: list[str] = field(default_factory=list)
+    #: 各工具**连续**失败次数（成功即清零），用于 :data:`MAX_TOOL_FAILURES`
+    #: 的短路判断。放在 context 上而不是模块全局：一次提问一个实例，
+    #: 上一轮问答的失败不该影响下一轮。
+    failures: dict[str, int] = field(default_factory=dict)
 
 
 # ======================================================================
@@ -396,25 +412,59 @@ _DISPATCH: dict[str, Callable[[dict, ToolContext], Awaitable[str]]] = {
 }
 
 
+def is_disabled(name: str, ctx: ToolContext) -> bool:
+    """这个工具是否已因**连续失败**被短路。
+
+    短路的调用是「零成本」的（不发任何请求），因此调用方**不该**把它算进
+    ``nlu_chat_tool_max_calls`` 配额 —— 否则数据源挂掉时，几次短路就把预算
+    吃光，真正还能用的工具反而轮不上。
+    """
+    return ctx.failures.get(str(name or "").strip(), 0) >= MAX_TOOL_FAILURES
+
+
 async def run_tool(name: str, arguments: Any, ctx: ToolContext) -> str:
     """执行一个工具。
 
     **永不抛异常**：任何失败都转成一段可读的说明回填给模型 ——
     工具挂掉不该让整条回答消失，模型可以基于「这块没拿到」继续作答。
     返回文本统一截断到 :data:`MAX_OUTPUT_CHARS`。
+
+    同一个工具**连续失败**到 :data:`MAX_TOOL_FAILURES` 次后会被**短路**：
+    不再真的执行，直接回一句「数据源本次不可用，别再调它了」。这一条是
+    为了止血 —— 没有它，数据源整体挂掉时模型会逐个玩家重试同一个工具，
+    6 个人各等 30 秒超时，用户要盯着三分钟没有任何动静。
     """
     tool = _DISPATCH.get(str(name or "").strip())
     if tool is None:
         return f"[未知工具 {name}] 插件没有这个工具，请改用清单里的工具。"
+
+    # 短路：这个工具已经连续失败太多次，再试一次也不会有新结果。
+    # 明确告诉模型「别再调了」，否则它会一直重试到轮数 / 次数用尽。
+    if is_disabled(name, ctx):
+        ctx.trace.append(f"{name}(短路：已连续失败 {MAX_TOOL_FAILURES} 次)")
+        return (
+            f"[{name} 本次不可用] 这个工具已经连续失败 {MAX_TOOL_FAILURES} 次，"
+            "多半是数据源整体不可用，**不要再调用它**。"
+            "请基于已经拿到的数据作答，并如实说明哪部分没取到。"
+        )
+
     args = parse_arguments(arguments)
     started = asyncio.get_running_loop().time()
+    failed = False
     try:
         text = await tool(args, ctx)
     except asyncio.TimeoutError:
+        failed = True
         text = f"[{name} 查询超时] 数据源响应太慢，这块数据这次没取到。"
     except Exception as e:  # noqa: BLE001 - 工具失败不该打断回答
+        failed = True
         logger.warning(f"[dota2] 兜底工具 {name} 执行失败: {e}")
         text = f"[{name} 执行失败] {type(e).__name__}: {str(e)[:120]}"
+    if failed:
+        ctx.failures[name] = ctx.failures.get(name, 0) + 1
+    else:
+        # 成功即清零：失败计数说的是「连续」，一次成功就说明工具本身没坏
+        ctx.failures.pop(name, None)
     elapsed = asyncio.get_running_loop().time() - started
     out = _truncate(text)
     ctx.trace.append(f"{name}({_brief_args(args)}) {elapsed:.1f}s {len(out)}字")
@@ -444,11 +494,18 @@ TOOL_GUIDE = """=== 你可以调用工具查真实数据 ===
 3. 工具返回的就是插件的真实数据。**只讲工具给过的内容**，不要补充记忆里的
    战绩、段位、数字；工具报错或明确说没取到，就如实说这块没拿到。
 4. **不要重复调用**同一个工具同一组参数；信息够了就停止调用，直接回答。
-5. 工具查不到「谁跟谁一起开黑」这类**关系型**结论：同场开黑只能从同一场比赛里
+5. **多人横向对比（「谁最惨 / 谁最强 / 昨天谁打得好」）不要逐个调 `query_matches`**：
+   上面上下文里的「近期战绩快照」与「横向对比」已经**按时间窗口**统计好了每个人，
+   直接用它们下判断。只有当上下文里**确实没有**某个人、或明确标了「没取到」而你
+   还需要他时，才为那一个人单独查一次。逐个查六个人会让用户干等好几分钟，
+   答案并不会更准。
+6. 工具回「本次不可用 / 已经连续失败」时就**别再调它了**，换别的数据或直接作答 ——
+   那说明数据源整体有问题，重试不会有新结果。
+7. 工具查不到「谁跟谁一起开黑」这类**关系型**结论：同场开黑只能从同一场比赛里
    出现两人以上来判断，而工具是单人视角。要回答开黑问题就用上面上下文里的
    「同场局」信息。
-6. 工具里**没有**绑定、解绑、加监听这类会改数据的操作。用户要这些就直接告诉他
+8. 工具里**没有**绑定、解绑、加监听这类会改数据的操作。用户要这些就直接告诉他
    用 `/d2 绑定 …`、`/d2 监听 …` 指令。
-7. 单场复盘（要比赛 ID 的那种）也不在工具里：它可能要等解析好几分钟，
+9. 单场复盘（要比赛 ID 的那种）也不在工具里：它可能要等解析好几分钟，
    请让用户直接说「复盘 <比赛ID>」由指令处理。
 """
