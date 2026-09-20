@@ -3937,6 +3937,12 @@ class Dota2Plugin(Star):
         if verb == "list":
             yield event.plain_result(await self._schedule_list_text(umo))
             return
+        if verb == "clear":
+            yield event.plain_result(await self._schedule_clear(umo))
+            return
+        if verb == "update":
+            yield event.plain_result(await self._schedule_update(rest, umo))
+            return
         if verb in {"delete", "disable", "enable", "run"}:
             yield event.plain_result(await self._schedule_control(verb, rest, umo))
             return
@@ -4098,10 +4104,16 @@ class Dota2Plugin(Star):
         return None
 
     async def _schedule_control(self, verb: str, rest: str, umo: str) -> str:
-        """处理「删 / 停 / 开 / 现在 <编号>」。"""
+        """处理「删 / 停 / 开 / 现在 <编号>」。
+
+        ``rest`` 为 :data:`dota_schedule.ALL_TOKEN` 时对**本会话的全部**任务生效
+        （「取消所有定时任务」「把任务都删了」）。
+        """
         items = await self._schedule_items(umo)
         if not items:
             return "本会话还没有定时任务。\n\n" + self._schedule_hint()
+        if rest == dota_schedule.ALL_TOKEN:
+            return await self._schedule_control_all(verb, items, umo)
         index = self._schedule_lookup(items, rest)
         if index is None:
             return (
@@ -4110,53 +4122,200 @@ class Dota2Plugin(Star):
                 f"先看一眼：`{self._nlu_keyword()} 定时 列表`"
             )
         kind, row = items[index - 1]
+        ok, text = await self._apply_control(verb, kind, row, umo)
+        return text
+
+    async def _schedule_control_all(
+        self, verb: str, items: list[tuple[str, dict]], umo: str
+    ) -> str:
+        """对全部任务执行同一个动作，并把结果逐条列出来。
+
+        只动**本会话**的任务：列表与编号本来就是本会话口径，从 A 群一条
+        指令删掉 B 群的任务既不直观也很危险（那边的人看着任务凭空消失）。
+        其他会话还有任务时明确提示一句，免得用户以为「所有」是字面意思。
+        """
+        acted: list[str] = []
+        failed: list[str] = []
+        for kind, row in items:
+            ok, text = await self._apply_control(verb, kind, row, umo)
+            if ok:
+                acted.append(text)
+            else:
+                failed.append(text)
+        if verb == "delete":
+            head = f"🗑 本会话的 {len(acted)} 个定时任务都删掉了。"
+        elif verb == "disable":
+            head = f"⏸ 停用了 {len(acted)} 个定时任务。"
+        elif verb == "enable":
+            head = f"▶️ 启用了 {len(acted)} 个定时任务。"
+        else:
+            head = f"▶️ 触发了 {len(acted)} 个定时任务。"
+        parts = [head]
+        parts.extend(acted)
+        if failed:
+            parts.extend(failed)
+        others = await self._schedule_other_session_count(umo)
+        if others:
+            parts.append(
+                f"（另有 {others} 个任务属于别的会话，请在对应会话里管理）"
+            )
+        logger.info(
+            f"[dota2] 定时任务批量操作 {verb}：成功 {len(acted)} 个，失败 {len(failed)} 个"
+        )
+        return "\n".join(parts)
+
+    async def _schedule_other_session_count(self, umo: str) -> int:
+        """本插件在**其他会话**里的定时任务数（只用于提示，不做任何修改）。"""
+        count = 0
+        try:
+            for job in await self.schedules.list_owned():
+                payload = getattr(job, "payload", None)
+                payload = payload if isinstance(payload, dict) else {}
+                session = str(payload.get("session") or "")
+                if session and session != umo:
+                    count += 1
+        except Exception as e:  # noqa: BLE001 - 只是提示，失败不该影响结果
+            logger.debug(f"[dota2] 统计其他会话的定时任务失败（可忽略）：{e}")
+        for row in self.store.list_count_tasks():
+            if str(row.get("umo") or "") not in ("", umo):
+                count += 1
+        return count
+
+    async def _apply_control(
+        self, verb: str, kind: str, row: dict, umo: str
+    ) -> tuple[bool, str]:
+        """执行一个动作，返回 ``(是否成功, 文案)``。"""
         if kind == "cron":
             return await self._schedule_control_cron(verb, row)
         return await self._schedule_control_count(verb, row, umo)
 
-    async def _schedule_control_cron(self, verb: str, row: dict) -> str:
+    async def _schedule_clear(self, umo: str) -> str:
+        """清空本会话的全部定时任务。"""
+        items = await self._schedule_items(umo)
+        if not items:
+            return "本会话本来就没有定时任务。"
+        return await self._schedule_control_all("delete", items, umo)
+
+    async def _schedule_update(self, rest: str, umo: str) -> str:
+        """给已有任务改执行时间。
+
+        两种说法都认：带编号的（``改 2 到早上八点``）和整句人话的
+        （``把这个定时任务的执行时间改到早上七点``）—— 后者没说是哪一个，
+        只有**本会话仅有一个任务**时才敢猜。
+        """
+        items = await self._schedule_items(umo)
+        if not items:
+            return "本会话还没有定时任务，没什么可改的。\n\n" + self._schedule_hint()
+
+        token, text = dota_schedule.split_update_target(rest)
+        index = self._schedule_lookup(items, token) if token else None
+        if index is None:
+            if token:
+                return (
+                    f"列表里没有编号 {token} 的任务（当前 1~{len(items)}）。\n"
+                    f"先看一眼：`{self._nlu_keyword()} 定时 列表`"
+                )
+            if len(items) > 1:
+                return (
+                    f"要改哪一个？请带上编号，例如「{self._nlu_keyword()} 定时 改 2 早上八点」。\n"
+                    f"先看一眼：`{self._nlu_keyword()} 定时 列表`"
+                )
+            index = 1
+        kind, row = items[index - 1]
+        if kind != "cron":
+            every = max(1, int(row.get("every") or dota_schedule.DEFAULT_EVERY))
+            return (
+                f"「每 {every} 场总结」是按场次触发的，没有执行时间可改。"
+                f"想改触发场次就删掉重建（`{self._nlu_keyword()} 定时 删 {index}`）。"
+            )
+
+        # 先按完整时间表达解（「改成每天晚上十点」连频率一起改）；
+        # 解不出就只取钟点，把钟点换进原来的 cron（「改到早上七点」——
+        # 频率沿用原来的，不能变成每天都响）。
+        spec = dota_schedule.parse_time_spec(
+            text, default_time=self._schedule_default_time()
+        )
+        if spec is not None and spec.cron:
+            new_cron = str(spec.cron)
+        else:
+            clock = dota_schedule.parse_clock(text)
+            if clock is None:
+                return (
+                    "没看出你想改成几点。这样说："
+                    f"`{self._nlu_keyword()} 定时 改 {index} 早上八点`，"
+                    "或直接说「把这个定时任务改到每天早上七点」。"
+                )
+            new_cron = dota_schedule.retime_cron(
+                str(row.get("cron") or ""), clock.hour, clock.minute
+            )
+
+        job_id = str(row.get("job_id") or "")
+        action = str(row.get("action") or "")
+        session_text = dota_schedule.session_label(umo)
+        # 任务名里带时刻，必须一起改，否则列表/WebUI 上显示的仍是旧时刻
+        ok = await self.schedules.set_cron(
+            job_id,
+            new_cron,
+            name=dota_schedule.job_name(action, new_cron),
+            description=dota_schedule.job_note(
+                action, new_cron, session_label=session_text
+            ),
+        )
+        if not ok:
+            return "⚠️ 改时间失败，原因见日志。"
+        logger.info(
+            f"[dota2] 定时任务 {row.get('schedule_id') or job_id} 执行时间改为 {new_cron}"
+        )
+        return (
+            f"✅ 改好了：{dota_schedule.cron_label(new_cron)}\n"
+            f"· 下次执行：{self.schedules.next_run_text_by_id(job_id, self._schedule_timezone())}"
+        )
+
+    async def _schedule_control_cron(self, verb: str, row: dict) -> tuple[bool, str]:
         job_id = str(row.get("job_id") or "")
         name = str(row.get("name") or "定时任务")
         if verb == "delete":
             ok = await self.schedules.delete(job_id)
-            return f"🗑 已删除：{name}" if ok else "⚠️ 删除失败，原因见日志。"
+            return (ok, f"🗑 已删除：{name}" if ok else "⚠️ 删除失败，原因见日志。")
         if verb == "disable":
             ok = await self.schedules.set_enabled(job_id, False)
             return (
-                f"⏸ 已停用：{name}\n（想恢复：`{self._nlu_keyword()} 定时 开 <编号>`）"
+                (ok, f"⏸ 已停用：{name}")
                 if ok
-                else "⚠️ 停用失败，原因见日志。"
+                else (False, f"⚠️ 停用失败：{name}，原因见日志。")
             )
         if verb == "enable":
             ok = await self.schedules.set_enabled(job_id, True)
-            return f"▶️ 已启用：{name}" if ok else "⚠️ 启用失败，原因见日志。"
+            return (ok, f"▶️ 已启用：{name}" if ok else f"⚠️ 启用失败：{name}，原因见日志。")
         ok = await self.schedules.run_now(job_id)
         return (
-            f"▶️ 已立即执行一次：{name}\n（结果会直接发到本会话，稍等片刻）"
+            (True, f"▶️ 已立即执行一次：{name}")
             if ok
-            else "⚠️ 执行失败，原因见日志。"
+            else (False, f"⚠️ 执行失败：{name}，原因见日志。")
         )
 
-    async def _schedule_control_count(self, verb: str, row: dict, umo: str) -> str:
+    async def _schedule_control_count(
+        self, verb: str, row: dict, umo: str
+    ) -> tuple[bool, str]:
         task_id = str(row.get("id") or "")
         every = max(1, int(row.get("every") or dota_schedule.DEFAULT_EVERY))
         label = f"每 {every} 场总结"
         if verb == "delete":
             ok = await self.store.remove_count_task(task_id)
-            return f"🗑 已删除：{label}" if ok else "⚠️ 删除失败。"
+            return (ok, f"🗑 已删除：{label}" if ok else f"⚠️ 删除失败：{label}")
         if verb == "disable":
             ok = await self.store.set_count_task_enabled(task_id, False)
-            return f"⏸ 已停用：{label}" if ok else "⚠️ 停用失败。"
+            return (ok, f"⏸ 已停用：{label}" if ok else f"⚠️ 停用失败：{label}")
         if verb == "enable":
             ok = await self.store.set_count_task_enabled(task_id, True)
-            return f"▶️ 已启用：{label}" if ok else "⚠️ 启用失败。"
+            return (ok, f"▶️ 已启用：{label}" if ok else f"⚠️ 启用失败：{label}")
         # 「现在」：用已经攒下的场次先出一份，**不清空窗口**
         # （它是预览，不该把用户攒的场次吃掉）
         seen = len(list(row.get("seen") or []))
         if seen < 1:
-            return f"「{label}」还没攒到任何场次，现在没东西可总结。"
+            return (False, f"「{label}」还没攒到任何场次，现在没东西可总结。")
         self._spawn_summary_task(task_id, umo, every, force=True)
-        return f"▶️ 正在用已攒的 {seen} 场生成总结，稍后发到本会话。"
+        return (True, f"▶️ 正在用已攒的 {seen} 场生成总结，稍后发到本会话。")
 
     # ------------------------------------------------------------------
     # 确认与创建

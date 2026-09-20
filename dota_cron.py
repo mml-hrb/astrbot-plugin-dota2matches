@@ -150,15 +150,20 @@ class CronBridge:
         直接当本地时间显示会差 8 小时。同时读一次调度器里的实时值：
         ``add_*_job`` 写库是 fire-and-forget 的，刚建完那一刻库里可能还是 None。
         """
+        return self.next_run_text_by_id(str(getattr(job, "job_id", "")), timezone, job)
+
+    def next_run_text_by_id(
+        self, job_id: str, timezone: str = "", job: Any = None
+    ) -> str:
+        """:meth:`next_run_text` 的「只有 job_id」版本（改完时间后查下一次）。"""
         value = None
         mgr = self.manager
-        job_id = str(getattr(job, "job_id", ""))
         if mgr is not None and job_id:
             try:
-                value = mgr.get_next_run_time(job_id)
+                value = mgr.get_next_run_time(str(job_id))
             except Exception:  # noqa: BLE001 - 老版本没有这个方法
                 value = None
-        if value is None:
+        if value is None and job is not None:
             value = getattr(job, "next_run_time", None)
         if value is None:
             return "未知"
@@ -244,6 +249,38 @@ class CronBridge:
             return await mgr.update_job(str(job_id), enabled=bool(enabled)) is not None
         except Exception as e:  # noqa: BLE001
             logger.error(f"[dota2] 修改定时任务 {job_id} 的启用状态失败：{e}")
+            return False
+
+    async def set_cron(
+        self,
+        job_id: str,
+        cron_expression: str,
+        *,
+        name: str = "",
+        description: str = "",
+    ) -> bool:
+        """改执行时间（顺带同步任务名 / 说明里的时刻）。
+
+        和 :meth:`set_enabled` 同理必须走 ``update_job``：``delete + create``
+        会换 ``job_id``，而 ``basic`` 任务的 handler 是**按 job_id 绑**在
+        ``CronJobManager._basic_handlers`` 里的，换了 id 之后任务就不再执行
+        （用户会看到「时间改了，但到点什么都不发生」）。
+
+        名字里带着时刻（``Dota2 · 每天 10:10 · 通报群里战绩情况``），所以必须
+        一起改：只改 cron 不改名字的话，列表与 WebUI 里显示的还是旧时刻。
+        """
+        mgr = self.manager
+        if mgr is None or not job_id or not cron_expression:
+            return False
+        kwargs: dict[str, Any] = {"cron_expression": str(cron_expression)}
+        if name:
+            kwargs["name"] = str(name)
+        if description:
+            kwargs["description"] = str(description)
+        try:
+            return await mgr.update_job(str(job_id), **kwargs) is not None
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[dota2] 修改定时任务 {job_id} 的执行时间失败：{e}")
             return False
 
     async def run_now(self, job_id: str) -> bool:

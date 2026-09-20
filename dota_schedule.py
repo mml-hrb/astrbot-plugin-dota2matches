@@ -613,6 +613,24 @@ def task_note(request: TaskRequest, *, session_label: str = "") -> str:
     return f"Dota2 定时任务{where}：{request.describe()}。"
 
 
+def job_name(action: str, cron: str) -> str:
+    """由「动作 + cron」还原任务名（改时间后名字里的时刻要跟着变）。
+
+    任务名里带着时刻（``Dota2 · 每天 10:10 · 通报群里战绩情况``），
+    改了执行时间却不改名字的话，用户看列表/WebUI 时看到的还是旧时刻，
+    会以为没改成功。
+    """
+    label = ACTION_LABELS.get(action, action)
+    return f"Dota2 · {cron_label(cron)} · {label}"
+
+
+def job_note(action: str, cron: str, *, session_label: str = "") -> str:
+    """由「动作 + cron」还原任务说明（改时间后要一起同步）。"""
+    where = f"（{session_label}）" if session_label else ""
+    label = ACTION_LABELS.get(action, action)
+    return f"Dota2 定时任务{where}：{cron_label(cron)} —— {label}。"
+
+
 # ======================================================================
 # 列表渲染
 # ======================================================================
@@ -667,7 +685,11 @@ def format_task_list(
 
     lines.append(f"删除：`{keyword} 定时 删 <编号>`")
     lines.append(f"停用 / 启用：`{keyword} 定时 停 <编号>` / `{keyword} 定时 开 <编号>`")
+    lines.append(f"改时间：`{keyword} 定时 改 <编号> 早上八点`")
     lines.append(f"立刻执行一次：`{keyword} 定时 现在 <编号>`")
+    lines.append(f"全部删掉：`{keyword} 定时 删 全部`")
+    lines.append("")
+    lines.append("也可以直接说人话：「取消所有定时任务」「把 2 号删掉」。")
     return "\n".join(lines)
 
 
@@ -778,8 +800,12 @@ CONTROL_WORDS: dict[str, str] = {
     "list": "list",
     "ls": "list",
     "查看": "list",
+    "看": "list",
+    "看看": "list",
     "删": "delete",
     "删除": "delete",
+    "取消": "delete",
+    "撤销": "delete",
     "del": "delete",
     "移除": "delete",
     "停": "disable",
@@ -797,19 +823,230 @@ CONTROL_WORDS: dict[str, str] = {
 }
 
 
+#: 「整批操作」的占位编号：把动作作用到本会话的**全部**任务上。
+#: 它不可能和真实编号撞车（编号是数字或短 ID），所以直接当哨兵值用。
+ALL_TOKEN = "*"
+
+#: 指令别名。自然语言入口把用户原话**整句**交给指令实现（见
+#: ``main.d2_natural`` 里的 ``intent.args = effective``），句首往往还留着
+#: 用户自己打的指令名。必须先剥掉再解析，否则会出**语义反转**的事故。
+SCHEDULE_ALIASES: tuple[str, ...] = (
+    "定时任务", "定时", "任务", "计划", "schedule", "cron", "d2",
+)
+
+#: 提到「定时任务」这件事本身的名词。整批操作（「都删了」）必须句子里有它，
+#: 否则「删除所有监听」会被误认成「删掉所有定时任务」。
+_SCHEDULE_NOUNS = ("定时", "任务", "计划")
+
+#: 范围词：出现它才可能是在说「全部」。
+_BULK_SCOPE_RE = re.compile(r"所有|全部|一切|全都|统统|都|全")
+
+#: 「动词在前、名词在后」的句子（「取消定时任务」「看一下所有计划」）里，
+#: 这些词只是把话说圆；剥掉之后剩下的才是真正的动作词。
+_FILLER_WORDS: tuple[str, ...] = (
+    "定时任务", "定时", "任务", "计划", "schedule",
+    "所有", "全部", "一切", "全都", "统统",
+    "一下", "我的", "本群的", "帮我", "帮忙", "给我", "请", "麻烦", "把",
+    "这个", "那个", "这些", "那些", "该",
+    "的", "了", "吧", "啦", "啊", "哦", "嘛", "呀",
+)
+
+#: :func:`normalize_target` 专用的填充词：**故意不含**「这个 / 那个」——
+#: 「删 这个」指的是某一个（只是没说明白），当成「全删」会误伤；
+#: 而「删 定时任务」里的名词确实只是把话说圆，可以直接归到「全部」。
+_TARGET_FILLER: tuple[str, ...] = (
+    "定时任务", "定时", "任务", "计划", "schedule",
+    "所有", "全部", "一切", "全都", "统统",
+    "一下", "我的", "本群的", "帮我", "帮忙", "给我", "请", "麻烦", "把",
+    "的", "了", "吧", "啦", "啊", "哦", "嘛", "呀",
+)
+
+#: 批量动作词：动作名 → 词表。顺序有意义（先删、再停、最后开）。
+_BULK_VERBS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("delete", ("清空", "清掉", "清理掉", "删除", "删掉", "移除", "取消", "撤销", "删")),
+    ("disable", ("停用", "暂停", "停掉", "关闭", "关掉", "停")),
+    ("enable", ("启用", "开启", "打开", "恢复", "开")),
+)
+
+#: 「光说动作、不带编号」也算整批的说法（「取消定时任务」「清空」）。
+_BARE_BULK_VERBS = frozenset(
+    {"删", "删除", "清空", "清掉", "移除", "取消", "撤销", "停", "停用", "暂停", "启用", "恢复", "开"}
+)
+
+#: 改时间的动词与必须伴随的时间词。
+_UPDATE_VERB_RE = re.compile(r"改到|改成|改为|改一下|改下|调整|调到|调成|换到|换成|修改|改")
+_UPDATE_TIME_RE = re.compile(r"时间|时刻|钟点|几点|[点时:：]")
+
+#: 「把 2 号删掉」——编号在前、动作在后。
+_TRAILING_INDEX_RE = re.compile(
+    r"\s*(?:把|请|帮我|帮忙|麻烦)?\s*(?:第)?\s*(?P<idx>[0-9]{1,2})\s*号?(?:个)?\s*(?:的)?\s*"
+    r"(?:定时任务|定时|任务|计划)?\s*"
+    r"(?P<verb>删掉|删除|删|移除|取消|撤销|停用|暂停|停掉|启用|开启|恢复|执行|跑一次)"
+    r"\s*(?:了|掉|吧|啦|啊|呗)?\s*"
+)
+
+#: 改时间句子里要抹掉的噪声词（**不能**把时间表达本身抹掉）。
+_UPDATE_NOISE: tuple[str, ...] = (
+    "执行时间", "运行时间", "触发时间", "提醒时间",
+    "定时任务", "定时", "任务", "计划",
+    "把那个", "把这个", "帮我", "帮忙", "给我", "麻烦",
+    "这个", "那个", "该", "它的", "其", "以后", "从明天起", "改成", "改到", "改为",
+    "调整到", "调整为", "调整", "调到", "调成", "换到", "换成", "修改", "改一下", "改下",
+    "时间", "时刻", "一下", "下", "把", "的", "为", "到", "成",
+)
+
+
+def _strip_filler(text: str, words: tuple[str, ...] = _FILLER_WORDS) -> str:
+    """把填充词剥掉，剩下的通常是真正的动作词。"""
+    out = str(text or "")
+    for word in sorted(words, key=len, reverse=True):
+        out = out.replace(word, "")
+    return re.sub(r"[\s，。、,.;；!！?？:：]+", "", out)
+
+
+def _strip_alias(text: str) -> str:
+    """剥掉句首的指令名与标点（「定时 删 1」→「删 1」）。
+
+    自然语言入口不解析参数，而是把整句原话交给指令实现。用户说
+    「dota2助手 定时 删 1」时，落到 ``d2_schedule`` 的 args 就是
+    「定时 删 1」—— 句首还留着指令名。**不剥掉就会出语义反转的事故**：
+    控制词解析扑空 → 整句被当成「新建任务」的人话 → 用户说「删」，
+    插件却在准备「建」。
+    """
+    body = str(text or "").strip().lstrip("，。、,.;；!！?？ \t")
+    changed = True
+    while changed and body:
+        changed = False
+        for word in sorted(SCHEDULE_ALIASES, key=len, reverse=True):
+            if not body.lower().startswith(word):
+                continue
+            rest = body[len(word):]
+            # 只有「别名后面紧跟分隔符或就到头」才敢剥。否则
+            # 「任务完成时提醒我」会被剥成「完成时提醒我」——另一句话了。
+            if rest[:1] in ("", " ", "，", "。", "、", ",", ":", "：", "\t"):
+                body = rest.strip().lstrip("，。、,.;；!！?？ \t")
+                changed = True
+                break
+    return body
+
+
+def _parse_bulk(raw: str) -> str | None:
+    """「全部 / 所有」这类整批操作；不是整批返回 ``None``。"""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    has_noun = any(noun in text for noun in _SCHEDULE_NOUNS)
+    forced = bool(re.search(r"清空|清掉|清理掉", text))
+    has_scope = bool(_BULK_SCOPE_RE.search(text))
+    verb_text = _strip_filler(text)
+    if not (has_scope or forced or verb_text in _BARE_BULK_VERBS):
+        return None
+    for verb, words in _BULK_VERBS:
+        for word in words:
+            if word in text:
+                # 范围词 + 动作词还不够：「删除所有监听」两者都有，但说的是
+                # 监听不是任务。必须同时提到「定时 / 任务 / 计划」，或者
+                # 明确说了「清空」、整句只剩一个光杆动作词。
+                if has_noun or forced or verb_text in _BARE_BULK_VERBS:
+                    return verb
+                return None
+    return None
+
+
+def _looks_like_update(raw: str) -> bool:
+    """这句话是不是在给**已有任务**改时间。"""
+    text = str(raw or "").strip()
+    if not text or not _UPDATE_VERB_RE.search(text):
+        return False
+    if _UPDATE_TIME_RE.search(text):
+        return True
+    # 「改 1 到八点」「把 2 号改成晚上十点」没写「时间」两个字，但给了编号 ——
+    # 这是配合列表编号的另一种常见说法。要求动词后面**紧跟着编号**，
+    # 免得「改一下通报内容」也被认成改时间。
+    return bool(re.search(r"(改|调|换|调整|修改)\s*(?:第)?\s*[0-9]{1,2}\s*号?\s*(到|成|为)?", text))
+
+
+def split_update_target(text: str) -> tuple[str, str]:
+    """拆出「改时间」请求里的 ``(编号, 剩下的时间表达)``；没给编号返回空串。"""
+    body = str(text or "").strip()
+    index = ""
+    head_match = re.match(r"^(?:把)?\s*(?:第)?\s*([0-9]{1,2})\s*号?\s*", body)
+    if head_match:
+        index = head_match.group(1)
+        body = body[head_match.end():]
+    else:
+        mid = re.search(
+            r"^(?:把)?\s*(改|调整|修改|换)\s*(?:第)?\s*([0-9]{1,2})\s*号?\s*(?:到|成|为)?\s*",
+            body,
+        )
+        if mid:
+            index = mid.group(2)
+            body = body[mid.end():]
+    clean = body
+    for word in sorted(_UPDATE_NOISE, key=len, reverse=True):
+        clean = clean.replace(word, "")
+    return index, clean.strip(" ，。、,.;；!！?？")
+
+
+def retime_cron(cron: str, hour: int, minute: int) -> str:
+    """只换钟点，保留原有的周期（每天 / 每周几 / 每月几号 / 一次性日期）。
+
+    「把这个任务的执行时间改到早上七点」只说钟点、没说频率，那频率就该
+    沿用原来的：原来每周五 23:00，改完是每周五 07:00，不能变成一个每天
+    都响的任务。
+    """
+    parts = str(cron or "").split()
+    if len(parts) != 5:
+        return f"{minute} {hour} * * *"
+    return f"{minute} {hour} {parts[2]} {parts[3]} {parts[4]}"
+
+
+def normalize_target(rest: str) -> str:
+    """把「操作对象」规范化：``全部 / 所有 / 定时任务`` → :data:`ALL_TOKEN`。
+
+    编号原样返回；实在看不懂的原样返回（由调用方回一句「要操作哪一个」）。
+    空串返回空串 —— 「一个都没说」和「说了全部」是两件事，不能混。
+    """
+    text = str(rest or "").strip()
+    if not text:
+        return ""
+    if text in ("全部", "所有", "一切", "全都", "统统", "全", ALL_TOKEN):
+        return ALL_TOKEN
+    if not _strip_filler(text, _TARGET_FILLER):
+        # 「删 定时任务」：名词只是把话说圆，意思就是「全都删」
+        return ALL_TOKEN
+    return text
+
+
 def parse_control(text: str) -> tuple[str, str]:
     """解析 ``/d2 定时`` 后面那串文本，返回 ``(动作, 余下文本)``。
 
     动作是 ``list`` / ``delete`` / ``disable`` / ``enable`` / ``run`` /
-    ``create``；空输入按 ``list`` 处理。没命中任何控制词时一律当
+    ``update`` / ``create``；空输入按 ``list`` 处理。没命中任何控制词时一律当
     ``create``（后面接的就是用户的整句人话）。
+
+    余下文本为 :data:`ALL_TOKEN` 时，表示对**全部**任务生效。
 
     「删3」这种不带空格的写法也要认 —— 中文用户很少记得打空格。
     """
-    raw = str(text or "").strip()
+    raw = _strip_alias(text)
     if not raw:
         return "list", ""
+
     head, sep, rest = raw.partition(" ")
+
+    # ---- 0. 「把 2 号删掉」：编号在前、动作在后 ----
+    # 中文里这是最口语的一种写法，但它和「删 1」的形状完全不同（动作在后），
+    # 下面两条分支都接不住，不单独认就会掉进 create。
+    trailing = _TRAILING_INDEX_RE.fullmatch(raw)
+    if trailing:
+        word = trailing.group("verb")
+        for key in sorted(CONTROL_WORDS, key=len, reverse=True):
+            if word.startswith(key):
+                return CONTROL_WORDS[key], trailing.group("idx")
+
+    # ---- 1. 先按「动作词打头」解析：这里的判据最硬（编号要紧跟动作词），
+    #         必须先跑，否则「删 1」会被下面的整批判定抢走。
     if not sep:
         for word in sorted(CONTROL_WORDS, key=len, reverse=True):
             if not raw.startswith(word) or len(raw) <= len(word):
@@ -821,9 +1058,53 @@ def parse_control(text: str) -> tuple[str, str]:
             if re.fullmatch(r"[0-9a-zA-Z]{1,12}", tail):
                 return CONTROL_WORDS[word], tail
     verb = CONTROL_WORDS.get(head.strip())
-    if verb is None:
-        return "create", raw
-    return verb, rest.strip()
+    if verb is not None:
+        return verb, normalize_target(rest)
+
+    # ---- 2. 整批：「取消所有定时任务」「把任务都删了」----
+    bulk = _parse_bulk(raw)
+    if bulk:
+        return bulk, ALL_TOKEN
+
+    # ---- 3. 动词在前、名词在后（「看一下定时任务」「查看所有计划」）----
+    # 中文习惯把动作放前面，「看一下定时任务」里「一下」和名词都只是填充。
+    # 剥掉之后整句只剩一个动作词，那它就是这条指令的意思。
+    lone = CONTROL_WORDS.get(_strip_filler(raw))
+    if lone is not None:
+        return lone, ALL_TOKEN
+
+    # ---- 3b. 问「有哪些 / 几个」的，就是想知道清单 ----
+    # 「看一下我建了哪些定时任务」剥完填充词还剩一串东西，落不到上面那条，
+    # 但它显然是在问列表，不能回一句「没听懂这个定时任务要做什么」。
+    if any(noun in raw for noun in _SCHEDULE_NOUNS) and re.search(
+        r"哪些|哪个|有什么|有几个|多少个|几个|都建了", raw
+    ):
+        return "list", ALL_TOKEN
+
+    # ---- 4. 改时间：「把这个定时任务的执行时间改到早上七点」----
+    if _looks_like_update(raw):
+        return "update", raw
+
+    return "create", raw
+
+
+def looks_like_control(text: str) -> bool:
+    """这句话是不是在**管理**已有任务（查看 / 删除 / 停用 / 改时间）。
+
+    给自然语言入口用。这类句子**没有任何时间表达**，走不到
+    :func:`looks_like_task` 那一步 —— 现场事故正是「取消所有定时任务」
+    被判成闲聊，插件回了一段不相关的唠嗑，任务一个都没删。
+
+    必须提到「定时 / 任务 / 计划」才认：光说「取消」「列表」太泛，
+    别的功能（取消监听、看绑定列表）也在用这些词。
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    if not any(noun in raw for noun in _SCHEDULE_NOUNS):
+        return False
+    verb, _rest = parse_control(raw)
+    return verb != "create"
 
 
 # ======================================================================
@@ -891,6 +1172,7 @@ __all__ = [
     "ACTION_META",
     "ACTION_PLAYER",
     "ACTION_WATCH_SUMMARY",
+    "ALL_TOKEN",
     "CONTROL_WORDS",
     "Clock",
     "DEFAULT_EVERY",
@@ -906,15 +1188,21 @@ __all__ = [
     "cron_label",
     "format_plan",
     "format_task_list",
+    "job_name",
+    "job_note",
+    "looks_like_control",
     "looks_like_task",
     "new_schedule_id",
+    "normalize_target",
     "once_cron",
     "parse_clock",
     "parse_control",
     "parse_request",
     "parse_time_spec",
+    "retime_cron",
     "session_label",
     "short_id",
+    "split_update_target",
     "task_name",
     "task_note",
     "window_rows",
