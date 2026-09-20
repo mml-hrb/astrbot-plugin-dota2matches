@@ -19,7 +19,8 @@
 9. [数据来源与已知限制](#数据来源与已知限制)
 10. [文件结构](#文件结构)
 11. [开发自测](#开发自测)
-12. [相关链接](#相关链接)
+12. [版本发布（打 tag 与推送）](#版本发布打-tag-与推送)
+13. [相关链接](#相关链接)
 
 ---
 
@@ -1227,6 +1228,49 @@ python tests/schedule_check.py       # 定时任务：时间→cron、拒绝纯�
 python tests/stratz_client_live.py   # STRATZ 客户端真实 API 验证（需在文件内填 Key）
 python tests/od_data_probe.py        # 真实拉取指定比赛的 od_data，探查解析状态
 ```
+
+### 版本发布（打 tag 与推送）
+
+**约定：每次推送都带一个 tag，tag 名原样取 `metadata.yaml` 里 `version` 的值**
+（含 `v` 前缀，例如 `v2.3.1`）。版本号只在这一个地方出现，代码与文档里都没有
+硬编码，所以它也是打 tag 时唯一的事实来源 —— 改行为就改它，不要另起一套。
+
+- **tag 是标注型**（`git tag -a`），带作者、日期与一句说明：`git describe`、
+  平台上的 Release 列表都能直接读，`git show vX.Y.Z` 也能立刻看到这一版做了什么。
+- **一个版本号只对应一个提交**。若某个版本号跨了多个提交（改了代码但忘了再提
+  版本号），tag 落在**最后一个**提交上 —— 取首次会让后来同样以这个版本号发出去的
+  修复落在 tag 之外，等于「checkout vX 拿不到 vX 的东西」。
+- **推送前必须先升版本号**：否则同一个版本号会对应两批内容，事后无法定位。
+  这一点由下面的脚本拦截，不靠人记得。
+- 历史已补全：`v1.2.0`（首个提交）到当前版本共 17 个 tag，覆盖全部提交里出现过的
+  版本号。中间有跳号（`v1.7.1 → v1.9.1`、`v2.0.2 → v2.2.1`），那些版本号在
+  仓库建立之前或没有对应提交，补不了也不该编。
+
+标准动作走脚本（提交 → 打 tag → 推送一体，并挡掉重复推送）：
+
+```bash
+python .workbuddy/tmp/push_release.py                     # 预演：只报告将要做什么
+python .workbuddy/tmp/push_release.py --msg "fix:..."     # 提交未落盘的改动并执行
+```
+
+不想用脚本时，手动等价于：
+
+```bash
+# 1) 先把 metadata.yaml 的 version 加一档，并提交
+# 2) 在 HEAD 上打标注 tag（名字就是那个版本号）
+git tag -a v2.3.2 -m "v2.3.2  <这一版做了什么>"
+# 3) 分支和 tag 一起推
+git push gitee main --tags
+```
+
+查当前状态：`git tag -l` 列全部版本，`git describe --tags` 看 HEAD 离哪个版本最近。
+补打历史 tag 的脚本在 `.workbuddy/tmp/tag_release.py`（逐提交读 `metadata.yaml`
+的 `version`，按上述「取末次」规则落点，已存在的 tag 不动）。
+
+> Windows 上这台机器的全局 `credential.helper` 里挂着一个 system 级的
+> `helper-selector`，会让 `git push` 卡在交互选择上没有任何输出。脚本已经用
+> `-c credential.helper= -c credential.helper=store` 绕开；手动敲命令时也要带上，
+> 否则会「看着像卡死」。详见技能 `windows-git-credential-helper-hang`。
 
 ### 相关链接
 
