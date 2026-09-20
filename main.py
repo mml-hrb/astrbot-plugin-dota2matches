@@ -4088,8 +4088,13 @@ class Dota2Plugin(Star):
 
     @staticmethod
     def _schedule_lookup(items: list[tuple[str, dict]], token: str) -> int | None:
-        """把「3」或「a1b2c3」解析成清单里的编号（从 1 开始）。"""
-        text = str(token or "").strip()
+        """把「3」或「a1b2c3」解析成清单里的编号（从 1 开始）。
+
+        会先剥掉尖括号 / 方括号 / 引号之类的包围符：文档与提示语里写的是
+        `删 <编号>`，用户把占位符连括号一起打进来是常态（线上日志实证：
+        `dota2助手 定时 删 <1>`），不该因此回一句「要操作哪一个」。
+        """
+        text = str(token or "").strip().strip("<>《》【】[]{}()（）\"'`“”‘’ \t")
         if not text:
             return None
         if text.isdigit():
