@@ -27,6 +27,15 @@ import re
 from dataclasses import dataclass
 from typing import Iterable
 
+try:  # 插件目录被作为包加载时的相对导入
+    from . import dota_schedule
+except ImportError:  # 兜底：以普通模块方式加载时，把插件目录加入 sys.path
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import dota_schedule  # type: ignore[no-redef]
+
 # ======================================================================
 # 意图关键词表
 # ======================================================================
@@ -415,6 +424,11 @@ INTENT_LABELS: dict[str, str] = {
     "watchlist": "查看本会话的监听列表",
     "llmtest": "测试插件专用的大模型 API Key 是否配置正确（连通性自检）",
     "datasource": "检查主/后备数据源（STRATZ / OpenDota）的连通性与降级状态",
+    "schedule": (
+        "创建定时任务：以后按时间或按场次自动往本会话推送（「每天早上七点通报"
+        "战绩」「每晚十点总结大家的表现」「每监听到十盘就生成一份总结」）。"
+        "注意与「现在查一次」区分：要的是**以后自动做**"
+    ),
 }
 
 
@@ -850,11 +864,26 @@ def parse(text: str) -> Intent | None:
     if not raw:
         return None
 
-    lowered = raw.lower()
+    #: 比赛 ID 是极强的单场复盘信号
+    match_id = extract_match_id(raw)
+
+    # ---- 定时任务请求：必须在关键词打分**之前**判 ----
+    #
+    # 「每天早上七点，通报群里战绩情况」这句话里必然夹着「战绩」（matches）、
+    # 「监听 / 通报」（watch）这些功能词，走打分会被拆成一次性的查询；更糟的是
+    # 「每晚十点总结大家的表现，顺便推一下轮椅」还会被复合问题判据吃掉，
+    # 于是用户要的「以后每天都做」这件事实**完全落空**。
+    #
+    # 所以先按形状判一次（判据与真正建任务时共用同一份 dota_schedule）：
+    # 出现时间表达（每天 / 每周 / 每隔 N 小时 / 明天几点）或「每 N 场」，
+    # 并且跟 Dota2 数据有关，才认成 schedule。参数就是**用户原话** ——
+    # 定时任务要的信息全在那句话里，抽成字段再拼回去一定会丢东西
+    # （「每监听到十盘」就是典型）。
+    if dota_schedule.looks_like_task(raw):
+        return _build_intent("schedule", raw, 99, match_id, False)
+
     scores = _score_all(raw)
 
-    # 比赛 ID 是极强的单场复盘信号
-    match_id = extract_match_id(raw)
     if match_id:
         scores["match"] = scores.get("match", 0) + 5
 
@@ -1219,6 +1248,12 @@ def _build_intent(
     """按意图拼装传给 handler 的参数串。"""
     detail = f"score={score}" + (" (negated)" if flipped else "")
 
+    if name == "schedule":
+        # 定时任务的参数就是**用户原话**：几点、做什么、发给谁全在那句话里，
+        # 抽成字段再拼回来一定会丢东西（「每监听到十盘」正是典型）。
+        # 认人这一步留给 main 侧（它拿得到本会话的绑定 / 监听名单）。
+        return Intent(name, text, score, "rule", detail)
+
     if name == "wheelchair":
         # 这里先出一版参数；真正的权威版本由 main 侧统一重建（它拿得到
         # 本会话的绑定 / 监听名单，能把「天鸽的轮椅」对上号）。
@@ -1336,6 +1371,12 @@ def build_classifier_prompt(
             "问出来的那个人（「谁输得最惨？**给他**找两个轮椅」）。只要出现这种"
             "「先问是谁、再为 TA 做事」的结构，就是两件事，一律填 none。\n"
             "6. match_id / count 没有就填 0，target 没有就填空字符串。\n"
+            "7. 用户要的是**以后自动做**，而不是现在查一次 —— 句子里同时出现"
+            "「每天 / 每晚 / 每周X / 每隔N小时 / 明天几点」这类时间表达（或"
+            "「每监听到 N 盘」这种按场次的说法）与「通报战绩 / 总结表现 / 推轮椅」"
+            "这类内容时 → schedule。这类句子里也有「战绩 / 总结 / 监听」等词，"
+            "但**不要**判成 matches / analyze / watch：那是「现在查一次」的意思，"
+            "判错的后果是用户要的「以后每天」彻底落空。target 留空即可。\n"
         )
         parts.append(
             "输出格式（只输出 JSON，不要解释）：\n"

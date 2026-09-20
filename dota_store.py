@@ -27,8 +27,26 @@
           "created_at": 1788905661,
           "last_match_id": 8989601141
         }
+      ],
+      "count_tasks": [
+        {
+          "id": "<umo>#10",
+          "umo": "...",
+          "kind": "watch_count",
+          "action": "watch_summary",
+          "every": 10,
+          "enabled": true,
+          "created_by": "10001",
+          "created_at": 1788905661,
+          "seen": [{"match_id": 8989601141, "desc": "...", "time_text": "..."}],
+          "last_fired_at": 1788905661
+        }
       ]
     }
+
+**时间型的定时任务不在这里** —— 它们存在 AstrBot 自己的任务库
+（``dashboard`` 里的「未来任务」），由 ``dota_cron`` 桥接。这样做是为了让用户
+在 AstrBot 的任务页面里就能看到、改时间、停用、删除，而不是在插件里另开一套。
 """
 
 from __future__ import annotations
@@ -56,6 +74,7 @@ class DotaStore:
             "version": SCHEMA_VERSION,
             "bindings": {},
             "watchers": [],
+            "count_tasks": [],
         }
         self._loaded = False
 
@@ -81,6 +100,13 @@ class DotaStore:
             "version": SCHEMA_VERSION,
             "bindings": data.get("bindings") if isinstance(data.get("bindings"), dict) else {},
             "watchers": data.get("watchers") if isinstance(data.get("watchers"), list) else [],
+            # 计数型定时任务（「每监听到 N 盘做一次总结」）。
+            # 时间型的任务不在这里 —— 它们存在 AstrBot 的任务库里，见 dota_cron。
+            "count_tasks": (
+                data.get("count_tasks")
+                if isinstance(data.get("count_tasks"), list)
+                else []
+            ),
         }
         self._loaded = True
 
@@ -293,3 +319,148 @@ class DotaStore:
                     changed = True
             if changed:
                 self._save_sync()
+
+    # ------------------------------------------------------------------
+    # 计数型定时任务（「每监听到 N 盘做一次总结」）
+    # ------------------------------------------------------------------
+    #
+    # 时间型的定时任务**不存这里** —— 它们存在 AstrBot 自己的任务库里
+    # （见 dota_cron），免得同一件事有两份真相、还有一份会漂移。
+    #
+    # 计数型的存这里，因为 cron 表达不了「每 N 场」。``seen`` 是窗口：
+    # 每推送成功一场就往里放一条简短记录，攒到 ``every`` 场触发一次总结，
+    # 触发后清空窗口重新攒。**窗口要落盘** —— 只放内存的话，插件重启
+    # （我们改代码时经常重启）会让已攒的场次归零，用户永远等不到第十场。
+    def list_count_tasks(self, umo: str | None = None) -> list[dict]:
+        """列出计数型任务；给了 ``umo`` 就只列该会话的。"""
+        tasks = [
+            t for t in self._data.get("count_tasks", []) if isinstance(t, dict)
+        ]
+        if umo is not None:
+            tasks = [t for t in tasks if str(t.get("umo") or "") == str(umo)]
+        return list(tasks)
+
+    def get_count_task(self, task_id: str) -> dict | None:
+        for task in self._data.get("count_tasks", []):
+            if isinstance(task, dict) and str(task.get("id")) == str(task_id):
+                return task
+        return None
+
+    def find_count_task(self, umo: str, every: int) -> dict | None:
+        """同一个会话里有没有「每 N 场」这个任务（避免重复添加）。"""
+        for task in self.list_count_tasks(umo):
+            if int(task.get("every") or 0) == int(every):
+                return task
+        return None
+
+    async def add_count_task(
+        self,
+        umo: str,
+        every: int,
+        *,
+        action: str = "watch_summary",
+        task_id: str = "",
+        created_by: str = "",
+        created_by_name: str = "",
+    ) -> tuple[dict, bool]:
+        """新增计数型任务。
+
+        Returns:
+            ``(任务记录, 是否新建)``。同一会话已有相同的 ``every`` 时返回已有项。
+        """
+        every = max(1, int(every))
+        async with self._lock:
+            existing = self.find_count_task(umo, every)
+            if existing is not None:
+                return existing, False
+            record = {
+                "id": task_id or f"{umo}#{every}",
+                "umo": str(umo),
+                "kind": "watch_count",
+                "action": action or "watch_summary",
+                "every": every,
+                "enabled": True,
+                "created_by": str(created_by or ""),
+                "created_by_name": created_by_name or "",
+                "created_at": int(time.time()),
+                "seen": [],
+            }
+            self._data.setdefault("count_tasks", []).append(record)
+            self._save_sync()
+        return record, True
+
+    async def remove_count_task(self, task_id: str) -> bool:
+        async with self._lock:
+            before = len(self._data.get("count_tasks", []))
+            self._data["count_tasks"] = [
+                t
+                for t in self._data.get("count_tasks", [])
+                if not (isinstance(t, dict) and str(t.get("id")) == str(task_id))
+            ]
+            changed = len(self._data["count_tasks"]) != before
+            if changed:
+                self._save_sync()
+        return changed
+
+    async def set_count_task_enabled(self, task_id: str, enabled: bool) -> bool:
+        async with self._lock:
+            task = self.get_count_task(task_id)
+            if task is None:
+                return False
+            task["enabled"] = bool(enabled)
+            self._save_sync()
+        return True
+
+    async def push_count_task_seen(
+        self, task_id: str, row: dict, *, every: int
+    ) -> bool:
+        """把一场比赛记进窗口，返回**这次是否该触发总结**。
+
+        同一场只记一次（``_deliver`` 在重试路径上可能重复调用）；触发之后
+        由调用方负责 :meth:`reset_count_task_window` —— 分开两步是为了让
+        「生成总结」失败时窗口还在，下一轮可以重试，而不是白白丢掉这些场次。
+
+        触发判据是 ``len(seen) >= every 且 len(seen) % every == 0``：
+        后半个条件看着多余，其实是**失败后的节流阀**。生成总结失败时窗口
+        不会被清空（那是故意的），若只看 ``>= every``，那之后每来一场都会
+        再触发一次 —— 模型挂掉的那段时间里，每场新比赛都会白烧一次调用。
+        加上取模之后变成「每再攒够一整个窗口才重试一次」，代价可控。
+        """
+        match_id = int(row.get("match_id") or 0)
+        if match_id <= 0:
+            return False
+        async with self._lock:
+            task = self.get_count_task(task_id)
+            if task is None or not task.get("enabled", True):
+                return False
+            seen = task.setdefault("seen", [])
+            if any(int(item.get("match_id") or 0) == match_id for item in seen):
+                return False
+            seen.append(
+                {
+                    "match_id": match_id,
+                    "desc": str(row.get("desc") or ""),
+                    "time_text": str(row.get("time_text") or ""),
+                    "at": int(time.time()),
+                }
+            )
+            # 窗口留一点余量（``every`` 的两倍起），一是给失败重试留空间，
+            # 二是失败后要能再攒够一整个窗口（见上面的取模判据），
+            # 所以下限取 ``every`` 的三倍。
+            limit = max(4, int(every) * 3)
+            if len(seen) > limit:
+                del seen[: len(seen) - limit]
+            self._save_sync()
+            size = len(seen)
+            return size >= max(1, int(every)) and size % max(1, int(every)) == 0
+
+
+    async def reset_count_task_window(self, task_id: str) -> None:
+        """清空窗口（一次总结成功发出去之后调用）。"""
+        async with self._lock:
+            task = self.get_count_task(task_id)
+            if task is None:
+                return
+            task["seen"] = []
+            task["last_fired_at"] = int(time.time())
+            self._save_sync()

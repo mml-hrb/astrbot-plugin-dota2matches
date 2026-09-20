@@ -71,9 +71,11 @@ try:  # 插件目录被作为包加载时的相对导入
     )
     from .dota_store import DotaStore
     from . import dota_chat
+    from . import dota_cron
     from . import dota_nlu
     from . import dota_parse
     from . import dota_pool
+    from . import dota_schedule
     from . import dota_tools
     from . import dota_zh
 except ImportError:  # 兜底：以普通模块方式加载时（把插件目录加入 sys.path）
@@ -127,9 +129,11 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
     from dota_store import DotaStore  # type: ignore[no-redef]
 
     import dota_chat  # type: ignore[no-redef]
+    import dota_cron  # type: ignore[no-redef]
     import dota_nlu  # type: ignore[no-redef]
     import dota_parse  # type: ignore[no-redef]
     import dota_pool  # type: ignore[no-redef]
+    import dota_schedule  # type: ignore[no-redef]
     import dota_tools  # type: ignore[no-redef]
     import dota_zh  # type: ignore[no-redef]
 
@@ -342,6 +346,25 @@ HELP_TEXT = """🎮 Dota2 数据查询助手（数据来源：STRATZ / OpenDota 
 /d2 取消监听 <目标 | 全部>　　取消你自己添加的监听
 /d2 监听列表　　　　　　　　　查看本会话的监听
 
+【定时任务】
+/d2 定时　　　　　　　　　　　查看本会话的定时任务（也可以用「定时 列表」）
+/d2 定时 <一句人话>　　　　　 直接描述你要的定时任务，例如：
+　　　　　　　　　　　　　　　 `/d2 定时 每天早上七点，通报群里战绩情况`
+　　　　　　　　　　　　　　　 `/d2 定时 每晚十点总结一下大家今天的表现`
+　　　　　　　　　　　　　　　 `/d2 定时 每监听到十盘战绩就生成一份这十盘的总结`
+　　　　　　　　　　　　　　　 `/d2 定时 明天早上八点通报一下战绩`
+　　　　　　　　　　　　　　　 （说完会先给你一份计划核对，回「确认」才建）
+/d2 定时 删 <编号>　　　　　　删除任务（编号见「定时 列表」）
+/d2 定时 停 <编号>　　　　　　停用；`/d2 定时 开 <编号>` 恢复
+/d2 定时 现在 <编号>　　　　　立刻执行一次
+
+　也可以不打指令，直接说人话（需要唤醒词）：
+　　`dota2助手 每天早上七点，通报群里战绩情况`
+　　`dota2助手 每监听到十盘战绩就生成一份这十盘的总结`
+
+　按时间的任务会出现在 AstrBot 的「未来任务」页面里，可以在那儿改时间、
+　停用或删除；按场次的任务（「每监听到 N 场」）不走定时器，攒够场次就发。
+
 【模型】
 /d2 模型测试　　　　　　　　　自检插件专用的大模型 Key 是否可用
 
@@ -355,6 +378,9 @@ HELP_TEXT = """🎮 Dota2 数据查询助手（数据来源：STRATZ / OpenDota 
 · 监听推送只给「胜负 + KDA + 近期战绩对照」的几句话，不占用录像解析、不用等；
   要看深度复盘（走势、团战、出装）请用 `/d2 单场 <比赛ID>`；
 · 「绑定列表」中他人的账号与用户 ID 默认打码，保护群聊隐私；
+· 定时任务只接跟 Dota2 数据有关、且带时间或场次的说法；「每天七点提醒我喝水」
+  这类纯提醒插件做不了，请用别的方式；
+· 想改定时任务的时间，去 AstrBot 的「未来任务」页面更直观（也可以先删后建）；
 · 想让查询结果更好看，可以在配置中调整「长报告转为图片发送」。
 
 关于数据源（STRATZ 主 / OpenDota 后备）：
@@ -660,11 +686,34 @@ class Dota2Plugin(Star):
         #: 等待解析的并发闸门：同时等待的场次上限由配置决定
         self._parse_sem: asyncio.Semaphore | None = None
         self._parse_sem_size = 0
+        #: AstrBot「未来任务」的桥接器（见 :mod:`dota_cron`）。
+        #:
+        #: 时间型任务一律建在 AstrBot 的任务库里（``basic`` 任务），好处是
+        #: 它们会出现在 AstrBot 的「未来任务」页面里、可停用可改时间可删除，
+        #: 而执行时跑的是**插件自己的 handler**（数据、口径、模型通道都是插件这套）。
+        self.schedules = dota_cron.CronBridge(context)
+        #: 定时任务待执行的计划：``{(umo, uid): 已解析好的任务请求}``。
+        #:
+        #: 建任务会**持续生效**（每天在那个点往群里发东西），误判的代价远大于
+        #: 绑定 / 监听，所以先解析出完整计划、把「几点、发什么、发到哪」写给用户看，
+        #: 回一句「确认」才真正建。计划只放在内存里，确认窗口只有两分钟。
+        self._schedule_plans: dict[tuple[str, str], dict[str, Any]] = {}
+        #: 插件是否已卸载。装卸期间若还有到点的任务被唤醒，
+        #: handler 靠它判断该直接退出（不然会往一个已经停掉的会话推消息）。
+        self._sched_stopped = False
+        #: 「每 N 场总结」的后台任务。生成总结要调一次大模型（十几秒），
+        #: **绝不能**卡在监听推送链路里 —— 那一轮还有别的会话要推。
+        self._summary_tasks: set[asyncio.Task] = set()
+        #: 启动接管定时任务的后台任务（幂等，见 :meth:`_start_schedule_adopt`）。
+        self._sched_adopt_task: asyncio.Task | None = None
         logger.info(
             f"[dota2] 插件已加载，数据目录: {self.data_dir}，"
             f"监听: {'开启' if self.cfg('watch_enabled', True) else '关闭'}"
         )
         self._start_watcher()
+        # 接管既有定时任务。**放在这里而不是 on_astrbot_loaded**：
+        # 热重载只重跑 __init__，不会再触发启动钩子（原因见该方法注释）。
+        self._start_schedule_adopt()
 
     # ==================================================================
     # 催解析 + 等解析（后台任务）
@@ -1625,6 +1674,7 @@ class Dota2Plugin(Star):
         "watchlist": "d2_watchlist",
         "llmtest": "d2_llmtest",
         "datasource": "d2_datasource",
+        "schedule": "d2_schedule",
     }
 
     #: 单场复盘的指令别名 → handler。
@@ -2293,42 +2343,7 @@ class Dota2Plugin(Star):
         tools_on = self._chat_tools_available()
         focus = self._nlu_chat_focus(question, umo) if tools_on else []
         try:
-            context = await dota_chat.collect_chat_context(
-                self.api,
-                question=question,
-                umo=umo,
-                user_id=uid,
-                watchers=self.store.list_watchers(umo),
-                bindings=list(self.store.list_bindings(umo).values()),
-                # 本会话近期的比赛（监听推送 / 复盘 / 查询提到过的）：
-                # 纯本地数据、零网络开销，永远注入。它带来的是「这个群
-                # 最近发生过什么」以及每场比赛自己的开赛时间。
-                recent_matches=self._nlu_recent_match_rows(umo, limit=8),
-                self_binding=binding,
-                focus_accounts=focus,
-                recent_limit=int(
-                    self.cfg("nlu_chat_context_matches", dota_chat.DEFAULT_RECENT_LIMIT)
-                ),
-                max_players=int(
-                    self.cfg("nlu_chat_max_players", dota_chat.DEFAULT_MAX_PLAYERS)
-                ),
-                timeout=float(
-                    self.cfg("nlu_chat_timeout", dota_chat.DEFAULT_FETCH_TIMEOUT)
-                ),
-                cache=self._chat_cache,
-                localizer=self._localize_heroes,
-                now=time.time(),
-                hero_pool_cfg={
-                    "min_games": int(
-                        self.cfg("hero_pool_min_games", dota_pool.DEFAULT_MIN_GAMES) or 0
-                    ),
-                    "max_patches": int(
-                        self.cfg("hero_pool_max_patches", dota_pool.DEFAULT_MAX_PATCHES) or 0
-                    ),
-                    "include_turbo": self.cfg("hero_pool_include_turbo", True),
-                    "patch_scope": self.cfg("hero_pool_patch_scope", True),
-                },
-            )
+            context = await self._collect_chat_context(question, umo, uid, binding, focus)
         except Exception as e:  # noqa: BLE001 - 兜底失败也要放行，不能吞消息
             logger.error(f"[dota2] 闲聊兜底收集数据失败: {e}", exc_info=True)
             return
@@ -2364,6 +2379,62 @@ class Dota2Plugin(Star):
         )
         async for item in self._emit(event, reply, as_image=False):
             yield item
+
+    async def _collect_chat_context(
+        self,
+        question: str,
+        umo: str,
+        uid: str,
+        binding: dict | None,
+        focus: list[int],
+    ) -> dota_chat.ChatContext:
+        """收集一次「带插件数据的回答」所需的会话语境。
+
+        **闲聊兜底与定时播报共用这一份** —— 定时播报要答的就是同一类问题
+        （「通报群里战绩情况」），而这份上下文里已经带齐了三样「坐标系」：
+        当前时间、本会话最近发生过的比赛、以及识别到时间词时的时间窗口。
+        两条路径各写一份的话，迟早会出现「手动问的和每天推的口径不一样」。
+
+        Args:
+            binding: 提问者的绑定（定时播报没有「提问者」，传 ``None``）。
+            focus: 只取这几个人的数据；空列表表示按常规规则取。
+        """
+        return await dota_chat.collect_chat_context(
+            self.api,
+            question=question,
+            umo=umo,
+            user_id=uid,
+            watchers=self.store.list_watchers(umo),
+            bindings=list(self.store.list_bindings(umo).values()),
+            # 本会话近期的比赛（监听推送 / 复盘 / 查询提到过的）：
+            # 纯本地数据、零网络开销，永远注入。它带来的是「这个群
+            # 最近发生过什么」以及每场比赛自己的开赛时间。
+            recent_matches=self._nlu_recent_match_rows(umo, limit=8),
+            self_binding=binding,
+            focus_accounts=focus,
+            recent_limit=int(
+                self.cfg("nlu_chat_context_matches", dota_chat.DEFAULT_RECENT_LIMIT)
+            ),
+            max_players=int(
+                self.cfg("nlu_chat_max_players", dota_chat.DEFAULT_MAX_PLAYERS)
+            ),
+            timeout=float(
+                self.cfg("nlu_chat_timeout", dota_chat.DEFAULT_FETCH_TIMEOUT)
+            ),
+            cache=self._chat_cache,
+            localizer=self._localize_heroes,
+            now=time.time(),
+            hero_pool_cfg={
+                "min_games": int(
+                    self.cfg("hero_pool_min_games", dota_pool.DEFAULT_MIN_GAMES) or 0
+                ),
+                "max_patches": int(
+                    self.cfg("hero_pool_max_patches", dota_pool.DEFAULT_MAX_PATCHES) or 0
+                ),
+                "include_turbo": self.cfg("hero_pool_include_turbo", True),
+                "patch_scope": self.cfg("hero_pool_patch_scope", True),
+            },
+        )
 
     def _nlu_pop_confirm(
         self, umo: str, uid: str
@@ -2410,9 +2481,23 @@ class Dota2Plugin(Star):
         # 这一步**不受唤醒词限制**：用户的确认是对上一轮已授权操作的收尾，
         # 再逼他打一遍「dota2助手 确认」是没必要的摩擦。为了两种写法都能用，
         # 统一拿剥离唤醒词后的正文来比对。
+        head = self._nlu_head_text(text)
+
+        # 定时任务的确认走**另一套**：确认的对象是一份已经解析好的计划
+        # （几时、做什么、发到哪），而不是「(意图名, 参数)」。若塞进通用确认，
+        # 回执会被再解析一次，用户就会陷进「确认 → 又让你确认」的死循环。
+        plan_result = self._nlu_schedule_plan_ack(umo, uid, head)
+        if plan_result is not None:
+            verdict, plan = plan_result
+            if verdict == "cancel":
+                yield event.plain_result("好的，这个定时任务就不建了。")
+                return
+            async for item in self._schedule_apply(plan, event, umo):
+                yield item
+            return
+
         pending = self._nlu_confirm.get((umo, uid))
         if pending is not None:
-            head = self._nlu_head_text(text)
             if pending[2] < time.time():
                 self._nlu_confirm.pop((umo, uid), None)
             elif head in NLU_CONFIRM_WORDS:
@@ -2476,6 +2561,14 @@ class Dota2Plugin(Star):
                     f"[dota2] 自然语言：轮椅参数由 {intent.args!r} 重建为 {rebuilt!r}"
                 )
             intent.args = rebuilt
+
+        # 定时任务的参数同理，而且更彻底：**必须**是用户原话。
+        # 模型返回的那几个字段（target / count / match_id）根本装不下
+        # 「每监听到十盘战绩就生成一份这十盘的总结」里的「每…十盘」，
+        # 拼回去就成了一个语义完全不同的任务。这里直接换成原句，
+        # 由 dota_schedule 去解析（它才是唯一定义「什么算定时请求」的地方）。
+        if intent is not None and intent.name == "schedule":
+            intent.args = effective
 
         if intent is None:
             # 没识别出内置指令。分两种情况：            #
@@ -2845,38 +2938,22 @@ class Dota2Plugin(Star):
             want_personal = bool(target)
 
         try:
-            hero_stats = await self.api.get_hero_stats()
-            heroes = await self._heroes()
-            patch = await self.api.get_latest_patch()
+            parts = await self._hero_meta_board_parts(position)
         except OpenDotaError as e:
             yield event.plain_result(f"❌ 查询失败：{e}")
             return
 
-        if not hero_stats:
+        if parts is None:
             yield event.plain_result(
                 "没有拿到版本英雄数据（数据源可能暂时不可用），稍后再试。"
             )
             return
 
-        rows, meta = hero_meta_rows(
-            hero_stats,
-            position=position,
-            min_pick=int(self.cfg("hero_meta_min_pick", 0) or 0),
-        )
-        board = format_hero_meta_board(
-            rows,
-            meta,
-            heroes,
-            patch=patch,
-            top=max(1, int(self.cfg("hero_meta_board_size", 10) or 10)),
-            hot_top=max(0, int(self.cfg("hero_meta_hot_size", 5) or 0)),
-            cold_top=max(0, int(self.cfg("hero_meta_cold_size", 3) or 0)),
-        )
-        for chunk in self._chunk_text(board):
+        for chunk in self._chunk_text(str(parts["board"])):
             yield event.plain_result(chunk)
 
         if not want_personal:
-            yield event.plain_result(format_hero_meta_footer(meta))
+            yield event.plain_result(str(parts["footer"]))
             return
 
         # ---------- 个人适配 ----------
@@ -2931,10 +3008,10 @@ class Dota2Plugin(Star):
             wl=wl,
             hero_rows=hero_rows,
             matches=matches,
-            meta_rows=rows,
-            meta=meta,
-            heroes=heroes,
-            patch=patch,
+            meta_rows=parts["rows"],
+            meta=parts["meta"],
+            heroes=parts["heroes"],
+            patch=parts["patch"],
             pool_scope=dota_pool.hero_pool_scope_text(pool) if pool.has_data else "",
         )
         report = await self._generate_report(event, prompt)
@@ -2945,7 +3022,9 @@ class Dota2Plugin(Star):
             return
 
         # 模型不可用：退回纯数据交叉的规则版，不硬凑一段分析
-        fallback = pick_heroes_for_player(rows, hero_rows, matches, heroes)
+        fallback = pick_heroes_for_player(
+            parts["rows"], hero_rows, matches, parts["heroes"]
+        )
         if not fallback:
             yield event.plain_result(
                 f"{header}\n\n"
@@ -2960,6 +3039,49 @@ class Dota2Plugin(Star):
         )
         for chunk in self._chunk_text(f"{header}\n\n{scope_line}{fallback}"):
             yield event.plain_result(chunk)
+
+    async def _hero_meta_board_parts(
+        self, position: str = ""
+    ) -> dict[str, Any] | None:
+        """拉取并渲染「当前版本强势英雄榜」。
+
+        抽出来是为了让**定时播报**（见 ``/d2 定时``）复用同一份取数与渲染 ——
+        两条路径各写一遍，迟早会出现「手动查到的榜和每天推的不是一个」。
+        个人适配那半段仍然留在 :meth:`d2_wheelchair` 里：它要额外拉英雄池与
+        近期对局、还要过一次模型，定时播报用不上。
+
+        Returns:
+            ``{"board", "footer", "rows", "meta", "heroes", "patch"}``；
+            数据源没给英雄数据时返回 ``None``。``OpenDotaError`` 照常抛出，
+            由调用方决定怎么提示（手动查询要告诉用户原因，定时播报只记日志）。
+        """
+        hero_stats = await self.api.get_hero_stats()
+        heroes = await self._heroes()
+        patch = await self.api.get_latest_patch()
+        if not hero_stats:
+            return None
+        rows, meta = hero_meta_rows(
+            hero_stats,
+            position=position,
+            min_pick=int(self.cfg("hero_meta_min_pick", 0) or 0),
+        )
+        board = format_hero_meta_board(
+            rows,
+            meta,
+            heroes,
+            patch=patch,
+            top=max(1, int(self.cfg("hero_meta_board_size", 10) or 10)),
+            hot_top=max(0, int(self.cfg("hero_meta_hot_size", 5) or 0)),
+            cold_top=max(0, int(self.cfg("hero_meta_cold_size", 3) or 0)),
+        )
+        return {
+            "board": board,
+            "footer": format_hero_meta_footer(meta),
+            "rows": rows,
+            "meta": meta,
+            "heroes": heroes,
+            "patch": patch,
+        }
 
     # ==================================================================
     # 指令：战绩
@@ -3788,6 +3910,643 @@ class Dota2Plugin(Star):
         return f"✅ 可用（英雄 {count} 个，耗时 {elapsed:.1f} 秒）"
 
     # ==================================================================
+    # 指令：定时任务（AstrBot 的「未来任务」）
+    # ==================================================================
+    # 时间型的任务建在 AstrBot 自己的任务库里（见 :mod:`dota_cron`）：好处是
+    # 它们会出现在 AstrBot 的「未来任务」页面上，可停用 / 改时间 / 删除，
+    # 而到点执行的仍是**插件自己的 handler** —— 数据源降级、中文英雄名、
+    # 英雄池版本口径、模型通道全是插件这一套，不经过 AstrBot 的主智能体。
+    #
+    # 计数型的任务（「每监听到 N 场」）cron 表达不了（它只能表达时间），
+    # 硬凑会把「攒够十场就发」拖成「第二天早上才发」。所以它们存在插件自己的
+    # 存储里，由监听推送链路计数触发。两类任务在 ``/d2 定时`` 里是同一个列表、
+    # 同一套管理动作（删 / 停 / 开 / 现在）。
+
+    @d2.command("schedule", alias={"定时", "定时任务", "任务", "计划"})
+    @take_over_event
+    async def d2_schedule(self, event: AstrMessageEvent, args: GreedyStr):
+        """定时任务：/d2 定时 [列表 | 删 <编号> | 停 <编号> | 开 <编号> | 现在 <编号>]
+
+        也可以直接说人话让它建：`/d2 定时 每天早上七点通报群里战绩情况`。
+        """
+        umo = str(event.unified_msg_origin)
+        uid = str(event.get_sender_id())
+        raw = str(args).strip()
+        verb, rest = dota_schedule.parse_control(raw)
+
+        if verb == "list":
+            yield event.plain_result(await self._schedule_list_text(umo))
+            return
+        if verb in {"delete", "disable", "enable", "run"}:
+            yield event.plain_result(await self._schedule_control(verb, rest, umo))
+            return
+
+        # ---- create：把整句人话解析成一个计划，先让用户核对 ----
+        if not self.cfg("schedule_enabled", True):
+            yield event.plain_result(
+                "定时任务功能已在插件配置里关闭（`schedule_enabled`）。"
+            )
+            return
+        if not raw:
+            yield event.plain_result(await self._schedule_list_text(umo))
+            return
+
+        request = self._parse_task_request(raw, umo)
+        if request is None:
+            yield event.plain_result(self._schedule_hint())
+            return
+        # 计数型任务（「每监听到 N 场」）不走平台的调度器 —— cron 表达不了
+        # 「每 N 场」，而且它是靠监听推送链路计数的。所以平台没定时能力时，
+        # 只挡「按时间」的那一类，别把这种也一起拒了。
+        if request.kind != "watch_count":
+            reason = self.schedules.unavailable_reason()
+            if reason:
+                # 也不能偷偷换成插件自己的定时器：用户要的就是「能在 AstrBot
+                # 的任务页面里看到并管理」，换一套实现只会让人找不到任务。
+                yield event.plain_result(
+                    f"⚠️ {reason}\n"
+                    "（如果你要的是「每监听到 N 场就总结」，那个不依赖平台调度器，"
+                    f"直接说「{self._nlu_keyword()} 每监听到十盘战绩就生成一份总结」即可）"
+                )
+                return
+        self._schedule_plans[(umo, uid)] = {
+            "request": request,
+            "umo": umo,
+            "expire": time.time() + NLU_CONFIRM_TTL,
+        }
+        yield event.plain_result(
+            dota_schedule.format_plan(
+                request,
+                session_text=dota_schedule.session_label(umo),
+                keyword=self._nlu_keyword(),
+            )
+        )
+
+    def _parse_task_request(
+        self, text: str, umo: str
+    ) -> dota_schedule.TaskRequest | None:
+        """把用户原话解析成任务请求（**认人**需要本会话的绑定 / 监听名单）。"""
+        return dota_schedule.parse_request(
+            text,
+            known_names=self._nlu_known_names(umo),
+            default_time=self._schedule_default_time(),
+        )
+
+    def _schedule_default_time(self) -> str:
+        return str(
+            self.cfg("schedule_default_time", dota_schedule.DEFAULT_TIME)
+            or dota_schedule.DEFAULT_TIME
+        )
+
+    def _schedule_timezone(self) -> str:
+        """定时任务的时区：插件配置优先，留空跟随 AstrBot 全局配置。
+
+        必须显式取一次，不能让平台自己回落到「进程所在时区」——
+        用户说的「早上七点」是他所在时区的七点，而服务器可能在别的时区；
+        时区错了任务会整体偏移几小时，且**很难被发现**（任务确实在跑）。
+        """
+        text = str(self.cfg("schedule_timezone", "") or "").strip()
+        if text:
+            return text
+        try:
+            conf = self.context.get_config()
+            return str((conf.get("timezone") if conf else "") or "").strip()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _schedule_hint(self) -> str:
+        """没解析出任务时给的说法示例。"""
+        keyword = self._nlu_keyword()
+        return (
+            "没听懂这个定时任务要做什么。可以这样说：\n"
+            f"　`{keyword} 每天早上七点，通报群里战绩情况`\n"
+            f"　`{keyword} 每晚十点总结一下大家今天的表现`\n"
+            f"　`{keyword} 每监听到十盘战绩就生成一份这十盘的总结`\n"
+            f"　`{keyword} 明天早上八点通报一下战绩`\n"
+            "\n"
+            "只有跟 Dota2 数据有关、且**带时间或场次**的说法才会被接住"
+            "（「每天七点提醒我喝水」这类纯提醒插件做不了）。\n"
+            f"查看已有任务：`{keyword} 定时 列表`"
+        )
+
+    # ------------------------------------------------------------------
+    # 列表 / 管理
+    # ------------------------------------------------------------------
+    async def _schedule_list_text(self, umo: str) -> str:
+        rows = await self._schedule_cron_rows(umo)
+        counts = self._schedule_count_rows(umo)
+        text = dota_schedule.format_task_list(
+            rows, counts, keyword=self._nlu_keyword()
+        )
+        reason = self.schedules.unavailable_reason()
+        if reason:
+            text += f"\n\n⚠️ {reason}"
+        return text
+
+    async def _schedule_cron_rows(self, umo: str) -> list[dict]:
+        """本会话的时间型任务（存在 AstrBot 的任务库里）。"""
+        timezone = self._schedule_timezone()
+        rows: list[dict] = []
+        for job in await self.schedules.list_owned():
+            row = dota_cron.CronBridge.job_summary(job)
+            session = str(row.get("session") or "")
+            # 任务说明里没有会话的（理论不该有）对所有会话可见，
+            # 免得建出来的任务在哪个群都看不到、还以为没建成。
+            if session and session != umo:
+                continue
+            action = str(row.get("action") or "")
+            label = dota_schedule.ACTION_LABELS.get(action, action)
+            if action == dota_schedule.ACTION_PLAYER and row.get("args"):
+                label = f"{label}（{row['args']}）"
+            row["action_label"] = label
+            row["next_run_text"] = self.schedules.next_run_text(job, timezone)
+            rows.append(row)
+        return rows
+
+    def _schedule_count_rows(self, umo: str) -> list[dict]:
+        """本会话的计数型任务（存在插件自己的存储里，见 dota_store）。"""
+        return [dict(row) for row in self.store.list_count_tasks(umo)]
+
+    async def _schedule_items(self, umo: str) -> list[tuple[str, dict]]:
+        """本会话的任务清单，**顺序与 ``/d2 定时 列表`` 完全一致**。
+
+        编号就是列表里的序号，所以两边的拼装顺序必须一样：先时间型、
+        再计数型。各拼各的一定会出现「用户看着列表说删 3，删掉的是另一个」。
+        """
+        items: list[tuple[str, dict]] = []
+        for row in await self._schedule_cron_rows(umo):
+            items.append(("cron", row))
+        for row in self._schedule_count_rows(umo):
+            items.append(("count", row))
+        return items
+
+    @staticmethod
+    def _schedule_lookup(items: list[tuple[str, dict]], token: str) -> int | None:
+        """把「3」或「a1b2c3」解析成清单里的编号（从 1 开始）。"""
+        text = str(token or "").strip()
+        if not text:
+            return None
+        if text.isdigit():
+            value = int(text)
+            return value if 1 <= value <= len(items) else None
+        for pos, (_kind, item) in enumerate(items, start=1):
+            sid = dota_schedule.short_id(
+                str(item.get("schedule_id") or item.get("id") or "")
+            )
+            if sid and (sid == text or sid.startswith(text)):
+                return pos
+        return None
+
+    async def _schedule_control(self, verb: str, rest: str, umo: str) -> str:
+        """处理「删 / 停 / 开 / 现在 <编号>」。"""
+        items = await self._schedule_items(umo)
+        if not items:
+            return "本会话还没有定时任务。\n\n" + self._schedule_hint()
+        index = self._schedule_lookup(items, rest)
+        if index is None:
+            return (
+                f"要操作哪一个？请给列表里的编号（1~{len(items)}）"
+                f"或任务编号，例如「定时 删 2」。\n"
+                f"先看一眼：`{self._nlu_keyword()} 定时 列表`"
+            )
+        kind, row = items[index - 1]
+        if kind == "cron":
+            return await self._schedule_control_cron(verb, row)
+        return await self._schedule_control_count(verb, row, umo)
+
+    async def _schedule_control_cron(self, verb: str, row: dict) -> str:
+        job_id = str(row.get("job_id") or "")
+        name = str(row.get("name") or "定时任务")
+        if verb == "delete":
+            ok = await self.schedules.delete(job_id)
+            return f"🗑 已删除：{name}" if ok else "⚠️ 删除失败，原因见日志。"
+        if verb == "disable":
+            ok = await self.schedules.set_enabled(job_id, False)
+            return (
+                f"⏸ 已停用：{name}\n（想恢复：`{self._nlu_keyword()} 定时 开 <编号>`）"
+                if ok
+                else "⚠️ 停用失败，原因见日志。"
+            )
+        if verb == "enable":
+            ok = await self.schedules.set_enabled(job_id, True)
+            return f"▶️ 已启用：{name}" if ok else "⚠️ 启用失败，原因见日志。"
+        ok = await self.schedules.run_now(job_id)
+        return (
+            f"▶️ 已立即执行一次：{name}\n（结果会直接发到本会话，稍等片刻）"
+            if ok
+            else "⚠️ 执行失败，原因见日志。"
+        )
+
+    async def _schedule_control_count(self, verb: str, row: dict, umo: str) -> str:
+        task_id = str(row.get("id") or "")
+        every = max(1, int(row.get("every") or dota_schedule.DEFAULT_EVERY))
+        label = f"每 {every} 场总结"
+        if verb == "delete":
+            ok = await self.store.remove_count_task(task_id)
+            return f"🗑 已删除：{label}" if ok else "⚠️ 删除失败。"
+        if verb == "disable":
+            ok = await self.store.set_count_task_enabled(task_id, False)
+            return f"⏸ 已停用：{label}" if ok else "⚠️ 停用失败。"
+        if verb == "enable":
+            ok = await self.store.set_count_task_enabled(task_id, True)
+            return f"▶️ 已启用：{label}" if ok else "⚠️ 启用失败。"
+        # 「现在」：用已经攒下的场次先出一份，**不清空窗口**
+        # （它是预览，不该把用户攒的场次吃掉）
+        seen = len(list(row.get("seen") or []))
+        if seen < 1:
+            return f"「{label}」还没攒到任何场次，现在没东西可总结。"
+        self._spawn_summary_task(task_id, umo, every, force=True)
+        return f"▶️ 正在用已攒的 {seen} 场生成总结，稍后发到本会话。"
+
+    # ------------------------------------------------------------------
+    # 确认与创建
+    # ------------------------------------------------------------------
+    def _nlu_schedule_plan_ack(
+        self, umo: str, uid: str, head: str
+    ) -> tuple[str, dict[str, Any]] | None:
+        """检查有没有等待确认的定时任务计划。
+
+        Returns:
+            ``("confirm", 计划)`` / ``("cancel", {})``；没有待确认项、或回复的
+            不是确认 / 取消时返回 ``None``。**取出即销毁**，避免同一条
+            「确认」被用两次。
+        """
+        plan = self._schedule_plans.get((umo, uid))
+        if plan is None:
+            return None
+        if float(plan.get("expire") or 0) < time.time():
+            self._schedule_plans.pop((umo, uid), None)
+            return None
+        if head in NLU_CONFIRM_WORDS:
+            self._schedule_plans.pop((umo, uid), None)
+            return ("confirm", plan)
+        if head in NLU_CANCEL_WORDS:
+            self._schedule_plans.pop((umo, uid), None)
+            return ("cancel", {})
+        return None
+
+    async def _schedule_apply(
+        self, plan: dict[str, Any], event: AstrMessageEvent, umo: str
+    ):
+        """用户确认之后真正建任务（两种类型各走一条路）。"""
+        request: dota_schedule.TaskRequest = plan["request"]
+        uid = str(event.get_sender_id())
+        try:
+            sender = str(event.get_sender_name() or "")
+        except Exception:  # noqa: BLE001 - 少数适配器没有这个方法
+            sender = ""
+        session_text = dota_schedule.session_label(umo)
+        keyword = self._nlu_keyword()
+
+        if request.kind == "watch_count":
+            record, created = await self.store.add_count_task(
+                umo,
+                int(request.every),
+                action=str(request.action or dota_schedule.ACTION_WATCH_SUMMARY),
+                task_id=dota_schedule.new_schedule_id("d2c"),
+                created_by=uid,
+                created_by_name=sender,
+            )
+            if not created:
+                sid = dota_schedule.short_id(str(record.get("id") or ""))
+                yield event.plain_result(
+                    f"ℹ️ 本会话已经有一个「每 {record.get('every')} 场总结」的任务了"
+                    f"（编号 {sid}），没有重复添加。"
+                )
+                return
+            yield event.plain_result(
+                f"✅ 建好了：每监听到 {record.get('every')} 场比赛，"
+                f"就为{session_text}生成一份这 {record.get('every')} 场的总结。\n"
+                f"· 编号：{dota_schedule.short_id(str(record.get('id') or ''))}\n"
+                "· 从现在开始计数（只算**推送成功**的新比赛）\n"
+                "· 这种任务按场次触发，不会出现在 AstrBot 的「未来任务」里\n"
+                f"· 查看 / 删除：`{keyword} 定时 列表`"
+            )
+            return
+
+        spec = request.time
+        cron = str(spec.cron or "") if spec is not None else ""
+        if not cron:
+            yield event.plain_result("⚠️ 没能把时间换算成执行计划，换个说法再试一次。")
+            return
+        schedule_id = dota_schedule.new_schedule_id("d2")
+        payload = {
+            "session": str(umo),
+            "action": str(request.action),
+            "args": str(request.args or ""),
+            "schedule_id": schedule_id,
+            "once": bool(spec.once),
+            "note": dota_schedule.task_note(request, session_label=session_text),
+        }
+        try:
+            job = await self.schedules.create(
+                payload,
+                name=dota_schedule.task_name(request, session_label=session_text),
+                cron_expression=cron,
+                handler=self._run_scheduled_task,
+                timezone=self._schedule_timezone(),
+            )
+        except dota_cron.CronUnavailable as e:
+            yield event.plain_result(f"⚠️ {e}")
+            return
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[dota2] 创建定时任务失败：{e}", exc_info=True)
+            yield event.plain_result(f"⚠️ 创建定时任务失败：{e}")
+            return
+
+        label = dota_schedule.ACTION_LABELS.get(request.action, request.action)
+        if request.action == dota_schedule.ACTION_PLAYER and request.args:
+            label = f"{label}（{request.args}）"
+        lines = [
+            "✅ 定时任务已建好",
+            f"· 时间：{dota_schedule.cron_label(cron)}",
+            f"· 内容：{label}",
+            f"· 发到：{session_text}",
+            f"· 编号：{dota_schedule.short_id(schedule_id)}",
+            f"· 下次执行：{self.schedules.next_run_text(job, self._schedule_timezone())}",
+            "",
+        ]
+        if spec is not None and spec.once:
+            lines.append("这是一次性任务，执行完就自动结束。")
+        lines.append(
+            "它也会出现在 AstrBot 的「未来任务」页面里（可以在那边改时间或停用）。"
+        )
+        lines.append(f"在这里管理：`{keyword} 定时 列表`")
+        yield event.plain_result("\n".join(lines))
+
+    # ------------------------------------------------------------------
+    # 到点执行
+    # ------------------------------------------------------------------
+    async def _run_scheduled_task(
+        self,
+        *,
+        owner: str = "",
+        session: str = "",
+        action: str = "",
+        args: str = "",
+        schedule_id: str = "",
+        once: bool = False,
+        note: str = "",
+        **_extra: Any,
+    ) -> None:
+        """定时任务到点执行（AstrBot ``basic`` 任务的回调）。
+
+        这是**唯一**由平台调度器直接调用的入口，因此必须把「插件已卸载」
+        「没有目标会话」「数据 / 模型不可用」这几种情况全部兜住：抛异常会被
+        ``CronJobManager`` 记成任务失败，而这些问题跟任务本身没关系，
+        却会在「未来任务」页面里显示成红色错误。
+        """
+        if self._sched_stopped:
+            # 插件已经卸载（热重载时旧实例会收到这一轮唤醒）：直接退出，
+            # 否则会往一个已经不属于它的会话推消息。
+            logger.info(f"[dota2] 定时任务 {schedule_id} 在插件停止后被唤醒，跳过")
+            return
+        umo = str(session or "")
+        if not umo:
+            logger.warning(f"[dota2] 定时任务 {schedule_id} 没有目标会话，跳过")
+            return
+        logger.info(
+            f"[dota2] 定时任务 {schedule_id} 到点执行：{action} {args!r} -> {umo}"
+        )
+        try:
+            await self._dispatch_scheduled(action, args, umo)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[dota2] 定时任务 {schedule_id} 执行失败：{e}", exc_info=True)
+        finally:
+            if once:
+                # 一次性任务的 cron 是「钉死日期」写法（见 dota_schedule.once_cron），
+                # 不删掉的话明年同一天还会响一次。执行完自己收尾。
+                await self._delete_schedule(schedule_id)
+
+    async def _dispatch_scheduled(self, action: str, args: str, umo: str) -> None:
+        """按动作分派：版本榜是纯数据（不用模型），其余走模型播报。"""
+        if action == dota_schedule.ACTION_META:
+            try:
+                parts = await self._hero_meta_board_parts()
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"[dota2] 定时推送版本榜失败：{e}", exc_info=True)
+                parts = None
+            if parts is None:
+                await self._send_quiet(
+                    umo, "⚠️ 定时播报没能拿到版本英雄数据（数据源可能不可用），本次跳过。"
+                )
+                return
+            await self._send_to_session(
+                umo, f"{parts['board']}\n\n{parts['footer']}"
+            )
+            return
+
+        question = dota_schedule.build_report_question(action, args)
+        reply = await self._scheduled_report(umo, question)
+        if not reply:
+            # 静默失败是最糟的：用户以为任务建好了，其实每天早上什么都没发。
+            # 一条短提示，让他知道该去看模型 / 数据源，而不是去查任务配置。
+            logger.warning(f"[dota2] 定时播报没拿到内容，跳过本次（{umo}）")
+            await self._send_quiet(
+                umo,
+                "⚠️ 定时播报没能生成内容（大模型不可用或数据源异常），本次跳过。\n"
+                "可以先用 `/d2 模型测试` 与 `/d2 数据源` 自检一下。",
+            )
+            return
+        await self._send_to_session(umo, reply)
+
+    async def _scheduled_report(self, umo: str, question: str) -> str | None:
+        """定时播报：用与闲聊兜底**同一份**数据上下文生成一段播报。
+
+        为什么不另写一套取数：那份上下文里已经带齐了三样「坐标系」
+        —— 当前时间、本会话最近发生过的比赛、以及时间窗口。少任何一样，
+        「通报群里战绩情况」都会答成一份泛泛而谈的东西。
+        """
+        if not self.cfg("enable_llm_analysis", True):
+            return None
+        try:
+            context = await self._collect_chat_context(
+                question, umo, "", self._binding_for_umo(umo), []
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[dota2] 定时播报收集数据失败：{e}", exc_info=True)
+            return None
+        prompt = dota_chat.build_chat_prompt(question, context)
+        system_prompt = dota_chat.build_chat_system_prompt(
+            str(self.cfg("nlu_chat_system_prompt", "") or "")
+        )
+        return await self._call_report_llm(prompt, umo=umo, system_prompt=system_prompt)
+
+    def _binding_for_umo(self, umo: str) -> dict | None:
+        """没有 event 时取本会话可用的绑定（定时播报用）。
+
+        只在「本会话只有一个绑定」时才认 —— 定时任务不知道是谁建的
+        （建任务的人可能早就退群了），随便挑一个当成提问者会让播报
+        围着某个人讲。多个绑定时返回 ``None``：宁可只讲监听名单。
+        """
+        bindings = self.store.list_bindings(umo)
+        if len(bindings) == 1:
+            return next(iter(bindings.values()))
+        return None
+
+    async def _delete_schedule(self, schedule_id: str) -> None:
+        """按插件自己的 task_id 删除定时任务。
+
+        不能用 job_id：AstrBot 重启 / 插件重载时 :meth:`dota_cron.CronBridge.adopt`
+        会**重建**任务，job_id 随之改变，而 ``schedule_id`` 一直在负载里、不变。
+        """
+        if not schedule_id:
+            return
+        for job in await self.schedules.list_owned():
+            payload = getattr(job, "payload", None)
+            payload = payload if isinstance(payload, dict) else {}
+            if str(payload.get("schedule_id") or "") == str(schedule_id):
+                await self.schedules.delete(str(job.job_id))
+                logger.info(f"[dota2] 一次性定时任务 {schedule_id} 已执行完并删除")
+                return
+
+    # ------------------------------------------------------------------
+    # 启动接管
+    # ------------------------------------------------------------------
+    def _start_schedule_adopt(self) -> None:
+        """启动时接管既有定时任务（幂等）。
+
+        **必须在插件加载时就调用**，不能只挂在 ``on_astrbot_loaded`` 上：
+        热重载（WebUI 的「重载插件」）走的是 ``plugin_manager.reload()``，
+        它只重新跑一遍插件的 ``__init__``，**不会再触发** ``on_astrbot_loaded``。
+        若只在启动钩子里接管，重载之后 ``CronJobManager._basic_handlers`` 里
+        留着的仍是**上一个实例**的绑定方法，而那个实例已经 ``terminate``
+        （``_sched_stopped=True``）—— 任务到点会静默什么都不做，用户完全
+        看不出哪里坏了。
+        """
+        if self._sched_stopped or not self.cfg("schedule_enabled", True):
+            return
+        reason = self.schedules.unavailable_reason()
+        if reason:
+            # 用户可能正纳闷「为什么建不了定时任务」，把原因写进日志，
+            # 排障时一眼就能看出是平台没给能力，而不是插件坏了。
+            logger.info(f"[dota2] 定时任务不可用，已跳过：{reason}")
+            return
+        if self._sched_adopt_task is not None and not self._sched_adopt_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - 插件加载发生在事件循环里
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                return
+        self._sched_adopt_task = loop.create_task(self._adopt_schedules())
+
+    async def _adopt_schedules(self) -> None:
+        try:
+            rebuilt, failed = await self.schedules.adopt(self._run_scheduled_task)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[dota2] 接管定时任务失败：{e}", exc_info=True)
+            return
+        logger.info(
+            f"[dota2] 定时任务已就绪（接入 AstrBot「未来任务」）；"
+            f"接管既有任务：重建 {rebuilt} 个，失败 {failed} 个"
+        )
+
+    # ==================================================================
+    # 「每 N 场总结」：计数窗口与后台生成
+    # ==================================================================
+    async def _push_count_tasks(
+        self, umo: str, match_id: int, desc: str, start_time: Any
+    ) -> None:
+        """把这一场记进本会话所有「每 N 场总结」任务的窗口，攒够就发。
+
+        调用点在 ``_deliver`` 的**送达之后**（标题已经进群）。没送达的场次
+        绝不能计数 —— 否则用户会收到一份「含他根本没看到的比赛」的总结。
+        """
+        tasks = self.store.list_count_tasks(umo)
+        if not tasks:
+            return
+        row = {
+            "match_id": int(match_id),
+            "desc": str(desc or ""),
+            "time_text": self._match_time_text(start_time),
+        }
+        for task in tasks:
+            task_id = str(task.get("id") or "")
+            if not task_id:
+                continue
+            every = max(1, int(task.get("every") or dota_schedule.DEFAULT_EVERY))
+            try:
+                triggered = await self.store.push_count_task_seen(
+                    task_id, row, every=every
+                )
+            except Exception as e:  # noqa: BLE001 - 计数失败不该影响推送
+                logger.error(f"[dota2] 记录场次到计数任务 {task_id} 失败：{e}")
+                continue
+            if triggered:
+                self._spawn_summary_task(task_id, umo, every)
+
+    @staticmethod
+    def _match_time_text(start_time: Any) -> str:
+        try:
+            return time.strftime(
+                "%Y-%m-%d %H:%M", time.localtime(int(start_time or 0))
+            )
+        except (TypeError, ValueError, OSError):
+            return ""
+
+    def _spawn_summary_task(
+        self, task_id: str, umo: str, every: int, *, force: bool = False
+    ) -> None:
+        """把「生成这 N 场总结」扔进后台任务。
+
+        **绝不能**在这条链路里 await 它：一次大模型调用要十几秒，而监听
+        推送这一轮后面还有别的会话等着推。生成失败时窗口**不清空**
+        （见 :meth:`dota_store.DotaStore.reset_count_task_window`），
+        下一场再来时会带着原来的场次重试。
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - 调用点一定在协程里
+            return
+        task = loop.create_task(self._run_count_summary(task_id, umo, every, force=force))
+        self._summary_tasks.add(task)
+        task.add_done_callback(self._summary_tasks.discard)
+
+    async def _run_count_summary(
+        self, task_id: str, umo: str, every: int, *, force: bool = False
+    ) -> None:
+        """生成并推送「这 N 场」的阶段总结。
+
+        Args:
+            force: 「定时 现在」触发的预览：允许用不足 ``every`` 的场次生成，
+                且**不动窗口**（预览不该把用户攒的场次吃掉）。
+        """
+        if self._sched_stopped:
+            return
+        task = self.store.get_count_task(task_id)
+        if task is None or not task.get("enabled", True):
+            return
+        rows = dota_schedule.window_rows(list(task.get("seen") or []), every)
+        if not rows:
+            return
+        if not force and len(rows) < every:
+            # 并发窗口：同一场被两个会话同时送达，或者窗口刚被清过
+            return
+        prompt = dota_schedule.build_watch_summary_prompt(rows, every=every)
+        reply = await self._call_report_llm(
+            prompt, umo=umo, system_prompt=dota_schedule.WATCH_SUMMARY_SYSTEM_PROMPT
+        )
+        if not reply:
+            logger.warning(
+                f"[dota2] 每 {every} 场总结没生成出来（模型不可用），"
+                f"窗口保留，下一场再试（{umo}）"
+            )
+            return
+        header = f"📊 本群最近 {len(rows)} 场小结"
+        if not await self._send_to_session(umo, f"{header}\n\n{reply}"):
+            logger.warning(
+                f"[dota2] 每 {every} 场总结发送失败，窗口保留（{umo}）"
+            )
+            return
+        if not force:
+            # 只有「攒够触发」才清窗口；「现在」只是看一眼，不能吃掉进度
+            await self.store.reset_count_task_window(task_id)
+        logger.info(f"[dota2] 已推送每 {every} 场总结到 {umo}（{len(rows)} 场）")
+
+    # ==================================================================
     # 大模型调用
     # ==================================================================
     def _llm_api_key(self) -> str:
@@ -4612,13 +5371,20 @@ class Dota2Plugin(Star):
                 # 闲聊兜底问「昨天谁打得好」时也靠它 —— 这里是唯一拿到完整
                 # match 的时机，所以把英雄 / KDA / 胜负 / 时长一次写足，
                 # 并带上**比赛自己的开赛时间**（不能拿记录时刻顶替）。
+                desc = dota_chat.describe_focus_result(
+                    match, heroes, focus_ids, focus_names
+                )
                 self._nlu_remember_match(
                     umo,
                     match_id,
-                    dota_chat.describe_focus_result(
-                        match, heroes, focus_ids, focus_names
-                    ),
+                    desc,
                     start_time=match.get("start_time"),
+                )
+                # 「每监听到 N 场就总结」的计数窗口：只在**送达之后**记一笔。
+                # 没送达的场次不能计数 —— 否则用户会收到一份含他根本没看到的
+                # 比赛的总结。攒够时它自己派后台任务去生成，不阻塞这条链路。
+                await self._push_count_tasks(
+                    umo, match_id, desc, match.get("start_time")
                 )
 
                 # 正文属于「尽力而为」：失败不影响送达判定，只提示用户去看概览。
@@ -5089,12 +5855,32 @@ class Dota2Plugin(Star):
     async def terminate(self):
         """插件被卸载 / 停用时清理后台任务与网络连接。"""
         self._stopping = True
+        # 定时任务的 handler 挂在 AstrBot 的调度器上，插件卸载**不会**自动摘掉。
+        # 先立个牌子：热重载或停用之后若还有到点的任务被唤醒，handler 一进门
+        # 就靠它退出，而不是往一个已经不属于本实例的会话推消息。
+        self._sched_stopped = True
+        adopt_task = self._sched_adopt_task
+        self._sched_adopt_task = None
+        if adopt_task is not None and not adopt_task.done():
+            adopt_task.cancel()
         task = self._watch_task
         self._watch_task = None
         if task is not None and not task.done():
             task.cancel()
             try:
                 await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        # 「每 N 场总结」的后台任务同样要收掉：它正拿着旧实例的数据层，
+        # 而且可能正等着一次十几秒的模型调用。
+        summary_tasks = list(self._summary_tasks)
+        self._summary_tasks.clear()
+        for summary_task in summary_tasks:
+            if not summary_task.done():
+                summary_task.cancel()
+        for summary_task in summary_tasks:
+            try:
+                await summary_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         # 等待解析的后台任务可能挂着十分钟，必须一并取消，

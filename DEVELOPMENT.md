@@ -715,6 +715,117 @@ STRATZ 侧没有等价接口，要拼出同等口径得写参数敏感的 GraphQ
 
 重启后监听关系依然有效。
 
+#### 定时任务（AstrBot「未来任务」，v2.3.0）
+
+```
+/d2 定时                                  # 查看本会话的定时任务（同「定时 列表」）
+/d2 定时 每天早上七点，通报群里战绩情况      # 直接描述，先给计划，回「确认」才建
+/d2 定时 每晚十点总结一下大家今天的表现
+/d2 定时 每周五晚上十一点推一下轮椅
+/d2 定时 明天早上八点通报一下战绩           # 一次性
+/d2 定时 每监听到十盘战绩就生成一份这十盘的总结   # 按场次（不是时间）
+/d2 定时 删 2      / 停 2      / 开 2      / 现在 2
+```
+
+不打指令也能用（要唤醒词）：`dota2助手 每天早上七点，通报群里战绩情况`。
+
+两类任务，**实现完全不同**，别混在一起看：
+
+| | 时间型（每天 / 每周 / 明天八点） | 计数型（每监听到 N 场） |
+|---|---|---|
+| 存在哪 | **AstrBot 自己的任务库**（`cron_jobs` 表） | 插件自己的 `bindings.json` → `count_tasks` |
+| 为什么会出现在「未来任务」页面 | 就是平台的任务 | 不会，它按场次触发 |
+| 触发 | AstrBot 的 `CronJobManager` | 监听推送链路数到 N 场 |
+| 到点执行什么 | **插件自己的 handler** | 插件自己的后台任务 |
+| 管理入口 | `/d2 定时` + AstrBot 的「未来任务」页面 | 只有 `/d2 定时` |
+
+**为什么时间型任务必须建 ``basic`` 任务，而不是 ``active_agent``**
+
+AstrBot 4.x 的 `CronJobManager` 有两种任务（见 `core/cron/manager.py`）：
+
+* `active_agent`：官方给「让主智能体在某个时间醒来做事」用的。它触发时由
+  `_woke_main_agent` **直接构造并运行 AstrBot 的主智能体**（`build_main_agent`
+  之后直接跑，**不走事件流水线**）。也就是说插件**无法接管**这次执行——没有事件能拦，
+  `stop_event()` 也没用；干活的是 AstrBot 的默认模型，拿不到插件的数据层
+  （双源降级、中文英雄名、英雄池版本口径……）。用它实现「每天早上七点通报战绩」
+  只会得到一份**不受控**的输出。
+* `basic`：插件侧真正的扩展点。`add_basic_job(handler=...)` 把 handler 登记在
+  `_basic_handlers` 里，到点由 `_run_basic_job` 直接 `handler(**payload)` 调用。
+  执行的是插件自己的代码，所以数据、口径、模型通道、推送链路全都是插件这一套。
+
+因此 `dota_cron.py` 一律建 `basic` 任务。它只用公开方法：
+`add_basic_job` / `list_jobs` / `delete_job` / `update_job` / `run_job_now` /
+`get_next_run_time`。**不碰** `_basic_handlers`（私有属性，跨版本随时可能改名）。
+
+**启动接管（adopt）：为什么必须有**
+
+`basic` 任务的 handler 只活在内存里（`_basic_handlers`），而 AstrBot 启动时的
+`sync_from_db()` 对「有行、没 handler」的 basic 任务会**跳过并打警告**。
+插件加载发生在 `cron_manager.start()` 之前，所以 `CronBridge.adopt()` 在插件启动时
+把既有任务「接管」一遍：读出行 → 删行 → 用 `add_basic_job` 原样重建
+（名称 / cron / 时区 / 启停状态 / 负载照抄），handler 就位。**重建后 `job_id` 会变**，
+这是唯一的副作用——对用户不可见（列表按名称与 `schedule_id` 显示），所以
+「按 `schedule_id` 删任务」而不是按 `job_id`。
+
+接管**必须挂在插件加载时（`__init__`）而不是 `on_astrbot_loaded`**：热重载走的是
+`plugin_manager.reload()`，它只重跑一遍插件的 `__init__`，**不再触发**启动钩子。
+若只在钩子里接管，重载之后 `_basic_handlers` 里留着的仍是**上一个实例**的绑定方法，
+而那个实例已经 `terminate`（`_sched_stopped=True`）——任务到点会**静默什么都不做**。
+
+负载（payload）会被原样 `handler(**payload)` 调回来，因此**每个键都必须是合法的
+Python 标识符**，且 handler 要吃得下：
+`owner`（归属标记，只认自己建的任务）/ `session`（umo）/ `action` / `args` /
+`schedule_id` / `once` / `note`。`owner` 由 `dota_cron.create` 统一写入。
+
+**一次性任务怎么表达**：`add_basic_job` **没有** `run_once` / `run_at` 参数
+（那是 `add_active_job` 的，而后者插件接管不了），所以一次性任务用「钉死日期」的 cron
+表达：`0 8 21 9 *` = 9 月 21 日 08:00，并把 `once=True` 放进负载，**执行完由 handler
+自己删除**。万一那次没跑成（插件没启动 / 模型不可用），最坏结果是明年同一天再响一次——
+比「静默丢掉用户的任务」好。
+
+**计数型任务为什么不用 cron**：cron 只能表达时间。「每监听到十盘」硬凑成「每天跑一次、
+看计数有没有满十」会把「攒够十盘就发」拖成「第二天早上才发」。所以窗口存在插件自己的
+存储里（`count_tasks[].seen`），由 `_deliver` 在**标题送达之后**记一笔
+（没送达的场次不计数，否则用户会收到一份含他根本没看到的比赛的总结）。
+窗口**必须落盘**：只放内存的话，插件重启会让攒了一半的场次归零，用户永远等不到第十场。
+
+触发判据是 `len(seen) >= N 且 len(seen) % N == 0`。后半个条件看着多余，其实是
+**失败后的节流阀**：生成总结失败时窗口**故意不清空**（留给下一场重试），若只看
+`>= N`，那之后每来一场都会再触发一次——模型挂掉的那段时间里每场新比赛都白烧一次调用。
+
+**时间/时区**：用户说的「早上七点」是他所在时区的七点。`schedule_timezone` 留空时
+跟随 AstrBot 的全局时区（读不到才用系统时区）。库里存的是 **naive UTC**，
+列表渲染前要先把 UTC 标签补回去再换本地时区，否则会整体差 8 小时
+（`next_run_text` 就是干这个的）。
+
+**建的流程一定要先确认**：建任务会**持续生效**，误判的代价远大于绑定 / 监听。
+所以先解析出一份完整计划（几点、做什么、发到哪），回一句「确认」才真正创建；
+计划只在内存里、两分钟过期。确认回执走的是 `dota_natural` 里**独立于**
+`_nlu_confirm` 的一条路径——`_nlu_confirm` 存的是「(意图名, 参数)」，
+回执会被**再解析一次**，用户会陷进「确认 → 又让你确认」的死循环。
+
+**边界**（宁缺毋滥）：只有「出现时间表达或每 N 场」**且**跟 Dota2 数据有关才接。
+`每天七点提醒我喝水`、`每周一早上九点开会` 一律拒绝；「只说频率没说钟点」
+（`每天早上通报战绩`）用 `schedule_default_time` 兜底，并在确认文案里**写明**
+用的是默认值。规则解析在 `dota_schedule.parse_request`，句子里的人名靠
+`known_names`（本会话的绑定 / 监听名单）来认。
+
+**排障看两行日志**：插件加载时会打 `[dota2] 定时任务已就绪（接入 AstrBot「未来任务」）；
+接管既有任务：重建 N 个，失败 M 个`。看到它说明平台的 `cron_manager` 被插件拿到了、
+`_basic_handlers` 也已重新绑定（`N` 就是用户在「未来任务」里会看到的本插件任务数）。
+如果换成了 `[dota2] 定时任务不可用，已跳过：…`，那是平台侧没提供能力（版本太老或被关掉），
+**不是**插件坏了——此时按时间的任务建不了，但计数型（每 N 场）仍然可用。
+
+回归：`tests/schedule_check.py`（189 项：时间解析 → cron、拒绝纯提醒、意图优先级、
+`CronBridge` 的建 / 列 / 停 / 删 / 接管与 UTC→本地渲染、计数窗口的触发与去重、
+`/d2 定时` 全流程、到点执行、一次性任务自删、插件卸载后不再推送、平台无 cron 时
+计数型仍可用、配置关闭）。
+
+另有一支**在线验收**（跑 AstrBot **真实**的 `CronJobManager` + `SQLiteDatabase`，不是替身）：
+自然语言 → 确认 → 真的进平台任务库 → 到点由平台调度器调起插件 handler → 重载后接管
+（`job_id` 变、名称 / cron / 负载不变）→ 停用再启用 handler 不丢 → 一次性任务执行完自删。
+它依赖本机 AstrBot 安装路径，所以**不入库**，脚本在 `.workbuddy/tmp/live_schedule_accept.py`。
+
 #### 模型自检
 
 ```
@@ -936,6 +1047,9 @@ OpenDota 作为后备。主源失效时自动切后备，无需人工干预。
 | `hero_meta_hot_size` | 5 | 「热门里最横的」取场次前几名 |
 | `hero_meta_cold_size` | 3 | 「悠着点」取多少个垫底英雄 |
 | `hero_meta_min_pick` | 0 | 榜单最低样本门槛；0 = 自适应 `max(200, 中位数 × 0.1)` |
+| `schedule_enabled` | true | 启用定时任务（按时间的建在 AstrBot 的「未来任务」里；按场次的存在插件存储里） |
+| `schedule_default_time` | `07:00` | 定时任务的默认时刻（`HH:MM`）：用户只说频率、没说钟点时用它，并在确认文案里写明 |
+| `schedule_timezone` | 空 | 定时任务时区。留空跟随 AstrBot 全局时区，读不到才用系统时区。服务器不在用户时区时必须显式填 |
 
 ### 数据来源与已知限制
 
@@ -1017,7 +1131,9 @@ astrbot_plugin_dota2/
 ├── dota_nlu.py          # 自然语言意图识别（大模型优先，关键词只管唤醒 + 兜底）
 ├── dota_chat.py         # 闲聊兜底：把插件内部数据整理成模型上下文（含时间窗口与同场局）
 ├── dota_tools.py        # 兜底对话的工具层：只读查询工具的 schema + 执行器（依赖注入，可离线测）
-├── dota_store.py        # 绑定与监听关系的落盘读写
+├── dota_schedule.py     # 定时任务的口径层：中文时间 → cron、任务动作、确认/列表文案（纯逻辑）
+├── dota_cron.py         # AstrBot「未来任务」桥接：只建 basic 任务，启动时接管既有任务
+├── dota_store.py        # 绑定 / 监听 / 计数型定时任务的落盘读写
 ├── dota_format.py       # 原始数据 → 可读文本 / 结构化提示词素材
 ├── dota_analyzer.py     # 提示词构造 + 大模型调用
 ├── _conf_schema.json    # 插件配置 Schema
@@ -1054,6 +1170,7 @@ python tests/llm_channel_check.py    # 专用模型 API Key：地址归一 / 返
 python tests/fallback_check.py       # 主/后备数据源：降级触发、不降级情形、插件组装、按 SOURCE_KIND 定位 OpenDota
 python tests/hero_meta_check.py      # 版本强势英雄（轮椅）：自适应门槛、位置互斥判定、三段榜去重、趋势留白、榜内推荐
 python tests/hero_pool_check.py      # 英雄池口径：当前版本过滤、样本不足向前并入、加速模式不被静默丢弃、无版本维度时降级标注
+python tests/schedule_check.py       # 定时任务：时间→cron、拒绝纯提醒、意图优先级、CronBridge 建/列/停/删/接管、计数窗口、到点执行、一次性自删
 python tests/stratz_client_live.py   # STRATZ 客户端真实 API 验证（需在文件内填 Key）
 python tests/od_data_probe.py        # 真实拉取指定比赛的 od_data，探查解析状态
 ```
