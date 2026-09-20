@@ -2178,7 +2178,14 @@ def format_hero_stats(
     heroes: dict[int, dict],
     top: int = 12,
 ) -> str:
-    """按英雄维度展示玩家统计。
+    """按英雄维度展示玩家统计（**生涯累计口径**）。
+
+    .. note::
+        命令层已改用 :mod:`dota_pool` 的版本口径（只看当前版本、含加速模式），
+        本函数保留给「确实要看生涯累计」的场景与既有测试。
+        直接拿 ``/players/{id}/heroes`` 的默认返回有两个坑：不认版本、
+        且 OpenDota 默认把加速模式整套丢掉（详见
+        :meth:`dota_api.OpenDotaClient.get_player_heroes`）。
 
     这里**不展示「最近使用」**：唯一的时间来源是 ``/players/{id}/heroes``
     的 ``last_played``，而该字段实测系统性陈旧（见 :func:`recent_hero_usage`

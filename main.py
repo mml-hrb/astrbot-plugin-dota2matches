@@ -53,7 +53,6 @@ try:  # 插件目录被作为包加载时的相对导入
         fmt_wan,
         format_hero_meta_board,
         format_hero_meta_footer,
-        format_hero_stats,
         format_match_list,
         format_player_profile,
         format_summary_block,
@@ -74,6 +73,7 @@ try:  # 插件目录被作为包加载时的相对导入
     from . import dota_chat
     from . import dota_nlu
     from . import dota_parse
+    from . import dota_pool
     from . import dota_tools
     from . import dota_zh
 except ImportError:  # 兜底：以普通模块方式加载时（把插件目录加入 sys.path）
@@ -108,7 +108,6 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
         fmt_wan,
         format_hero_meta_board,
         format_hero_meta_footer,
-        format_hero_stats,
         format_match_list,
         format_player_profile,
         format_summary_block,
@@ -130,6 +129,7 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
     import dota_chat  # type: ignore[no-redef]
     import dota_nlu  # type: ignore[no-redef]
     import dota_parse  # type: ignore[no-redef]
+    import dota_pool  # type: ignore[no-redef]
     import dota_tools  # type: ignore[no-redef]
     import dota_zh  # type: ignore[no-redef]
 
@@ -1101,6 +1101,26 @@ class Dota2Plugin(Star):
             logger.debug(f"[dota2] 获取英雄常量失败：{e}")
             return {}
         return await self._localize_heroes(raw)
+
+    async def _hero_pool(self, account_id: int) -> "dota_pool.HeroPool":
+        """取英雄池（当前版本口径 + 含加速模式），配置从插件配置读。
+
+        之所以收成一个方法：指令、轮椅的个人适配、近期分析、兜底对话四处
+        都要用英雄池，各读各的配置很容易出现「同一个回答里两种口径」。
+        """
+        min_games = int(self.cfg("hero_pool_min_games", dota_pool.DEFAULT_MIN_GAMES) or 0)
+        max_patches = int(self.cfg("hero_pool_max_patches", dota_pool.DEFAULT_MAX_PATCHES) or 0)
+        include_turbo = self.cfg("hero_pool_include_turbo", True)
+        patch_scope = self.cfg("hero_pool_patch_scope", True)
+        return await dota_pool.collect_hero_pool(
+            self.api,
+            account_id,
+            min_games=max(1, min_games),
+            max_patches=max(1, max_patches),
+            include_turbo=False if include_turbo is False else True,
+            patch_scope=False if patch_scope is False else True,
+            timeout=max(5.0, float(self.cfg("request_timeout", 30) or 30)),
+        )
 
     async def _items(self) -> dict[str, dict]:
         """道具常量（已中文本地化）。"""
@@ -2298,6 +2318,16 @@ class Dota2Plugin(Star):
                 cache=self._chat_cache,
                 localizer=self._localize_heroes,
                 now=time.time(),
+                hero_pool_cfg={
+                    "min_games": int(
+                        self.cfg("hero_pool_min_games", dota_pool.DEFAULT_MIN_GAMES) or 0
+                    ),
+                    "max_patches": int(
+                        self.cfg("hero_pool_max_patches", dota_pool.DEFAULT_MAX_PATCHES) or 0
+                    ),
+                    "include_turbo": self.cfg("hero_pool_include_turbo", True),
+                    "patch_scope": self.cfg("hero_pool_patch_scope", True),
+                },
             )
         except Exception as e:  # noqa: BLE001 - 兜底失败也要放行，不能吞消息
             logger.error(f"[dota2] 闲聊兜底收集数据失败: {e}", exc_info=True)
@@ -2740,20 +2770,26 @@ class Dota2Plugin(Star):
                 yield event.plain_result(f"❌ OpenDota 查不到账号 {account_id}。")
                 return
             wl = await self.api.get_player_wl(account_id)
-            hero_rows = await self.api.get_player_heroes(account_id)
             heroes = await self._heroes()
         except OpenDotaError as e:
             yield event.plain_result(f"❌ 查询失败：{e}")
             return
 
-        yield event.plain_result(
-            format_player_profile(player_data, wl, hero_rows, heroes)
-        )
+        pool = await self._hero_pool(account_id)
+        text = format_player_profile(player_data, wl, pool.rows, heroes)
+        if pool.has_data:
+            text += f"\n常用英雄口径: {dota_pool.hero_pool_scope_text(pool)}"
+        yield event.plain_result(text)
 
     @d2.command("heroes", alias={"英雄", "hero", "英雄池"})
     @take_over_event
     async def d2_heroes(self, event: AstrMessageEvent, args: GreedyStr):
-        """查看英雄使用统计：/d2 英雄 [昵称|账号ID]"""
+        """查看英雄使用统计：/d2 英雄 [昵称|账号ID]
+
+        口径是**当前版本**（样本不足时自动并入更早的版本并在文案里说明），
+        并且**包含加速模式** —— 群里多数人的对局是加速局，不计入的话
+        这个人的英雄池看起来几乎是空的。
+        """
         target = str(args).strip()
         if target:
             try:
@@ -2770,13 +2806,13 @@ class Dota2Plugin(Star):
             name = binding.get("personaname") or f"账号{account_id}"
 
         try:
-            hero_rows = await self.api.get_player_heroes(account_id)
+            pool = await self._hero_pool(account_id)
             heroes = await self._heroes()
         except OpenDotaError as e:
             yield event.plain_result(f"❌ 查询失败：{e}")
             return
 
-        text = format_hero_stats(name, hero_rows, heroes)
+        text = dota_pool.format_hero_pool(pool, name, heroes)
         for chunk in self._chunk_text(text):
             yield event.plain_result(chunk)
 
@@ -2867,7 +2903,7 @@ class Dota2Plugin(Star):
 
         limit = self._clamp_count(None)
         try:
-            hero_rows = await self.api.get_player_heroes(account_id)
+            pool = await self._hero_pool(account_id)
             matches, _economy = await self.api.get_player_matches_enriched(
                 account_id, limit
             )
@@ -2881,6 +2917,7 @@ class Dota2Plugin(Star):
             yield event.plain_result(f"❌ 拉取 {name} 的数据失败：{e}")
             return
 
+        hero_rows = pool.rows
         if not hero_rows and not matches:
             yield event.plain_result(
                 f"没有查到 {name} 的英雄池与近期对局，做不了个人适配。"
@@ -2898,6 +2935,7 @@ class Dota2Plugin(Star):
             meta=meta,
             heroes=heroes,
             patch=patch,
+            pool_scope=dota_pool.hero_pool_scope_text(pool) if pool.has_data else "",
         )
         report = await self._generate_report(event, prompt)
         if report:
@@ -2915,7 +2953,12 @@ class Dota2Plugin(Star):
                 "近期记录也不足以判断他常打的位置。"
             )
             return
-        for chunk in self._chunk_text(f"{header}\n\n{fallback}"):
+        scope_line = (
+            f"（英雄池口径：{dota_pool.hero_pool_scope_text(pool)}）\n\n"
+            if pool.has_data
+            else ""
+        )
+        for chunk in self._chunk_text(f"{header}\n\n{scope_line}{fallback}"):
             yield event.plain_result(chunk)
 
     # ==================================================================
@@ -3013,10 +3056,9 @@ class Dota2Plugin(Star):
             try:
                 player_data = await self.api.get_player(account_id) or {}
                 wl = await self.api.get_player_wl(account_id)
-                hero_rows = await self.api.get_player_heroes(account_id)
             except OpenDotaError as e:
                 logger.warning(f"[dota2] 补充玩家资料失败: {e}")
-                player_data, wl, hero_rows = {}, {}, []
+                player_data, wl = {}, {}
         except OpenDotaError as e:
             yield event.plain_result(f"❌ 拉取数据失败：{e}")
             return
@@ -3025,15 +3067,17 @@ class Dota2Plugin(Star):
             yield event.plain_result(f"没有查询到 {name} 的比赛记录。")
             return
 
+        pool = await self._hero_pool(account_id)
         prompt = build_recent_analysis_prompt(
             account_id=account_id,
             profile_data=player_data,
             wl=wl,
             matches=matches,
             heroes=heroes,
-            hero_rows=hero_rows,
+            hero_rows=pool.rows,
             economy_samples=economy_samples,
             requested_count=limit,
+            pool_scope=dota_pool.hero_pool_scope_text(pool) if pool.has_data else "",
         )
 
         report = await self._generate_report(event, prompt)

@@ -344,6 +344,63 @@ provider —— 后者的 `text_chat` 只暴露纯文本进出，各版本对工
 /d2 轮椅 核心 天鸽                # 位置 + 目标一起给
 ```
 
+#### 英雄池（version 口径 + 加速模式）
+
+`/d2 英雄`、`/d2 资料`、`/d2 轮椅`（个人适配）、`/d2 分析`，以及自然语言兜底里的
+`query_hero_pool` / `query_profile` / `recommend_heroes` 工具，**共用同一份口径实现**
+`dota_pool.collect_hero_pool()`（main 侧收口在 `Dota2Plugin._hero_pool`，工具侧在
+`dota_tools._pool_of`）。以前各处各拿一份 `api.get_player_heroes()` 直接渲染，
+口径不一致 —— 这份实现就是为了把口径钉死在一个地方。
+
+**两个必须修的问题**（都是真实数据取证的）：
+
+1. **只看当前版本**。旧实现拿的是**生涯累计**，把几个月前的场次和上个版本的强势期
+   混在一起；推荐「该练什么」时参考价值很低。现在只取 `/constants/patch` 倒序第一项
+   对应的补丁。
+2. **数据源默认把加速模式整批丢掉**。OpenDota `/players/{id}/heroes` 默认带
+   `significant=1`，会把加速（Turbo，`game_mode=23`）的场次**静默排除** —— 不报错、
+   字段照常返回，只是数字小得离谱。实测钢板当前版本：旧口径 17 场 → 新口径 407 场
+   （其中加速 389）。群里六个人新旧对照：17→407、1→101、5→221、0→548、0→629、29→340。
+   **这群人九成以上打加速**，旧口径下英雄池几乎为空。
+
+做法：
+
+| 维度 | 实现 |
+|---|---|
+| 版本过滤 | 走**服务端**参数 `?patch=<id>`。`matches` / `heroes` 的返回体里**没有 patch 字段**，客户端切不了版本，只能靠服务端过滤（`get_player_heroes(patch=60)` 实测生效） |
+| 加速模式 | `?significant=0` 把 insignificant 局（含 Turbo）一并拿回；再单独以 `game_mode=23` 求一次，**只为了算加速占比**，不叠加总量 |
+| 样本不足放宽 | 当前版本场次 < `hero_pool_min_games`（默认 30）时，按补丁**倒序向前并入**更早版本，最多 `hero_pool_max_patches` 个（默认 3），并在抬头写明覆盖了哪几个版本 |
+| 无版本维度的数据源 | `SUPPORTS_PATCH_FILTER=False` 的数据源退回**全量口径**，并在抬头/提示词里**显式标注**不支持版本过滤 |
+
+抬头格式固定为「`7.41 版本 · 407 场（加速 389 / 普通 18）`」。**加速占比必须写出来**：
+不写的话读者会默认这是普通局胜率，而加速局的节奏与胜率分布跟普通局差很远。
+样本不足放宽时抬头换成「`7.41 + 7.40 版本 · 583 场（加速 565 / 普通 18）`」。
+
+.. warning::
+
+   **STRATZ 没有版本维度，必须显式降级**。实测它的 GraphQL
+   `heroesPerformance(request:{patchIds:[60]})` 直接报 `Unknown field`（它只支持
+   `gameModeIds`，所以加速能取到、版本取不到）。降级时**绝不能拿全生涯冒充当前版本**：
+   `pool.reason` 会写明「数据源不支持版本过滤，已退回全量口径」，这句会一路带到
+   用户看到的抬头和喂给模型的提示词里。线上 `data_source_priority=opendota`，
+   正常情况下走不到这条分支。
+
+口径字符串由 `dota_pool.hero_pool_scope_text()` 生成，经 `build_hero_pick_prompt` /
+`build_recent_analysis_prompt` 的 `pool_scope` 形参、以及兜底对话的
+`ChatContext.hero_pool_scope` 一路透到提示词里，避免模型把「当前版本」的英雄池
+当成生涯数据来解读（「你玩光之守卫 33 场」这种话，模型的默认理解是生涯累计）。
+
+**失败一律返回空池**（`has_data=False`），不抛异常 —— 英雄池只是回答里的一块，
+不该因为一块数据取不到就拖垮整条指令。取数超时由调用方按 `factor=3.0` 放大
+（版本过滤是逐个补丁串行取数，比单次请求慢）。
+
+配置（4 键）：`hero_pool_patch_scope`（总开关，false = 退回生涯口径）、
+`hero_pool_min_games`（默认 30）、`hero_pool_max_patches`（默认 3）、
+`hero_pool_include_turbo`（默认 true，**别关** —— 关掉等于回到丢加速的老问题）。
+
+回归：`tests/hero_pool_check.py`（口径开关、样本不足放宽、STRATZ 降级标注、
+补丁表失败回落、参数翻译成 `patch= / game_mode= / significant=0`、补丁表倒序与缓存）。
+
 #### 版本强势英雄（轮椅）
 
 **数据源固定走 OpenDota 的 `/heroStats`**，不走 `data_source_priority`：这是 OpenDota 的
@@ -459,14 +516,20 @@ STRATZ 侧没有等价接口，要拼出同等口径得写参数敏感的 GraphQ
 `nlu_check.py` 的 `[16]` 断言英雄池接口的调用次数必须为 0。
 
 **数据源路由**：`FallbackDataSource.get_hero_stats()` / `get_latest_patch()` /
-`request_parse()` 都按 **`SOURCE_KIND` 身份**定位 OpenDota 那一端（`is_opendota_source()`），
+`get_patches()` / `request_parse()` 都按 **`SOURCE_KIND` 身份**定位 OpenDota 那一端（`is_opendota_source()`），
 而不是写死 `primary` / `secondary`。这修掉了一个既有 bug：早先 `request_parse` 写的是
 「转发给 `self.secondary`」，只在 `data_source_priority=stratz` 时成立；线上配置是
 `opendota`，此时 secondary 是 STRATZ，催解析被转发给一个永远返回 `False` 的实现 ——
 **从未真正提交过**。
 
+`SUPPORTS_PATCH_FILTER` 是数据源层的**能力开关**，由 `FallbackDataSource` 代为转发：
+当前生效的是主源就返回主源的、已降级到后备就返回后备的。上层（`dota_pool`）据此决定
+能不能按版本取数 —— 这样「降级之后口径跟着变」是自动的，不用调用方感知。
+
 缓存：`/heroStats` 3 小时（`HERO_STATS_CACHE_TTL`）、`/constants/patch` 12 小时
-（`PATCH_CACHE_TTL`），都在 `OpenDotaClient` 实例上。
+（`PATCH_CACHE_TTL`），都在 `OpenDotaClient` 实例上。补丁表缓存的是**整份倒序列表**
+（`_patches_cache`），`get_patches(limit=n)` 只是切片 —— 版本口径要按序向前并入，
+取一个补丁和取三个补丁都得有整份表才排得对序。
 
 #### AI 分析（近期表现）
 
@@ -865,6 +928,10 @@ OpenDota 作为后备。主源失效时自动切后备，无需人工干预。
 | `nlu_chat_tool_rounds` | 3 | 兜底对话最多几轮工具调用（用完收走工具，要一次收口回答） |
 | `nlu_chat_tool_max_calls` | 6 | 一次回答最多执行几个查询工具（超出的不执行，只回一句说明） |
 | `nlu_chat_tool_timeout` | 30.0 | 单个查询工具的超时（秒），超时只影响那一个工具 |
+| `hero_pool_patch_scope` | true | 英雄池按**当前版本**统计（详见[英雄池口径](#英雄池version-口径--加速模式)）；false = 退回生涯累计 |
+| `hero_pool_min_games` | 30 | 当前版本场次低于此值就按补丁倒序向前并入更早版本 |
+| `hero_pool_max_patches` | 3 | 向前并入的版本数上限 |
+| `hero_pool_include_turbo` | true | 英雄池计入加速模式（Turbo）。**别关**：数据源默认会静默丢掉加速局 |
 | `hero_meta_board_size` | 10 | 「胜率最高」榜单展示多少个英雄 |
 | `hero_meta_hot_size` | 5 | 「热门里最横的」取场次前几名 |
 | `hero_meta_cold_size` | 3 | 「悠着点」取多少个垫底英雄 |
@@ -986,6 +1053,7 @@ python tests/proactive_scene_check.py # 主动推送前置：重启后补回「�
 python tests/llm_channel_check.py    # 专用模型 API Key：地址归一 / 返回体解析 / 回退优先级
 python tests/fallback_check.py       # 主/后备数据源：降级触发、不降级情形、插件组装、按 SOURCE_KIND 定位 OpenDota
 python tests/hero_meta_check.py      # 版本强势英雄（轮椅）：自适应门槛、位置互斥判定、三段榜去重、趋势留白、榜内推荐
+python tests/hero_pool_check.py      # 英雄池口径：当前版本过滤、样本不足向前并入、加速模式不被静默丢弃、无版本维度时降级标注
 python tests/stratz_client_live.py   # STRATZ 客户端真实 API 验证（需在文件内填 Key）
 python tests/od_data_probe.py        # 真实拉取指定比赛的 od_data，探查解析状态
 ```

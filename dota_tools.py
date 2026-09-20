@@ -35,7 +35,6 @@ from astrbot.api import logger
 try:  # 插件目录被作为包加载时的相对导入
     from .dota_format import (
         format_hero_meta_board,
-        format_hero_stats,
         format_match_list,
         format_player_profile,
         format_summary_block,
@@ -45,6 +44,7 @@ try:  # 插件目录被作为包加载时的相对导入
         pick_heroes_for_player,
         summarize_matches,
     )
+    from . import dota_pool
 except ImportError:  # 兜底：以普通模块方式加载时，把插件目录加入 sys.path
     import os
     import sys
@@ -52,7 +52,6 @@ except ImportError:  # 兜底：以普通模块方式加载时，把插件目录
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from dota_format import (  # type: ignore[no-redef]
         format_hero_meta_board,
-        format_hero_stats,
         format_match_list,
         format_player_profile,
         format_summary_block,
@@ -62,6 +61,7 @@ except ImportError:  # 兜底：以普通模块方式加载时，把插件目录
         pick_heroes_for_player,
         summarize_matches,
     )
+    import dota_pool  # type: ignore[no-redef]
 
 #: 单个工具返回给模型的文本上限。超出的部分截掉并标注 —— 只留最前面
 #: 最有信息量的部分，比塞满上下文更有用。
@@ -178,14 +178,16 @@ def build_tool_specs() -> list[dict]:
         ),
         _spec(
             "query_hero_pool",
-            "查询某位玩家的英雄池统计：每个英雄的场次、胜率、最近使用时间。"
+            "查询某位玩家的英雄池统计：每个英雄的场次与胜率。"
+            "口径是**当前版本**（样本太少时会自动并入更早的版本并说明），"
+            "并且**包含加速模式**——这群人多数对局是加速局，不带上它池子几乎是空的。"
             "问「他会玩什么」「绝活是什么」「英雄池深不深」时用。",
             {"player": _PLAYER_PROP},
             [],
         ),
         _spec(
             "query_profile",
-            "查询某位玩家的账号资料：段位、生涯总场次与胜率、常用英雄。"
+            "查询某位玩家的账号资料：段位、生涯总场次与胜率、当前版本的常用英雄。"
             "问「他什么段位」「打了多少场」时用。",
             {"player": _PLAYER_PROP},
             [],
@@ -260,16 +262,58 @@ async def _person(args: dict, ctx: ToolContext) -> tuple[int, str]:
     return await ctx.resolve_player(raw)
 
 
-async def _guarded(coro: Awaitable[Any], ctx: ToolContext) -> Any:
+async def _guarded(
+    coro: Awaitable[Any], ctx: ToolContext, *, factor: float = 1.0
+) -> Any:
     """给工具内部的数据源调用加超时。
 
     下限只取 0.1 秒：超时值由配置决定，配置成 0 / 负数时回落到
     :data:`DEFAULT_TOOL_TIMEOUT`。**不要**在这里写死一个较大的下限
     （例如 5 秒）—— 那会让「把超时调小」这个配置项彻底失效，
     测试也没法验证超时分支。
+
+    Args:
+        factor: 放大倍数。有些调用内部要串好几个接口（英雄池按版本放宽时
+            可能连查 3 个版本、每个两次请求），按单接口的超时去卡它必然误杀。
     """
     timeout = float(ctx.timeout or 0) or DEFAULT_TOOL_TIMEOUT
-    return await asyncio.wait_for(coro, timeout=max(0.1, timeout))
+    return await asyncio.wait_for(coro, timeout=max(0.1, timeout * max(1.0, factor)))
+
+
+async def _pool_of(ctx: ToolContext, account_id: int) -> "dota_pool.HeroPool":
+    """按插件配置取一位玩家的英雄池（版本口径 + 含加速模式）。
+
+    口径配置集中在这里读，三个用到英雄池的工具共用一份，避免各读各的
+    导致同一个回答里出现两种口径。**取数失败时返回空池**（不抛异常）。
+    """
+    min_games = _clamp_int(
+        ctx.cfg("hero_pool_min_games", dota_pool.DEFAULT_MIN_GAMES),
+        default=dota_pool.DEFAULT_MIN_GAMES,
+        low=1,
+        high=100000,
+    )
+    max_patches = _clamp_int(
+        ctx.cfg("hero_pool_max_patches", dota_pool.DEFAULT_MAX_PATCHES),
+        default=dota_pool.DEFAULT_MAX_PATCHES,
+        low=1,
+        high=20,
+    )
+    cfg_turbo = ctx.cfg("hero_pool_include_turbo", True)
+    cfg_scope = ctx.cfg("hero_pool_patch_scope", True)
+    pool = await _guarded(
+        dota_pool.collect_hero_pool(
+            ctx.api,
+            account_id,
+            min_games=min_games,
+            max_patches=max_patches,
+            include_turbo=False if cfg_turbo is False else True,
+            patch_scope=False if cfg_scope is False else True,
+            timeout=ctx.timeout or dota_pool.DEFAULT_TIMEOUT,
+        ),
+        ctx,
+        factor=3.0,
+    )
+    return pool
 
 
 # ---------------------------------------------------------------- 各工具实现
@@ -310,11 +354,13 @@ async def _tool_query_matches(args: dict, ctx: ToolContext) -> str:
 
 async def _tool_query_hero_pool(args: dict, ctx: ToolContext) -> str:
     account_id, name = await _person(args, ctx)
-    rows = await _guarded(ctx.api.get_player_heroes(account_id), ctx)
-    if not rows:
+    pool = await _pool_of(ctx, account_id)
+    if not pool.has_data:
         return f"没有取到 {name} 的英雄池数据（可能该账号未公开比赛数据）。"
     heroes = await _guarded(ctx.heroes(), ctx)
-    return format_hero_stats(name, rows, heroes, top=12)
+    text = dota_pool.format_hero_pool(pool, name, heroes, top=12)
+    note = dota_pool.hero_pool_note(pool)
+    return text + ("\n\n（口径：" + note + "）" if note else "")
 
 
 async def _tool_query_profile(args: dict, ctx: ToolContext) -> str:
@@ -323,9 +369,13 @@ async def _tool_query_profile(args: dict, ctx: ToolContext) -> str:
     if not profile:
         return f"数据源查不到账号 {account_id}（{name}）。"
     wl = await _guarded(ctx.api.get_player_wl(account_id), ctx)
-    rows = await _guarded(ctx.api.get_player_heroes(account_id), ctx)
     heroes = await _guarded(ctx.heroes(), ctx)
-    return format_player_profile(profile, wl or {}, rows or [], heroes)
+    # 「常用英雄」也按同一份版本口径取，否则档案里的英雄会是几年前的老黄历
+    pool = await _pool_of(ctx, account_id)
+    text = format_player_profile(profile, wl or {}, pool.rows, heroes)
+    if pool.has_data:
+        text += f"\n常用英雄口径: {dota_pool.hero_pool_scope_text(pool)}"
+    return text
 
 
 async def _meta_board(ctx: ToolContext, position: str = "") -> tuple[list[dict], dict, dict]:
@@ -369,7 +419,8 @@ async def _tool_recommend_heroes(args: dict, ctx: ToolContext) -> str:
     if not rows:
         return "没有拿到版本英雄数据（数据源可能暂时不可用），稍后再试。"
 
-    hero_rows = await _guarded(ctx.api.get_player_heroes(account_id), ctx)
+    pool = await _pool_of(ctx, account_id)
+    hero_rows = pool.rows
     matches = await _guarded(
         ctx.fetch_matches(
             account_id,
@@ -393,14 +444,12 @@ async def _tool_recommend_heroes(args: dict, ctx: ToolContext) -> str:
             f"筛不出合适的{scope}。"
         )
     header = f"=== 版本强势英雄里适合 {name} 的{scope} ==="
-    return "\n".join(
-        [
-            header,
-            hero_meta_note(meta, extra["patch"]),
-            text,
-        ]
-    )
-
+    lines = [header]
+    if pool.has_data:
+        lines.append(f"（英雄池口径：{dota_pool.hero_pool_scope_text(pool)}）")
+    lines.append(hero_meta_note(meta, extra["patch"]))
+    lines.append(text)
+    return "\n".join(lines)
 
 _DISPATCH: dict[str, Callable[[dict, ToolContext], Awaitable[str]]] = {
     "list_players": _tool_list_players,
@@ -508,4 +557,8 @@ TOOL_GUIDE = """=== 你可以调用工具查真实数据 ===
    用 `/d2 绑定 …`、`/d2 监听 …` 指令。
 9. 单场复盘（要比赛 ID 的那种）也不在工具里：它可能要等解析好几分钟，
    请让用户直接说「复盘 <比赛ID>」由指令处理。
+10. 英雄池类工具（`query_hero_pool` / `recommend_heroes`）返回的口径行里会写明
+   **覆盖了哪个版本、共多少场、其中加速模式多少场**。这群人多数对局是加速局，
+   所以「加速占比很高」是常态，别当成异常；但也别把加速局的胜率直接说成
+   天梯强度 —— 提到胜率时把口径一起说清楚。
 """

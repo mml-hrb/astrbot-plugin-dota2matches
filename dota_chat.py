@@ -66,6 +66,15 @@ from typing import Any, Iterable
 
 from astrbot.api import logger
 
+try:  # 插件目录被作为包加载时的相对导入
+    from . import dota_pool
+except ImportError:  # 兜底：以普通模块方式加载时，把插件目录加入 sys.path
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import dota_pool  # type: ignore[no-redef]
+
 # ======================================================================
 # 数据块：需要拿到什么，由问题里的信号决定
 # ======================================================================
@@ -989,6 +998,10 @@ class ChatContext:
     snapshots: list[PlayerSnapshot] = field(default_factory=list)
     heroes: dict[int, dict] = field(default_factory=dict)
     hero_history: list[dict] = field(default_factory=list)
+    #: 英雄池的**口径说明**（覆盖哪个版本、共多少场、其中加速多少场）。
+    #: 空串表示没按版本口径取（或没取到）。不写进提示词的话，模型会把
+    #: 「当前版本的场次」当成生涯数据，说出「他总共就玩过 17 场」这种错话。
+    hero_pool_scope: str = ""
     needs: set[str] = field(default_factory=set)
     #: 给模型看的「注意事项」，例如某块数据没取到
     notes: list[str] = field(default_factory=list)
@@ -1400,7 +1413,12 @@ def format_context_block(ctx: ChatContext) -> str:
     # ---- 英雄池 ----
     if ctx.hero_history:
         lines.append("")
-        lines.append("【提问者的英雄池】按使用场次排序，取前几：")
+        # 口径必须写在抬头：这份池子是**当前版本**的（且默认含加速局），
+        # 不写模型就会当成生涯数据，说出「他总共就玩过这几个英雄」这种错话
+        title = "【提问者的英雄池】按使用场次排序，取前几："
+        if ctx.hero_pool_scope:
+            title += f"（口径：{ctx.hero_pool_scope}）"
+        lines.append(title)
         # 英雄池接口不带位置，位置只能从他自己近期的对局记录里就地取
         hero_pos = _self_hero_positions(ctx)
         for row in ctx.hero_history[:HERO_ROWS]:
@@ -1539,15 +1557,41 @@ async def _fetch_snapshot(
     )
 
 
-async def _fetch_hero_history(api: Any, account_id: int, timeout: float) -> list[dict]:
+async def _fetch_hero_history(
+    api: Any,
+    account_id: int,
+    timeout: float,
+    *,
+    pool_cfg: dict | None = None,
+) -> tuple[list[dict], str]:
+    """取提问者的英雄池，返回 ``(英雄行, 口径说明)``。
+
+    走 :func:`dota_pool.collect_hero_pool`：**只看当前版本**（样本不足时
+    自动并入更早的版本并说明），且**包含加速模式** —— 群里多数人的对局
+    是加速局，按旧口径（``/players/{id}/heroes`` 默认返回）他们的英雄池
+    几乎是空的，模型据此说「他没什么在玩的英雄」就完全是冤枉。
+    """
+    cfg = dict(pool_cfg or {})
     try:
-        rows = await asyncio.wait_for(
-            api.get_player_heroes(account_id), timeout=timeout
+        pool = await asyncio.wait_for(
+            dota_pool.collect_hero_pool(
+                api,
+                account_id,
+                min_games=int(cfg.get("min_games") or dota_pool.DEFAULT_MIN_GAMES),
+                max_patches=int(cfg.get("max_patches") or dota_pool.DEFAULT_MAX_PATCHES),
+                include_turbo=cfg.get("include_turbo", True) is not False,
+                patch_scope=cfg.get("patch_scope", True) is not False,
+                timeout=max(1.0, float(timeout or dota_pool.DEFAULT_TIMEOUT)),
+            ),
+            # 内部每个请求各有超时，这里再兜一层整体超时（最多查 N 个版本）
+            timeout=max(1.0, float(timeout or dota_pool.DEFAULT_TIMEOUT)) * 3,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[dota2] 闲聊兜底：拉取 {account_id} 英雄池失败: {e}")
-        return []
-    return [row for row in (rows or []) if isinstance(row, dict)]
+        return [], ""
+    if not pool.has_data:
+        return [], ""
+    return pool.rows, dota_pool.hero_pool_scope_text(pool)
 
 
 async def collect_chat_context(
@@ -1568,6 +1612,7 @@ async def collect_chat_context(
     cache_ttl: float = DEFAULT_CACHE_TTL,
     localizer: Any = None,
     now: float | None = None,
+    hero_pool_cfg: dict | None = None,
 ) -> ChatContext:
     """收集一次闲聊回答所需的插件数据。
 
@@ -1585,6 +1630,9 @@ async def collect_chat_context(
         cache: 可选的战绩缓存 ``{(account_id, limit): (时间戳, 快照)}``，
             由调用方持有，跨消息复用；不传则不缓存。
         now: 回答时刻（时间戳）。测试可传入固定值，生产不传即取当前时间。
+        hero_pool_cfg: 英雄池口径配置（``min_games`` / ``max_patches`` /
+            ``include_turbo`` / ``patch_scope``），由插件主体从配置读好传入；
+            不传则用 :mod:`dota_pool` 的默认值。
 
     Returns:
         :class:`ChatContext`。**不会抛异常** —— 任何一块数据拿不到，
@@ -1739,7 +1787,9 @@ async def collect_chat_context(
 
     # ---- 英雄池（只对提问者本人） ----
     if NEED_HEROES in ctx.needs and self_account:
-        ctx.hero_history = await _fetch_hero_history(api, self_account, timeout)
+        ctx.hero_history, ctx.hero_pool_scope = await _fetch_hero_history(
+            api, self_account, timeout, pool_cfg=hero_pool_cfg
+        )
         if not ctx.hero_history:
             ctx.notes.append("提问者的英雄池数据没取到。")
 

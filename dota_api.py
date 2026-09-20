@@ -125,6 +125,16 @@ class OpenDotaClient:
     #: 用显式标记而不是 ``isinstance``：打桩/包装类同样能声明身份。
     SOURCE_KIND = "opendota"
 
+    #: 本数据源能否**按补丁（版本）过滤**玩家数据。
+    #:
+    #: OpenDota 的 ``/players/{id}/heroes`` 与 ``/players/{id}/matches``
+    #: 都接受 ``patch`` 参数（值取 ``/constants/patch`` 的 ``id``）。
+    #: 这是「英雄池只看当前版本」这件事的地基 —— 拿掉它就只剩时间窗口
+    #: 这种近似手段。STRATZ 侧没有对应维度（实测 ``patchIds`` 报
+    #: ``Unknown field``），所以那边必须显式声明 False，由上层决定怎么降级，
+    #: **绝不能默默返回全生涯数据冒充当前版本**。
+    SUPPORTS_PATCH_FILTER = True
+
     def __init__(
         self,
         api_key: str = "",
@@ -149,9 +159,10 @@ class OpenDotaClient:
         #: 英雄版本胜率原始行（``/heroStats``）。同上：None 未拉过、空 list 拉过但失败。
         self._hero_stats_cache: list[dict] | None = None
         self._hero_stats_cache_at = 0.0
-        #: 最新补丁（``/constants/patch`` 的最后一项）
-        self._patch_cache: dict | None = None
-        self._patch_cache_at = 0.0
+        #: 补丁列表（``/constants/patch``），**按时间倒序**（最新在前）。
+        #: None 表示还没拉过；空 list 表示拉过但失败。
+        self._patches_cache: list[dict] | None = None
+        self._patches_cache_at = 0.0
 
     # ------------------------------------------------------------------
     # 底层请求
@@ -507,9 +518,39 @@ class OpenDotaClient:
         data = await self._request(f"/players/{int(account_id)}/wl")
         return data if isinstance(data, dict) else {}
 
-    async def get_player_heroes(self, account_id: int) -> list[dict]:
-        """获取玩家各英雄的使用统计（返回原始列表，含 games 为 0 的条目）。"""
-        data = await self._request(f"/players/{int(account_id)}/heroes")
+    async def get_player_heroes(
+        self,
+        account_id: int,
+        *,
+        patch: int | None = None,
+        game_mode: int | None = None,
+        include_insignificant: bool = True,
+    ) -> list[dict]:
+        """获取玩家各英雄的使用统计（返回原始列表，含 games 为 0 的条目）。
+
+        Args:
+            patch: 只统计某个补丁的场次，值取 ``/constants/patch`` 的 ``id``。
+                这是「英雄池只看当前版本」的实现基础——服务端过滤，
+                比拿最近 N 场自己对时间切更准。
+            game_mode: 只统计某个游戏模式，``23`` = 加速模式（Turbo）。
+            include_insignificant: 是否纳入 OpenDota 判为「不重要」的对局。
+
+        .. important::
+            ``include_insignificant`` **默认 True，而且必须默认 True**。
+            OpenDota 把加速模式整套归进 ``insignificant``，不显式传
+            ``significant=0`` 就会全部丢掉——这个丢法是**静默**的，
+            接口不报错、字段也正常，只是 ``games`` 少了一大截。
+            实测账号 153659639 在当前版本因此只剩 **17 场**，而真实是
+            **407 场（其中加速 389 场）**：这个人九成以上的局是加速模式，
+            按旧口径他的「英雄池」几乎是空的，据此给出的推荐也就全错。
+        """
+        params: dict[str, Any] = {"patch": patch, "game_mode": game_mode}
+        if include_insignificant:
+            # 值为 None 的项会被 _request 丢掉，所以这里只在需要时塞进去
+            params["significant"] = "0"
+        data = await self._request(
+            f"/players/{int(account_id)}/heroes", params=params
+        )
         if not isinstance(data, list):
             return []
         return [item for item in data if isinstance(item, dict)]
@@ -616,33 +657,49 @@ class OpenDotaClient:
         self._hero_stats_cache_at = now
         return rows
 
+    async def get_patches(self, limit: int = 0) -> list[dict]:
+        """获取补丁列表，**按时间倒序**（最新在前），形如
+        ``[{"name": "7.41", "date": ..., "id": 60}, ...]``。
+
+        只用 ``name``/``id`` 两个字段：``name`` 给用户看，``id`` 拿去当
+        ``patch`` 查询参数用（实测两者是同一套编号——``?patch=60`` 返回的
+        场次数与 7.41 的起止时间对得上）。
+
+        Args:
+            limit: 取最近几个。``0``（默认）表示全部。
+
+        拿不到就返回空列表 —— 上层据此退回「无版本口径」，绝不猜版本号。
+        失败也写缓存（空列表），避免接口挂掉时每次查询都重试一遍退避。
+        """
+        now = time.time()
+        rows = self._patches_cache
+        if rows is None or now - self._patches_cache_at >= PATCH_CACHE_TTL:
+            try:
+                data = await self._request(
+                    "/constants/patch", timeout=max(30, self.timeout)
+                )
+            except OpenDotaError as e:
+                logger.debug(f"[dota2] 补丁表获取失败，本次不按版本过滤：{e}")
+                data = []
+            rows = (
+                [row for row in data if isinstance(row, dict) and row.get("name")]
+                if isinstance(data, list)
+                else []
+            )
+            # 接口按时间升序返回；仍显式排序一次，避免顺序假设哪天失效
+            rows.sort(key=lambda row: str(row.get("date") or ""), reverse=True)
+            self._patches_cache = rows
+            self._patches_cache_at = now
+        return list(rows[:limit]) if limit > 0 else list(rows)
+
     async def get_latest_patch(self) -> dict:
         """获取 OpenDota 记录的最新补丁，形如 ``{"name": "7.41", "date": ..., "id": 60}``。
 
         只用来给用户**标注版本号**。拿不到就返回空字典 —— 此时报告里只写
         「最近 7 天」而不写版本名，绝不猜一个版本号糊弄过去。
         """
-        now = time.time()
-        if self._patch_cache is not None and now - self._patch_cache_at < PATCH_CACHE_TTL:
-            return self._patch_cache
-
-        try:
-            data = await self._request("/constants/patch", timeout=max(30, self.timeout))
-        except OpenDotaError as e:
-            logger.debug(f"[dota2] 补丁表获取失败，本次不标注版本号：{e}")
-            data = []
-
-        latest: dict = {}
-        if isinstance(data, list):
-            rows = [row for row in data if isinstance(row, dict) and row.get("name")]
-            if rows:
-                # 接口按时间升序返回；仍显式排序一次，避免顺序假设哪天失效
-                rows.sort(key=lambda row: str(row.get("date") or ""))
-                latest = rows[-1]
-        # 失败也写缓存（空 dict）：接口真挂时不能每次查询都重试一遍退避
-        self._patch_cache = latest
-        self._patch_cache_at = now
-        return latest
+        rows = await self.get_patches(limit=1)
+        return rows[0] if rows else {}
 
     @staticmethod
     def is_parsed(match: dict | None) -> bool:
@@ -720,6 +777,7 @@ _FALLBACK_METHODS: tuple[str, ...] = (
     "get_player_matches_enriched",
     "get_player_wl",
     "get_player_heroes",
+    "get_patches",
     "get_player_totals",
     "get_player_peers",
     "get_match",
@@ -786,6 +844,18 @@ class FallbackDataSource:
     #: 对外暴露的数据源名字，供日志与「当前数据源」提示使用
     name = "fallback"
     label = "STRATZ（后备 OpenDota）"
+
+    @property
+    def SUPPORTS_PATCH_FILTER(self) -> bool:
+        """当前**实际生效**的那一端能否按版本过滤（见 OpenDotaClient 上的说明）。
+
+        不能简单写死 True：这个能力只归属 OpenDota。一旦已经降级到后备源，
+        版本过滤就没了 —— 上层必须看得见这件事，否则会把全生涯数据
+        当成当前版本摆给用户。
+        """
+        if self.degrade_reason == "unavailable":
+            return bool(getattr(self.secondary, "SUPPORTS_PATCH_FILTER", False))
+        return bool(getattr(self.primary, "SUPPORTS_PATCH_FILTER", False))
 
     def __init__(
         self,

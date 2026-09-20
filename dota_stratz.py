@@ -165,6 +165,13 @@ class StratzClient:
     #: （例如 ``request_parse`` / ``get_hero_stats`` 是 OpenDota 独占）。
     SOURCE_KIND = "stratz"
 
+    #: 与 ``OpenDotaClient.SUPPORTS_PATCH_FILTER`` 配对：STRATZ **没有**
+    #: 版本维度。实测 ``heroesPerformance(request: { patchIds: [60] })``
+    #: 直接报 ``Unknown field``，只能在 ``gameModeIds`` 上过滤。
+    #: 所以这里必须显式声明 False —— 上层据此决定「退回全量口径并如实标注」，
+    #: 而不是把全生涯数据当成当前版本摆给用户。
+    SUPPORTS_PATCH_FILTER = False
+
     #: 数据源名称，供日志与「当前数据源」提示使用
     name = "STRATZ"
     label = "STRATZ"
@@ -774,13 +781,48 @@ class StratzClient:
             return {}
         return {"win": wins, "lose": max(0, total - wins)}
 
-    async def get_player_heroes(self, account_id: int) -> list[dict]:
-        """获取玩家各英雄使用统计（OpenDota ``/players/{id}/heroes`` 形状）。"""
+    async def get_patches(self, limit: int = 0) -> list[dict]:
+        """STRATZ 没有补丁表，返回空列表。
+
+        不是「忘了实现」：STRATZ 的 schema 里没有版本维度（见
+        :attr:`SUPPORTS_PATCH_FILTER`），拿不到补丁编号与起止时间。
+        返回空列表而不是抛异常，是为了让上层走**已知的降级路径**：
+        :func:`dota_pool.collect_hero_pool` 见补丁表为空 → 退回全量口径
+        并在文案里写明「未按版本过滤」。抛异常反而会触发数据源整体的
+        降级链，把一次正常的「这个源没这个能力」变成一次故障。
+        """
+        return []
+
+    async def get_player_heroes(
+        self,
+        account_id: int,
+        *,
+        patch: int | None = None,
+        game_mode: int | None = None,
+        include_insignificant: bool = True,
+    ) -> list[dict]:
+        """获取玩家各英雄使用统计（OpenDota ``/players/{id}/heroes`` 形状）。
+
+        Args:
+            patch: **本数据源不支持**，传了也会被忽略（见类属性
+                :attr:`SUPPORTS_PATCH_FILTER`）。留着这个形参只为与
+                :meth:`OpenDotaClient.get_player_heroes` 保持同一份签名，
+                免得两个源在同一段调用代码下行为分叉。
+            game_mode: 只统计某个模式，``23`` = 加速模式。STRATZ 的
+                加速数据是**独立统计**的，不走 OpenDota 那套
+                ``significant`` 默认过滤，所以这里传不传都能拿到。
+            include_insignificant: STRATZ 侧无此概念（它本来就收全模式），
+                参数保留只为签名一致。
+        """
+        req: list[str] = ["take: 100"]
+        if game_mode is not None:
+            req.append(f"gameModeIds: [{int(game_mode)}]")
+        request = "{ " + ", ".join(req) + " }"
         data = await self._gql(
             """
             query HP($id: Long!) {
               player(steamAccountId: $id) {
-                heroesPerformance(request: { take: 100 }) {
+                heroesPerformance(request: %s) {
                   heroId
                   matchCount
                   winCount
@@ -794,7 +836,8 @@ class StratzClient:
                 }
               }
             }
-            """,
+            """
+            % request,
             {"id": int(account_id)},
         )
         rows = ((data.get("player") or {}).get("heroesPerformance")) or []

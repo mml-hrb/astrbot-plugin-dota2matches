@@ -271,6 +271,7 @@ def build_recent_analysis_prompt(
     hero_rows: list[dict],
     economy_samples: int | None = None,
     requested_count: int = 20,
+    pool_scope: str = "",
 ) -> str:
     """构造「近期表现与打法风格分析」的提示词。"""
     summary = summarize_matches(matches, economy_samples=economy_samples)
@@ -291,13 +292,18 @@ def build_recent_analysis_prompt(
         )
 
     if rows:
+        # 这份英雄池是**当前版本口径**（不是生涯），抬头必须写清楚：
+        # 否则模型会把它当生涯数据，说出「他生涯就玩过这几个英雄」这种错话
+        title = "他在当前版本的英雄池" if pool_scope else "英雄池"
         lines.append(
-            "生涯英雄池（按场次倒序，前 10）: "
+            f"{title}（按场次倒序，前 10）: "
             + "、".join(
                 f"{hname(heroes, row['hero_id'])} {row['games']}场/{row['winrate']:.0f}%"
                 for row in rows[:10]
             )
         )
+    if pool_scope:
+        lines.append(f"英雄池口径: {pool_scope}")
 
     lines.append("")
     lines.append(f"=== 最近 {len(matches)} 场对局逐场明细（从最近往前）===")
@@ -401,6 +407,7 @@ def build_hero_pick_prompt(
     patch: dict | None = None,
     board_size: int = 25,
     pool_size: int = 20,
+    pool_scope: str = "",
 ) -> str:
     """构造「版本强势英雄里，哪些适合他」的提示词。
 
@@ -440,6 +447,10 @@ def build_hero_pick_prompt(
     position = str(meta.get("position") or "")
     if position:
         lines.append(f"榜单范围: 已按位置筛选为 {POSITION_LABELS.get(position, position)}")
+    if pool_scope:
+        # 「他的英雄池」那一节是按**当前版本**取的（并可能含加速局），
+        # 不写清楚的话模型会把它当成生涯数据，说出「他生涯玩过 N 场」这种错话
+        lines.append(f"他的英雄池口径: {pool_scope}")
     lines.append("")
 
     # ---- 版本榜 ----
