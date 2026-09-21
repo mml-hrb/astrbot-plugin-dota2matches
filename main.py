@@ -29,6 +29,7 @@ try:  # 插件目录被作为包加载时的相对导入
     from .dota_analyzer import (
         LLMRequestError,
         OpenAICompatibleClient,
+        ProviderToolClient,
         WATCH_COMMENT_SYSTEM_PROMPT,
         build_hero_pick_prompt,
         build_recent_analysis_prompt,
@@ -86,6 +87,7 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
     from dota_analyzer import (  # type: ignore[no-redef]
         LLMRequestError,
         OpenAICompatibleClient,
+        ProviderToolClient,
         WATCH_COMMENT_SYSTEM_PROMPT,
         build_hero_pick_prompt,
         build_recent_analysis_prompt,
@@ -2096,19 +2098,67 @@ class Dota2Plugin(Star):
     # 兜底对话：工具调用（一次回答可以调多个功能）
     # ------------------------------------------------------------------
     def _chat_tools_available(self) -> bool:
-        """工具模式是否可用。
+        """闲聊的**工具模式**是否启用 —— 只看配置，不看通道此刻通不通。
 
-        需要三件事同时成立：配置里开着工具、开着 LLM 分析、且**插件专用
-        模型通道**配好了 Key。走 AstrBot 的 provider 时不带工具：那条通道
-        只暴露了 ``text_chat``（纯文本进出），不同 AstrBot 版本对工具的支持
-        差异很大，硬塞参数会直接报错。没有专用 Key 时退回单轮带数据的回答，
-        功能不会消失，只是模型不能自己追加查询。
+        v2.3.4 起闲聊改走「默认模型优先」：AstrBot 自带的 provider 从 4.x
+        起支持 ``func_tool``，所以工具调用不再依赖插件专用 Key（专用 Key
+        留给比赛分析）。通道到底能不能用，由 :meth:`_chat_tool_clients` 在
+        真正调用前逐个判定。
+
+        这里故意只做同步的配置检查，是为了让调用方的分支只反映「用户想不
+        想要工具」；把「此刻哪个通道是通的」混进来，同一个开关会随网络状态
+        忽真忽假，路由就没法预期了。
         """
         if not self.cfg("nlu_chat_tools", True):
             return False
-        if not self.cfg("enable_llm_analysis", True):
-            return False
-        return self._dedicated_client() is not None
+        return bool(self.cfg("enable_llm_analysis", True))
+
+    @staticmethod
+    def _provider_label(provider: Any) -> str:
+        """给「默认模型」起一个能在日志 / 自检里看懂的名字。"""
+        model = ""
+        try:
+            getter = getattr(provider, "get_model", None)
+            if callable(getter):
+                value = getter()
+                # 个别版本把 get_model 写成异步的，那种情况下别去 await ——
+                # 这里只是取个显示名，不值得为它引入协程语义。
+                if not hasattr(value, "__await__"):
+                    model = str(value or "")
+        except Exception:  # noqa: BLE001
+            model = ""
+        if not model:
+            try:
+                config = getattr(provider, "provider_config", None) or {}
+                model = str(config.get("model") or "")
+            except Exception:  # noqa: BLE001
+                model = ""
+        return f"默认模型 {model}".strip() if model else "默认模型"
+
+    async def _chat_tool_clients(self, umo: str) -> list[Any]:
+        """闲聊（含工具调用）的模型通道，按优先级排列：**默认模型 → 专用 Key**。
+
+        闲聊是高频、低价值的交互，用 AstrBot 全局配置的模型就够；插件专用
+        Key 是给比赛分析准备的（长文、按量计费）。只有当默认模型压根拿不到、
+        或者它调不动工具（不支持 function calling）时，才回退专用 Key ——
+        这样「一句话里要好几件事」不会因为默认模型不支持工具就答不全。
+        """
+        chain: list[Any] = []
+        provider = None
+        try:
+            provider = await resolve_provider(
+                self.context, umo, str(self.cfg("llm_provider_id", "") or "")
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[dota2] 获取默认模型提供商失败：{e}")
+        if provider is not None:
+            chain.append(
+                ProviderToolClient(provider, label=self._provider_label(provider))
+            )
+        client = self._dedicated_client()
+        if client is not None:
+            chain.append(client)
+        return chain
 
     def _nlu_chat_focus(self, question: str, umo: str) -> list[int]:
         """问题只点名了**一个**人、又没有横向对比语义时，返回那个人的账号。
@@ -2529,13 +2579,10 @@ class Dota2Plugin(Star):
         )
         await self._send_to_session(umo, raw)
 
-    async def _nlu_chat_agent(
-        self,
-        event: AstrMessageEvent,
-        prompt: str,
-        system_prompt: str,
-    ) -> tuple[str | None, str, list[str]]:
-        """带工具的多轮问答。
+    async def _run_tool_loop(
+        self, client: Any, prompt: str, system_prompt: str, tool_ctx: Any
+    ) -> tuple[str, bool]:
+        """在**一条**通道上跑完多轮工具循环。
 
         流程就是标准的 function calling 循环：把问题与工具清单发给模型，
         它要么直接作答、要么要求调用若干工具；执行完把结果作为 ``role=tool``
@@ -2544,16 +2591,11 @@ class Dota2Plugin(Star):
         问题能让模型把数据源查个底朝天。
 
         Returns:
-            ``(回答, 工具调用轨迹, 待发给用户的确认请求)``。回答为 ``None``
-            表示这条链路没能产出内容（没配 Key、模型报错等），调用方回落到
-            单轮带数据的回答。第三项来自写操作工具：**必须由插件原样发出**，
-            不能让模型转述（确认文案要和用户逐字对齐）。
+            ``(回答, 通道是否不可用)``。第二项只在**第一轮就失败**时为真：
+            那多半说明这条通道不支持工具或没配好，调用方可以换下一条重试。
+            中途失败（之前已经拿到过工具调用）不算 —— 换条通道重跑等于把
+            同一批查询再烧一遍配额，没有意义。
         """
-        client = self._dedicated_client()
-        if client is None:
-            return None, "", []
-
-        tool_ctx = self._nlu_chat_tool_ctx(event)
         tools = dota_tools.build_tool_specs()
         rounds = max(1, int(self.cfg("nlu_chat_tool_rounds", 3) or 3))
         max_calls = max(1, int(self.cfg("nlu_chat_tool_max_calls", 6) or 6))
@@ -2581,13 +2623,10 @@ class Dota2Plugin(Star):
                 )
             except Exception as e:  # noqa: BLE001 - 失败回落单轮，不能吞消息
                 logger.error(
-                    f"[dota2] 兜底工具对话第 {round_index + 1} 轮失败: {e}"
+                    f"[dota2] 闲聊工具对话第 {round_index + 1} 轮失败"
+                    f"（{client.endpoint}）: {e}"
                 )
-                return (
-                    (answer or None),
-                    "; ".join(tool_ctx.trace),
-                    list(tool_ctx.pending_prompts),
-                )
+                return answer, round_index == 0
 
             if not reply.has_tool_calls:
                 answer = reply.content or answer
@@ -2638,20 +2677,63 @@ class Dota2Plugin(Star):
                 )
                 answer = final.content or answer
             except Exception as e:  # noqa: BLE001
-                logger.error(f"[dota2] 兜底工具对话收口失败: {e}")
+                logger.error(f"[dota2] 闲聊工具对话收口失败: {e}")
 
         trace = "; ".join(tool_ctx.trace)
         if trace:
-            logger.info(f"[dota2] 兜底工具调用: {trace}")
-        return (answer or None), trace, list(tool_ctx.pending_prompts)
+            logger.info(f"[dota2] 闲聊工具调用（{client.endpoint}）: {trace}")
+        return answer, False
+
+    async def _nlu_chat_agent(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        system_prompt: str,
+    ) -> tuple[str | None, str, list[str]]:
+        """带工具的多轮问答（闲聊主路径，走**默认模型**）。
+
+        通道顺序固定为「默认模型 → 插件专用 Key」（见
+        :meth:`_chat_tool_clients`）：闲聊是高频交互，用 AstrBot 全局配置的
+        模型即可；专用 Key 留给比赛分析。默认模型调不动工具（不支持 function
+        calling）时才换专用 Key，保证「一句话里要好几件事」仍然答得全。
+
+        Returns:
+            ``(回答, 工具调用轨迹, 待发给用户的确认请求)``。回答为 ``None``
+            表示这条链路没能产出内容（一条通道都没有 / 模型报错），调用方
+            回落单轮带数据的回答。第三项来自写操作工具：**必须由插件原样
+            发出**，不能让模型转述（确认文案要和用户逐字对齐）。
+        """
+        clients = await self._chat_tool_clients(event.unified_msg_origin)
+        if not clients:
+            logger.info(
+                "[dota2] 闲聊工具通道不可用：既没有 AstrBot 模型提供商，也没配专用 API Key"
+            )
+            return None, "", []
+
+        tool_ctx = self._nlu_chat_tool_ctx(event)
+        answer = ""
+        for index, client in enumerate(clients):
+            answer, channel_dead = await self._run_tool_loop(
+                client, prompt, system_prompt, tool_ctx
+            )
+            if answer:
+                if index:
+                    logger.info(f"[dota2] 闲聊工具通道回退到 {client.endpoint}")
+                break
+            if not channel_dead:
+                # 通道本身是通的，只是这一轮没产出 —— 换通道重跑没有意义
+                break
+            if index + 1 < len(clients):
+                logger.warning(f"[dota2] {client.endpoint} 调不动工具，换下一条通道重试")
+        return (answer or None), "; ".join(tool_ctx.trace), list(tool_ctx.pending_prompts)
 
     async def _nlu_agent_reply(
         self, event: AstrMessageEvent, question: str
     ) -> tuple[str | None, list[str]]:
         """**工具优先**路径：带着插件数据与全套工具，让模型自己决定干什么。
 
-        这是自然语言入口的主路径（规则识别只在没有专用模型通道时兜底）。
-        模型可以：
+        这是自然语言入口的主路径，走的是**默认模型**（AstrBot 全局配置的那个）；
+        规则识别只在一条模型通道都拿不到时才兜底。模型可以：
 
         * 直接回答（闲聊、解释、建议）；
         * 调用只读工具补数据（查战绩 / 英雄池 / 版本榜 …）；
@@ -2706,8 +2788,12 @@ class Dota2Plugin(Star):
         )
         # 先走「带工具的多轮问答」：一句复合问题（既看战绩又要推荐英雄）
         # 靠意图分类只能二选一，只有让模型自己按需追加查询才能都答上。
-        # 这条路走不通（没配专用 Key / 模型报错）时，回落到原来的单轮
+        # 这条路走不通（没有可用模型通道 / 模型报错）时，回落到原来的单轮
         # 带数据回答 —— 功能不会因为模型不支持工具就消失。
+        #
+        # 注意单轮兜底走的是 `_call_chat_llm`（默认模型优先），**不是**
+        # `_call_report_llm` —— 后者是比赛分析通道（专用 Key 优先），
+        # 拿它来接闲聊等于把闲聊的账记到分析 Key 上。
         reply: str | None = None
         trace = ""
         pending: list[str] = []
@@ -2716,7 +2802,7 @@ class Dota2Plugin(Star):
                 event, prompt, system_prompt
             )
         if not reply:
-            reply = await self._call_report_llm(
+            reply = await self._call_chat_llm(
                 prompt, umo=umo, system_prompt=system_prompt
             )
         if not reply and not pending:
@@ -4142,31 +4228,87 @@ class Dota2Plugin(Star):
     @d2.command("llmtest", alias={"模型测试", "模型自检", "测试模型", "llm"})
     @take_over_event
     async def d2_llmtest(self, event: AstrMessageEvent):
-        """检查插件专用的模型 API Key 是否可用"""
+        """检查闲聊与分析两条模型通道是否可用"""
         yield event.plain_result("⏳ 正在测试模型通道，请稍候…")
         yield event.plain_result(await self._llm_selftest(event.unified_msg_origin))
 
     async def _llm_selftest(self, umo: str) -> str:
-        """用极短请求探一次模型通道，回显配置与耗时，便于用户排查。
+        """实测**两条**模型通道，回显各自走谁、通不通。
 
-        分三种情况：
-        * 配了专用 Key → 只测专用通道，成功/失败都给细节；
-        * 没配专用 Key → 说明当前回退 AstrBot 提供商，并实测一次回退通道；
-        * 连回退通道都拿不到 → 提示去补配置。
+        插件的模型分工（v2.3.4 起）：
+
+        * **闲聊**（自然语言入口 + 工具调用）→ 默认模型优先、专用 Key 兜底；
+        * **比赛分析**（复盘 / 分析 / 轮椅适配 / 赛后短评 / 定时播报正文）
+          → 专用 Key 优先、默认模型兜底。
+
+        两条要**分别测**：只报一条，用户会误以为另一条也不可用（或反之）。
         """
         if not self.cfg("enable_llm_analysis", True):
             return (
-                "⚠️ AI 分析功能当前是关闭的（配置项「启用 AI 分析」）。\n"
-                "把它打开后 `/d2 分析`、`/d2 单场` 才会有 AI 报告。"
+                "⚠️ AI 功能当前是关闭的（配置项「启用 AI 分析」）。\n"
+                "把它打开后 `/d2 分析`、`/d2 单场` 才会有 AI 报告，"
+                "自然语言入口也才会带上工具。"
             )
+        lines = ["🔎 模型通道自检（闲聊与分析是两条独立的通道）", ""]
+        lines.append(await self._selftest_chat_channel(umo))
+        lines.append("")
+        lines.append(await self._selftest_analysis_channel(umo))
+        return "\n".join(lines)
 
+    async def _selftest_chat_channel(self, umo: str) -> str:
+        """闲聊通道：默认模型优先，专用 Key 兜底。"""
+        head = "【闲聊 / 自然语言入口】"
+        provider = await resolve_provider(
+            self.context, umo, str(self.cfg("llm_provider_id", "") or "")
+        )
+        if provider is None:
+            body = (
+                f"{head}\n"
+                "❌ 拿不到 AstrBot 的默认模型提供商 —— 闲聊会没有模型可用。\n"
+                "　　请在 AstrBot 里配置一个模型提供商，或给插件填专用 API Key 兜底。"
+            )
+        else:
+            label = self._provider_label(provider)
+            started = time.monotonic()
+            try:
+                reply = await call_llm(
+                    provider,
+                    "你是一个连通性测试助手，只回答用户要求的内容，不要添加任何多余的话。",
+                    "请只回复两个字：可用",
+                )
+            except Exception as e:  # noqa: BLE001
+                elapsed = time.monotonic() - started
+                body = (
+                    f"{head}\n"
+                    f"❌ {label} 测试失败（耗时 {elapsed:.1f} 秒）：{e}"
+                )
+            else:
+                elapsed = time.monotonic() - started
+                body = (
+                    f"{head}\n"
+                    f"✅ {label} 可用（耗时 {elapsed:.1f} 秒）\n"
+                    f"　　模型回显：{reply}"
+                )
+        # 工具能力单独说一句：闲聊的「一句话多件事」靠 provider 的 func_tool，
+        # 而这是 AstrBot 较新版本才有的 —— 老版本上会自动退回专用 Key。
+        try:
+            from astrbot.api import ToolSet  # noqa: F401
+
+            tool_note = "　　工具调用：支持（可让模型自己决定调哪些功能）"
+        except Exception:  # noqa: BLE001
+            tool_note = "　　⚠️ 工具调用：当前 AstrBot 未暴露 ToolSet，闲聊会自动退回专用 Key"
+        return body + "\n" + tool_note
+
+    async def _selftest_analysis_channel(self, umo: str) -> str:
+        """分析通道：专用 Key 优先，默认模型兜底。"""
+        head = "【比赛分析 / 报告】"
         client = self._dedicated_client()
         if client is None:
             return await self._llm_selftest_fallback(
                 umo,
-                "ℹ️ 你没有配置专用的模型 API Key，当前走 AstrBot 自带的模型提供商。\n"
-                "如果想让本插件用独立的 Key（比如填 DeepSeek 的 key 省钱），"
-                "在插件配置里填「专用 API Key」即可。\n\n",
+                f"{head}\n"
+                "ℹ️ 没有配置专用的模型 API Key，比赛分析将回退 AstrBot 的默认模型。\n"
+                "　　想让分析走独立 Key（费用与闲聊分开），在插件配置里填「专用 API Key」。\n",
             )
 
         configured = [
@@ -4177,6 +4319,7 @@ class Dota2Plugin(Star):
         ]
         if not client.model:
             return (
+                f"{head}\n"
                 "❌ 专用模型通道配置不完整：填了 API Key，但没填模型名称。\n"
                 + "\n".join(configured)
                 + "\n\n请在插件配置里补上「模型名称」，例如 `deepseek-chat`。"
@@ -4193,6 +4336,7 @@ class Dota2Plugin(Star):
         except LLMRequestError as e:
             elapsed = time.monotonic() - started
             return (
+                f"{head}\n"
                 f"❌ 专用模型通道测试失败（耗时 {elapsed:.1f} 秒）\n"
                 + "\n".join(configured)
                 + f"\n\n错误信息：\n{e}\n\n"
@@ -4206,6 +4350,7 @@ class Dota2Plugin(Star):
             elapsed = time.monotonic() - started
             logger.error(f"[dota2] 模型自检出现异常：{e}", exc_info=True)
             return (
+                f"{head}\n"
                 f"❌ 专用模型通道测试异常（耗时 {elapsed:.1f} 秒）\n"
                 + "\n".join(configured)
                 + f"\n\n异常信息：{e}"
@@ -4213,6 +4358,7 @@ class Dota2Plugin(Star):
 
         elapsed = time.monotonic() - started
         return (
+            f"{head}\n"
             f"✅ 专用模型通道可用（耗时 {elapsed:.1f} 秒）\n"
             + "\n".join(configured)
             + f"\n\n模型回显：{reply}"
@@ -5133,6 +5279,16 @@ class Dota2Plugin(Star):
     # ==================================================================
     # 大模型调用
     # ==================================================================
+    # 两条通道，分工是这一版的核心约定：
+    #
+    #   * **闲聊通道**（自然语言入口 / 工具调用）→ 默认模型优先
+    #     （:meth:`_call_chat_llm`、:meth:`_chat_tool_clients`）；
+    #   * **分析通道**（复盘 / 分析 / 轮椅适配 / 赛后短评 / 定时播报正文）
+    #     → 插件专用 API Key 优先（:meth:`_call_report_llm`）。
+    #
+    # 这么切是因为两者的成本结构完全不同：闲聊高频、单次短，用 AstrBot 里
+    # 已有的全局模型就够；比赛分析要出长文、按量计费，值得用独立的 Key 和
+    # 更强的模型，也便于单独盯着额度。
     def _llm_api_key(self) -> str:
         """读取插件专用 API Key（空字符串表示未配置）。"""
         return str(self.cfg("llm_api_key", "") or "").strip()
@@ -5150,17 +5306,62 @@ class Dota2Plugin(Star):
             proxy=str(self.cfg("llm_proxy", "") or ""),
         )
 
+    async def _call_chat_llm(
+        self, prompt: str, *, umo: str = "", system_prompt: str = ""
+    ) -> str | None:
+        """生成**闲聊**回答的模型调用：默认模型优先，专用 Key 只作后备。
+
+        与 :meth:`_call_report_llm` 的分工是本版改动的核心 ——
+        「闲聊走默认模型、只有比赛分析走专用 Key」。默认模型整个拿不到时
+        才用专用 Key 兜一下，否则闲聊也会去消耗分析用的额度。
+
+        Returns:
+            回答正文；两条通道都不可用时返回 None（并说明原因）。
+        """
+        if not self.cfg("enable_llm_analysis", True):
+            return None
+
+        provider = await resolve_provider(
+            self.context,
+            umo,
+            str(self.cfg("llm_provider_id", "") or ""),
+        )
+        if provider is not None:
+            try:
+                return await call_llm(provider, system_prompt, prompt)
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"[dota2] 闲聊走默认模型失败：{e}")
+
+        client = self._dedicated_client()
+        if client is None:
+            if provider is None:
+                logger.warning("[dota2] 闲聊没有可用的模型通道，跳过")
+            return None
+        try:
+            logger.info("[dota2] 闲聊回退到插件专用模型")
+            max_tokens = int(self.cfg("llm_max_tokens", 0) or 0)
+            return await client.chat(
+                system_prompt,
+                prompt,
+                temperature=float(self.cfg("llm_temperature", 0.7) or 0),
+                max_tokens=max_tokens or None,
+            )
+        except LLMRequestError as e:
+            logger.error(f"[dota2] 闲聊走专用模型失败（{client.endpoint}）：{e}")
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[dota2] 闲聊走专用模型出现异常：{e}", exc_info=True)
+        return None
+
     async def _call_report_llm(
         self, prompt: str, *, umo: str = "", system_prompt: str = ""
     ) -> str | None:
-        """生成报告用的大模型调用：专用 Key 优先，失败按配置回退 AstrBot。
+        """生成**报告 / 分析**用的大模型调用：专用 Key 优先，失败回退 AstrBot。
 
         Args:
             prompt: 用户提示词。
             umo: 会话来源，回退到 AstrBot 提供商时用来解析会话默认模型。
             system_prompt: 自定义系统提示词。留空则用配置项
                 ``analysis_system_prompt``，再留空用内置的报告模板。
-                闲聊兜底会传自己的系统提示词进来，避免被「报告体」污染。
 
         Returns:
             报告正文；失败或未启用时返回 None（并在日志里说明原因）。

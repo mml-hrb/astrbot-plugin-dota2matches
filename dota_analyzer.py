@@ -712,6 +712,193 @@ async def call_llm(provider: Any, system_prompt: str, user_prompt: str) -> str:
 
 
 # ======================================================================
+# 闲聊通道：把 AstrBot 的模型提供商接上工具
+# ======================================================================
+# 背景：插件的模型分工是「闲聊走默认模型、比赛分析走专用 Key」。
+# 早期版本里 AstrBot 的 provider 只能纯文本进出，所以带工具的闲聊只能
+# 绑在自建通道上；从 AstrBot 4.x 起 ``text_chat`` 支持 ``func_tool``，
+# 于是闲聊可以回到默认模型，而工具调用能力不必牺牲。
+#
+# 下面这层适配把 provider 包装成与 ``OpenAICompatibleClient`` **同形**的
+# 通道（都提供 ``chat_with_tools`` / ``chat``，都返回 ``ToolReply``），
+# 这样 main 侧的多轮循环对两条通道一视同仁，不必写两套。
+
+
+def build_provider_tool_set(tools: list[dict]) -> Any:
+    """把 OpenAI 格式的工具清单转成 AstrBot 的 ``ToolSet``。
+
+    用**延迟导入**是有意的：插件要能在离线测试（没有 AstrBot 内部包）里被
+    导入，也要装到旧版 AstrBot（没有 ``astrbot.api.ToolSet``）上时不至于
+    直接崩 —— 那种情况下这里抛 ``LLMRequestError``，上层据此判定
+    「这条通道用不了」，改走专用 Key。
+
+    Raises:
+        LLMRequestError: 拿不到 ``ToolSet`` / ``FunctionTool``，或某个工具的
+            schema 不被 AstrBot 接受（它内部会用 jsonschema 校验）。
+    """
+    try:
+        from astrbot.api import FunctionTool, ToolSet  # 延迟导入，见上
+    except Exception as e:  # noqa: BLE001
+        raise LLMRequestError(f"当前 AstrBot 未暴露 ToolSet，无法在默认模型上调用工具（{e}）") from e
+
+    tool_set = ToolSet()
+    for item in tools or []:
+        function = item.get("function") if isinstance(item, dict) else None
+        function = function if isinstance(function, dict) else {}
+        name = str(function.get("name") or "").strip()
+        if not name:
+            continue
+        parameters = function.get("parameters")
+        if not isinstance(parameters, dict) or not parameters:
+            parameters = {"type": "object", "properties": {}}
+        try:
+            tool_set.add_tool(
+                FunctionTool(
+                    name=name,
+                    description=str(function.get("description") or ""),
+                    parameters=parameters,
+                )
+            )
+        except Exception as e:  # noqa: BLE001
+            raise LLMRequestError(f"工具 {name} 的 schema 不被 AstrBot 接受：{e}") from e
+    return tool_set
+
+
+def split_system_prompt(messages: list[dict]) -> tuple[str, list[dict]]:
+    """把 ``messages`` 里的 system 消息摘出来，其余原样返回。
+
+    AstrBot 的 ``text_chat`` 用的是 ``system_prompt`` 参数（内部插到上下文
+    最前面），**不认 contexts 里的 system 角色** —— 混着传会被静默丢掉，
+    提示词就白写了。
+    """
+    system_parts: list[str] = []
+    rest: list[dict] = []
+    for message in messages or []:
+        if isinstance(message, dict) and message.get("role") == "system":
+            text = str(message.get("content") or "").strip()
+            if text:
+                system_parts.append(text)
+            continue
+        rest.append(message)
+    return "\n\n".join(system_parts), rest
+
+
+def parse_provider_reply(response: Any) -> ToolReply:
+    """把 AstrBot 的 ``LLMResponse`` 归一成插件自己的 ``ToolReply``。
+
+    ``tools_call_args`` 给的是 dict（自建通道给的是 JSON 字符串），这里统一
+    转成字符串：回填给模型时要**一字不改**，字典再序列化一次反而更安全。
+    """
+    content = str(getattr(response, "completion_text", "") or "").strip()
+    names = list(getattr(response, "tools_call_name", None) or [])
+    args = list(getattr(response, "tools_call_args", None) or [])
+    ids = list(getattr(response, "tools_call_ids", None) or [])
+    calls: list[ToolCall] = []
+    for index, name in enumerate(names):
+        name = str(name or "").strip()
+        if not name:
+            continue
+        raw = args[index] if index < len(args) else {}
+        if not isinstance(raw, str):
+            raw = json.dumps(raw if raw is not None else {}, ensure_ascii=False)
+        call_id = str(ids[index]) if index < len(ids) and ids[index] else f"call_{index}"
+        calls.append(ToolCall(id=call_id, name=name, arguments_raw=raw))
+    return ToolReply(content=content, tool_calls=calls)
+
+
+class ProviderToolClient:
+    """把 AstrBot 的模型提供商包装成带工具通道（与自建通道同形）。
+
+    与 :class:`OpenAICompatibleClient` 的三点差异，都是这条通道的性质决定的：
+
+    * system 提示词走 ``system_prompt`` 参数，不能留在 contexts 里
+      （见 :func:`split_system_prompt`）；
+    * ``temperature`` / ``max_tokens`` 由 AstrBot 的提供商配置决定，这里传了
+      也不生效 —— 保留参数只为对上调用签名；
+    * 工具 schema 要走 AstrBot 的 ``ToolSet``（含 jsonschema 校验）。
+    """
+
+    def __init__(self, provider: Any, *, label: str = "默认模型") -> None:
+        self.provider = provider
+        self.label = label
+        #: 按工具名集合缓存 ToolSet：`_run_tool_loop` 每轮都会重建 messages，
+        #: 但工具清单在一轮问答内是固定的，没必要每轮重新校验 schema。
+        self._tool_sets: dict[tuple[str, ...], Any] = {}
+
+    @property
+    def endpoint(self) -> str:
+        """与自建通道的 ``endpoint`` 对齐，日志 / 自检里可以直接打印。"""
+        return self.label
+
+    def _tool_set(self, tools: list[dict]) -> Any:
+        key = tuple(
+            sorted(
+                str((item.get("function") or {}).get("name") or "")
+                for item in tools or []
+                if isinstance(item, dict)
+            )
+        )
+        if key not in self._tool_sets:
+            self._tool_sets[key] = build_provider_tool_set(tools)
+        return self._tool_sets[key]
+
+    async def chat_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        tool_choice: Any = "auto",
+    ) -> ToolReply:
+        """带工具的一轮对话。
+
+        Raises:
+            LLMRequestError: 通道不可用（不支持 func_tool、鉴权 / 网络失败等）。
+        """
+        system_prompt, contexts = split_system_prompt(messages)
+        kwargs: dict[str, Any] = {
+            "contexts": contexts,
+            "func_tool": self._tool_set(tools) if tools else None,
+            "tool_choice": tool_choice or "auto",
+        }
+        if system_prompt:
+            kwargs["system_prompt"] = system_prompt
+        try:
+            response = await self.provider.text_chat(**kwargs)
+        except LLMRequestError:
+            raise
+        except TypeError as e:
+            # 旧版 AstrBot 的 text_chat 不接受 func_tool，硬塞会 TypeError
+            raise LLMRequestError(f"当前 AstrBot 的模型提供商不支持工具调用：{e}") from e
+        except Exception as e:  # noqa: BLE001
+            raise LLMRequestError(f"{self.label}调用失败：{e}") from e
+        return parse_provider_reply(response)
+
+    async def chat(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
+        """不带工具的普通一轮（闲聊的单轮兜底走它）。"""
+        try:
+            response = await self.provider.text_chat(
+                prompt=user_prompt, system_prompt=system_prompt
+            )
+        except TypeError:
+            response = await self.provider.text_chat(prompt=user_prompt)
+        except Exception as e:  # noqa: BLE001
+            raise LLMRequestError(f"{self.label}调用失败：{e}") from e
+        text = str(getattr(response, "completion_text", "") or "").strip()
+        if not text:
+            raise LLMRequestError(f"{self.label}返回了空结果")
+        return text
+
+
+# ======================================================================
 # 插件自带的 OpenAI 兼容通道
 # ======================================================================
 #: 常见服务商的默认接口地址，方便用户在配置里只填 key

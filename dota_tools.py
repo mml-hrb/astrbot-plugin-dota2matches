@@ -357,6 +357,9 @@ def build_tool_specs() -> list[dict]:
                     "description": (
                         "仅 action 为 delete/disable/enable/retime 时必需："
                         "query_schedules 列表里的编号（数字）或任务编号。"
+                        "用户说的是「所有 / 全部 / 都」这类**整批**操作时填 `*`"
+                        "（delete / disable / enable 支持；retime 不支持，"
+                        "因为改时间必须落到某一个任务上）。"
                     ),
                 },
                 "when": {
@@ -741,7 +744,29 @@ SCHEDULE_CONTROL: dict[str, str] = {
 def _desc(verb: str, target: str = "") -> str:
     """拼一句给人读的操作描述；目标为空时只留动词（不出现空的「」）。"""
     target = str(target or "").strip()
+    if target == ALL_TARGET:
+        target = "全部"
     return f"{verb}「{target}」" if target else verb
+
+
+#: 整批操作的槽位值。值与 ``dota_schedule.ALL_TOKEN`` 相同（``"*"``），
+#: 但**故意不 import 过来**：工具层只负责把模型给的参数拼成 ``d2_schedule``
+#: 认得的那串控制文本（``删 *``），认不认是口径层的事。少一层依赖，
+#: 少一处「改了口径忘了改工具层」的机会。
+ALL_TARGET = "*"
+
+#: 模型把「全部」按**人类说法**原样填进 target 时会出现的形式。
+#: 指令层的 ``dota_schedule.normalize_target`` 也认这些词，但那里是给
+#: 用户打字用的；工具参数由模型生成，写法五花八门（还会带英文 all），
+#: 在这里一次性收敛成槽位值，比让两道正则各维护一份名单稳。
+_ALL_TARGET_WORDS = frozenset(
+    {"*", "all", "全部", "所有", "一切", "全都", "统统", "全", "都"}
+)
+
+
+def _is_all_target(text: str) -> bool:
+    """这个 target 是不是在说「全部任务」。"""
+    return str(text or "").strip().lower() in _ALL_TARGET_WORDS
 
 
 async def _tool_manage_binding(args: dict, ctx: ToolContext) -> str:
@@ -808,7 +833,19 @@ async def _tool_manage_schedule(args: dict, ctx: ToolContext) -> str:
     if not target:
         return (
             "要操作哪一个定时任务？请先调 query_schedules 拿到列表编号，"
-            "再把编号填进 target。"
+            "再把编号填进 target；用户说的是「所有 / 全部」时填 `*`。"
+        )
+    # 整批操作的写法收敛到槽位值 `*`：模型很容易把「全部」按人类说法原样
+    # 填进来，而 `d2_schedule.normalize_target` 认的也是这些词 —— 与其指望
+    # 两道正则各认一套，不如在这里一次性归一。**retime 不接受 `*`**：
+    # 改时间必须落到某一个任务上，"把所有任务的触发时间都改成八点" 在
+    # 指令层也走不通（`改 * 早上八点` 会被当成编号越界）。
+    if action != "retime" and _is_all_target(target):
+        target = ALL_TARGET
+    if action == "retime" and _is_all_target(target):
+        return (
+            "改时间要指定具体某一个任务（先调 query_schedules 拿编号），"
+            "不能对全部任务一起改。"
         )
     payload = f"{SCHEDULE_CONTROL[action]} {target}"
     desc = _desc(SCHEDULE_VERBS[action], target)

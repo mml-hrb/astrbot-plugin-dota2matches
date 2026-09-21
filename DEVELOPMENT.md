@@ -131,9 +131,11 @@ dota2助手 复盘一下这一局                    → 只**发起**后台复�
   「取消」则什么都不做（`nlu_confirm_sensitive` 只管降级路径；工具路径的闸门始终生效）；
 - **规则识别退为降级兜底**（`nlu_llm_first` / `nlu_llm_fallback`）：关键词按词频打分，
   看不懂人话——「详细分析这一盘」里「分析」4 分压过「这盘」3 分，会被判成「分析近期
-  表现」。所以主路径不再走它；只有专用模型通道不可用（没配 `llm_api_key` / 关掉
-  `nlu_chat_tools` / 接口报错）时才回落到「判意图 → 关键词 → 指令 handler」，
-  保证模型不可用时功能不至于全瘫。
+  表现」。所以主路径不再走它；只有当**一条模型通道都拿不到**（关掉 `nlu_chat_tools`、
+  或默认模型与专用 Key 双双不可用 / 接口报错）时才回落到
+  「判意图 → 关键词 → 指令 handler」，保证模型不可用时功能不至于全瘫。
+  注意「闲聊的主路径」与「分析的模型通道」是**两回事**，见
+  [模型通道分工](#模型通道分工闲聊走默认模型分析走专用-key)。
 
 #### 「这一盘」是哪一盘
 
@@ -210,10 +212,12 @@ dota2助手 复盘一下这一局                    → 只**发起**后台复�
 **主路径**（`main.d2_natural` 的第 3 步）：命中唤醒词 + 工具可用时，整条消息交给
 `main._nlu_agent_reply`，它带着本会话数据与工具清单进 `main._nlu_chat_agent`
 的 function calling 循环，由模型自己决定**直接回答 / 调查询工具 / 发起后台任务 /
-提出写操作**。
+提出写操作**。这条路径走的是 **AstrBot 全局的默认模型**（v2.3.4 起），见
+[模型通道分工](#模型通道分工闲聊走默认模型分析走专用-key)。
 
-**降级路径**（第 4 步）：专用模型通道不可用（没配 Key / 关掉工具 / 接口报错）时，
-才退回「大模型判意图（AstrBot provider）→ 关键词规则 → 指令 handler」；
+**降级路径**（第 4 步）：一条模型通道都拿不到（关掉 `nlu_chat_tools` / 默认模型与
+专用 Key 双双不可用 / 接口报错）时，才退回
+「大模型判意图（AstrBot provider）→ 关键词规则 → 指令 handler」；
 规则也认不出来且有唤醒词时，退回「单轮带数据回答」。**旧的 `dota_nlu` 一行没删**，
 它就是这层的兜底。
 
@@ -337,8 +341,9 @@ if reply or pending_prompts:
 「近期战绩快照」「横向对比」已经按时间窗口统计好每个人，逐个查既慢又不会更准。
 它同时也是那次事故的直接诱因。
 
-**回归**：`tests/chat_tools_check.py`（100+ 项：schema 合法、只读边界、失败/超时/上限、
-失败短路与配额、收窄、认人零联网、循环回填、降级、收口）。真实验收脚本
+**回归**：`tests/chat_tools_check.py`（170+ 项：schema 合法、只读边界、失败/超时/上限、
+失败短路与配额、收窄、认人零联网、循环回填、降级、收口、**模型通道分工**、
+`manage_schedule` 整批 `*` 归一）。真实验收脚本
 `.workbuddy/tmp/live_tools_accept.py`（真 OpenDota + 真 DeepSeek，跑三个场景）；
 复合问题专项 `.workbuddy/tmp/live_composite_accept.py`。
 
@@ -350,6 +355,51 @@ if reply or pending_prompts:
    很容易误判成「回答是空的」。真正的出口是 `event.sent`。
 
 自然语言入口与指令入口走的是**同一套实现**，因此行为、权限、输出格式完全一致。
+
+#### 模型通道分工（闲聊走默认模型，分析走专用 Key）
+
+v2.3.4 起，插件里**两条模型通道各管一摊**，不再混用：
+
+| 通道 | 来源 | 用途 | 优先级 |
+|---|---|---|---|
+| **默认模型** | AstrBot 全局配置的模型提供商（`main.resolve_provider`，受 `llm_provider_id` 覆盖） | 闲聊、说人话查战绩、**模型自己调工具** | 闲聊侧**第一优先**；分析侧作回退 |
+| **专用 Key** | 插件自带的 `OpenAICompatibleClient`（`llm_api_key` / `llm_base_url` / `llm_model`） | `/d2 分析`、`/d2 单场`、监听短评、定时播报等**长文分析** | 分析侧**第一优先**；闲聊侧作回退 |
+
+**为什么这么分**：闲聊是高频、低价值的交互，用全局模型就够；专用 Key 按量计费、
+是给长文准备的钱，拿它接闲聊等于把群里的日常唠嗑记到分析账上。反过来，默认模型
+**不一定支持函数调用**，所以闲聊侧不能只挂它一条通道。
+
+**闲聊侧的两条通道**（`main._chat_tool_clients`，顺序即优先级）：
+
+1. `ProviderToolClient`（`dota_analyzer`）——把 AstrBot 的 provider 包成
+   「能用工具的客户端」，与 `OpenAICompatibleClient` **同形**，于是
+   `_run_tool_loop` 一套代码吃两条通道；
+2. `self._dedicated_client()` —— 默认模型拿不到、或它调不动工具时的后备。
+
+两条通道**共用同一个工具循环**（`main._run_tool_loop`）。任一通道给出了回答就停；
+通道「整个不可用」（拿不到 / 抛错）才换下一条；两条都没产出才回落规则路径。
+
+分析侧则是镜像关系（`main._call_report_llm`）：专用 Key 优先，失败后按
+`llm_fallback_on_error` 决定要不要回退到 AstrBot 的 provider。单轮闲聊兜底走的是
+`main._call_chat_llm`（默认模型优先），**不要**拿 `_call_report_llm` 接闲聊。
+
+**AstrBot 的 provider 是支持工具调用的**（v4.x：`provider.text_chat(..., func_tool=ToolSet)`）。
+早先「只有插件自带通道支持 function calling」的判断是错的，这一版已据此改掉；
+`dota_analyzer.build_provider_tool_set` 负责把 OpenAI 格式的工具清单转成 AstrBot 的
+`ToolSet`（延迟 import `FunctionTool` / `ToolSet`，版本太老或 schema 被拒时抛
+`LLMRequestError`，由调用方降级）。两个必须留意的细节：
+
+* **`system_prompt` 要作为参数传**，不能塞进 `contexts` —— AstrBot 的 `text_chat`
+  只认自己的 `system_prompt` 形参，`contexts` 里的 `role=system` 会被忽略，
+  于是「不要编造数据」这类护栏会静默失效。`split_system_prompt` 就是干这个的；
+* 工具结果回填用 `ToolCallsResult.to_openai_messages()` 的形状（assistant 带
+  `tool_calls` + 每个 id 一条 `role=tool`），与专用通道完全一致。
+
+**开关语义**：`nlu_chat_tools` 决定「要不要工具优先这条路」（`_chat_tools_available`
+只看配置，不看通道此刻通不通）；`nlu_chat_fallback` 决定「闲聊还要不要交给模型」。
+想让**规则路径单独跑**（写回归用例时）应当关 `nlu_chat_tools` 而不是
+`nlu_chat_fallback` —— 后者会把单轮带数据回答一起关掉，那些「带唤醒词的闲聊
+由插件回答」的断言会跟着一起聋掉。
 
 ### 安装
 
@@ -912,11 +962,15 @@ B 群的任务既不直观也很危险。其他会话还有任务时明确提示
 增删改各有一行留痕：`定时任务批量操作 delete：成功 N 个，失败 M 个` /
 `定时任务 <schedule_id> 执行时间改为 <cron>`，用户报「删了没反应」时先 grep 这两行。
 
-回归：`tests/schedule_check.py`（251 项：时间解析 → cron、拒绝纯提醒、意图优先级、
+回归：`tests/schedule_check.py`（253 项：时间解析 → cron、拒绝纯提醒、意图优先级、
 `CronBridge` 的建 / 列 / 停 / 删 / 改时间 / 接管与 UTC→本地渲染、计数窗口的触发与去重、
 `/d2 定时` 全流程、到点执行、一次性任务自删、插件卸载后不再推送、平台无 cron 时
 计数型仍可用、配置关闭、**控制词解析（别名剥离 / 编号在后 / 整批 / 改时间沿用周期 /
 反例不误伤）**）。
+本文件测的是定时任务**子系统**，`say()` 只是为了借自然语言入口把人话送进计划确认流程，
+所以它的 `build_plugin` 一律带 `nlu_chat_tools=False` —— 否则工具优先路径会先把整句
+接走（替身模型不返回工具调用，什么也不会发生），所有断言会集体失败得看不出原因。
+工具路径下的定时任务管理由 `nlu_agent_routing_check [2f]` 单独覆盖。
 
 另有一支**在线验收**（跑 AstrBot **真实**的 `CronJobManager` + `SQLiteDatabase`，不是替身）：
 自然语言 → 确认 → 真的进平台任务库 → 到点由平台调度器调起插件 handler → 重载后接管
@@ -1063,11 +1117,15 @@ OpenDota 作为后备。主源失效时自动切后备，无需人工干预。
 
 行为约定：
 
-- 只对「分析 / 单场」的报告生效（监听推送的短评另有一套内置提示词，
-  可用 `watch_comment_system_prompt` 单独调整）；自然语言的意图识别仍用 AstrBot 默认模型；
+- 这条通道**只承载长文分析**：「分析 / 单场 / 监听推送 / 定时播报」。群里的闲聊、
+  说人话查战绩、模型自己调工具都走 **AstrBot 全局的默认模型**（v2.3.4 起），
+  所以填了 Key 也不会把日常唠嗑记到它头上；监听推送的短评另有一套内置提示词，
+  可用 `watch_comment_system_prompt` 单独调整；
 - 配了专用 Key 但调用失败时，默认自动回退到 AstrBot 的模型重试一次（可用
-  `llm_fallback_on_error` 关闭）；
-- 不填专用 Key 时行为与以前完全一致，不影响现有部署；
+  `llm_fallback_on_error` 关闭）；闲聊侧是反过来的 —— 默认模型拿不到或调不动工具时
+  才用专用 Key 兜一下；
+- 不填专用 Key 时，分析侧行为与以前完全一致；闲聊侧则**更省**了（走全局模型，
+  不再向专用通道要账）。详见[模型通道分工](#模型通道分工闲聊走默认模型分析走专用-key)；
 - 只依赖 Python 标准库实现，不新增第三方依赖。
 
 ### 配置项
@@ -1087,8 +1145,8 @@ OpenDota 作为后备。主源失效时自动切后备，无需人工干预。
 | `default_match_count` | 20 | 默认查询/分析场次 |
 | `max_match_count` | 50 | 允许的最大场次 |
 | `enable_llm_analysis` | true | 关闭后只输出整理好的原始数据 |
-| `llm_provider_id` | 空 | 指定用于分析的模型，留空用会话默认模型。配了专用 API Key 后，本项仅作回退 |
-| `llm_api_key` | 空 | 插件专用 API Key（OpenAI 兼容）。填了就优先走自己的通道，留空回退 AstrBot |
+| `llm_provider_id` | 空 | 默认模型提供商：**闲聊（含工具调用）用的就是这一条**；分析侧仅在专用通道不可用时作回退。留空用会话默认模型 |
+| `llm_api_key` | 空 | 插件专用 API Key（OpenAI 兼容）。**只承载长文分析**（分析 / 单场 / 监听短评 / 定时播报）；闲聊与工具调用不占这条通道 |
 | `llm_base_url` | 空 | 专用通道接口地址；也可只填服务商名（`deepseek`/`kimi`/`qwen`/`zhipu`/`siliconflow`/`openrouter`/`ollama`）自动补全 |
 | `llm_model` | 空 | 专用通道模型名，如 `deepseek-chat`。使用专用 Key 时必填 |
 | `llm_temperature` | 0.7 | 专用通道采样温度，复盘建议 0.3~0.7 |
@@ -1128,12 +1186,12 @@ OpenDota 作为后备。主源失效时自动切后备，无需人工干预。
 | `nlu_confirm_sensitive` | true | 「绑定 / 解绑 / 添加监听」自然语言触发时先确认再执行。**只影响降级的关键词/意图路径**；走工具路径时写操作的确认闸门始终生效 |
 | `nlu_llm_first` | true | **降级路径**的意图识别以大模型为准（关键词只管唤醒）；关掉则恢复「关键词优先、认不出再问模型」。工具路径不读本项 |
 | `nlu_llm_fallback` | true | **降级路径**启用大模型意图识别；关掉后只用关键词规则。工具路径不读本项 |
-| `nlu_chat_fallback` | true | 自然语言**总闸**：命中唤醒词的消息带本会话数据与工具清单交给大模型处理。关掉则退回「关键词 + 意图分类 → 指令 handler」 |
+| `nlu_chat_fallback` | true | 自然语言**总闸**：命中唤醒词的消息带本会话数据与工具清单交给大模型处理（走**默认模型**）。关掉则退回「关键词 + 意图分类 → 指令 handler」 |
 | `nlu_chat_context_matches` | 10 | 预取上下文里每人取多少场算胜率/KDA/GPM（问题里出现时间词时会自动放宽到至少 30 场） |
 | `nlu_chat_max_players` | 6 | 预取上下文一次最多分析几个玩家（提问者本人优先） |
 | `nlu_chat_timeout` | 25.0 | 预取上下文拉数据的单次超时（秒） |
 | `nlu_chat_system_prompt` | 空 | 闲聊的角色/口吻提示词，留空用内置「群里老玩家」风格 |
-| `nlu_chat_tools` | true | 把**全部能力**作为工具交给模型（查询 / 写操作带确认闸门 / 后台任务）。只在配了 `llm_api_key` 时生效；工具清单与三类边界见[自然语言的工具化重构](#自然语言的工具化重构v233) |
+| `nlu_chat_tools` | true | 把**全部能力**作为工具交给模型（查询 / 写操作带确认闸门 / 后台任务）。走**默认模型**，无需专用 Key；默认模型调不动工具时自动回退专用 Key。工具清单与三类边界见[自然语言的工具化重构](#自然语言的工具化重构v233)，通道优先级见[模型通道分工](#模型通道分工闲聊走默认模型分析走专用-key) |
 | `nlu_chat_tool_rounds` | 3 | 最多几轮工具调用（用完收走工具，要一次收口回答） |
 | `nlu_chat_tool_max_calls` | 6 | 一次回答最多执行几个工具（超出的不执行，只回一句说明；被短路的调用不占配额） |
 | `nlu_chat_tool_timeout` | 30.0 | 单个工具的超时（秒），超时只影响那一个工具；不影响后台任务 |
@@ -1255,8 +1313,8 @@ python tests/nlu_check.py            # 自然语言入口：意图识别 + 端�
 python tests/nlu_context_check.py    # 指代消歧（「这一盘」）+ 大模型优先于关键词
 python tests/nlu_chat_check.py       # 预取上下文：数据注入路由、缺失不冒充、失败必放行
 python tests/chat_time_party_check.py # 上下文时效与开黑：凌晨 4 点分界（游戏日）、时间窗口收窄口径、同场局归并、缺字段不冒充单排
-python tests/chat_tools_check.py     # 工具层：schema 合法、失败/超时/上限、短路、按需收窄、认人零联网、多轮回填、降级与收口
-python tests/nlu_agent_routing_check.py # 工具优先路由与确认闸门：写操作只登记不执行、慢任务只发起、降级链、无产出不吞消息
+python tests/chat_tools_check.py     # 工具层：schema 合法、失败/超时/上限、短路、按需收窄、认人零联网、多轮回填、降级与收口、模型通道分工与整批删除归一
+python tests/nlu_agent_routing_check.py # 工具优先路由与确认闸门：写操作只登记不执行（含 manage_schedule 整批删除直达平台任务库）、慢任务只发起、降级链、无产出不吞消息
 python tests/takeover_scope_check.py # 放弃消息时不得吞掉其他插件与默认大模型
 python tests/parse_wait_check.py     # 催解析 + 等待解析：成功 / 超时降级 / 跳过 / 并发
 python tests/watch_deliver_check.py  # 监听短评：标题推进基线、正文失败可见、不再 @ 人
