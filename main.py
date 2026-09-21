@@ -764,8 +764,36 @@ class Dota2Plugin(Star):
         Returns:
             是否成功排入后台任务。
         """
-        umo = str(event.unified_msg_origin)
-        uid = str(event.get_sender_id())
+        platform = ""
+        try:
+            platform = event.get_platform_name()
+        except Exception:  # noqa: BLE001
+            platform = ""
+        return self._spawn_parse_task(
+            umo=str(event.unified_msg_origin),
+            uid=str(event.get_sender_id()),
+            match_id=match_id,
+            focus_ids=focus_ids,
+            focus_names=focus_names,
+            platform=platform,
+        )
+
+    def _spawn_parse_task(
+        self,
+        *,
+        umo: str,
+        uid: str,
+        match_id: int,
+        focus_ids: list[int],
+        focus_names: dict[int, str],
+        platform: str = "",
+    ) -> bool:
+        """``_start_parse_task`` 的核心部分（不依赖 event，供工具路径复用）。
+
+        自然语言工具触发单场复盘时手上没有 handler 的 event，但仍要走同一条
+        「催解析 → 等 → 出报告 → 发回会话」流水线；拆出这一层就是为了让两条
+        路径共用它，而不是在工具侧再写一份（两套等的节拍迟早会不一致）。
+        """
         key = self._parse_task_key(umo, match_id, uid)
 
         existing = self._parse_tasks.get(key)
@@ -783,12 +811,6 @@ class Dota2Plugin(Star):
         except RuntimeError:  # pragma: no cover - handler 一定在事件循环里
             logger.error(f"[dota2] 无法排入等待解析任务 {match_id}：没有运行中的事件循环")
             return False
-
-        platform = ""
-        try:
-            platform = event.get_platform_name()
-        except Exception:  # noqa: BLE001
-            platform = ""
 
         task = loop.create_task(
             self._parse_and_analyze(
@@ -2178,7 +2200,16 @@ class Dota2Plugin(Star):
             ) from e
 
     def _nlu_chat_tool_ctx(self, event: AstrMessageEvent) -> dota_tools.ToolContext:
-        umo = event.unified_msg_origin
+        """构造一次工具调用的运行环境。
+
+        六个外部能力全部以闭包注入，工具层因此不需要 import 插件主体，
+        可以脱离 AstrBot 单独测试。这里**必须**把 ``ask_confirm`` /
+        ``trigger_async`` / ``schedules_text`` 三个也接上：漏掉任何一个，
+        对应的那类工具就会一律回「当前环境不支持」，写操作与单场复盘
+        在自然语言里直接失效（界面上表现为「说了它说用不了」）。
+        """
+        umo = str(event.unified_msg_origin)
+        uid = str(event.get_sender_id())
         timeout = float(
             self.cfg("nlu_chat_tool_timeout", dota_tools.DEFAULT_TOOL_TIMEOUT)
             or dota_tools.DEFAULT_TOOL_TIMEOUT
@@ -2190,16 +2221,320 @@ class Dota2Plugin(Star):
             resolve_player=lambda raw: self._nlu_resolve_person(umo, event, raw),
             session_players=lambda: self._nlu_session_players(umo),
             fetch_matches=self._fetch_chat_matches,
+            ask_confirm=lambda action: self._nlu_ask_confirm(umo, uid, action),
+            trigger_async=lambda kind, params: self._nlu_trigger_async(
+                umo, uid, event, kind, params
+            ),
+            schedules_text=lambda: self._schedule_list_text(umo),
             now=time.time(),
             timeout=timeout,
         )
+
+    # ------------------------------------------------------------------
+    # 写操作工具的确认闸门
+    # ------------------------------------------------------------------
+    async def _nlu_ask_confirm(self, umo: str, uid: str, action: dict) -> str:
+        """写操作工具的统一出口：**只登记，不执行**，返回给用户看的文案。
+
+        登记这一步必须留在插件主体：待确认状态本来就有两套现成机制
+        （``_nlu_confirm`` 存「(handler 名, 参数)」、``_schedule_plans``
+        存已解析的定时计划），让工具层自己再发明一套，就会出现「模型那边
+        说登记好了、用户回确认却没反应」。
+
+        .. important::
+
+           写操作的确认闸门**始终生效**，不受 ``nlu_confirm_sensitive``
+           影响。原因是模型看到的工具契约就是「调了不会立刻生效」——
+           如果这个开关能把它变成立刻执行，模型就会照旧说「已完成」，
+           而契约与事实不一致的那一天，用户收到的是一句假话。
+
+        Returns:
+            给用户看的确认文案；返回空串表示登记失败（工具层会据此让
+            模型改口让用户用指令），**绝不是「已执行」**。
+        """
+        kind = str(action.get("kind") or "")
+        if kind == "schedule":
+            if not self.cfg("schedule_enabled", True):
+                return ""
+            request = self._parse_task_request(str(action.get("request") or ""), umo)
+            if request is None:
+                return ""
+            # 计数型任务（「每监听到 N 场」）不依赖平台调度器，别一起拒了。
+            if request.kind != "watch_count" and self.schedules.unavailable_reason():
+                return ""
+            self._schedule_plans[(umo, uid)] = {
+                "request": request,
+                "umo": umo,
+                "expire": time.time() + NLU_CONFIRM_TTL,
+            }
+            logger.info(f"[dota2] 工具登记待确认定时任务：{request.kind}")
+            return dota_schedule.format_plan(
+                request,
+                session_text=dota_schedule.session_label(umo),
+                keyword=self._nlu_keyword(),
+            )
+
+        name = str(action.get("name") or "").strip()
+        if name not in self.NLU_DISPATCH:
+            logger.warning(f"[dota2] 工具请求了未知的写操作: {name!r}")
+            return ""
+        args = str(action.get("args") or "")
+        desc = str(action.get("desc") or "").strip()
+        if not desc:
+            verb = str(action.get("verb") or name)
+            desc = f"{verb}「{args}」" if args else verb
+        self._nlu_confirm[(umo, uid)] = (name, args, time.time() + NLU_CONFIRM_TTL)
+        logger.info(f"[dota2] 工具登记待确认动作: {name} args={args!r}")
+        return (
+            f"你刚才是想让我{desc}吗？\n"
+            "回复「确认」我就执行；回复「取消」就当我没说。"
+        )
+
+    # ------------------------------------------------------------------
+    # 慢任务的异步落地
+    # ------------------------------------------------------------------
+    async def _nlu_trigger_async(
+        self,
+        umo: str,
+        uid: str,
+        event: AstrMessageEvent,
+        kind: str,
+        params: dict,
+    ) -> str:
+        """慢任务工具的统一出口：**只发起**后台任务，立刻返回受理回执。
+
+        单场复盘可能要申请录像解析并等十几分钟。工具调用发生在一次模型
+        请求里，同步等就是把这轮问答连同模型的超时一起卡死；因此这里
+        只 ``create_task``，正文由后台任务直接发回会话。
+        """
+        if kind not in dota_tools.ASYNC_KINDS:
+            return f"[{kind} 不支持] 插件没有这种后台任务。"
+        match_id = int(params.get("match_id") or 0)
+        if match_id <= 0:
+            return "[缺少比赛 ID] 后台任务需要比赛 ID，请先向用户确认是哪一场。"
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - 工具一定在事件循环里跑
+            return "[后台任务启动失败] 当前没有运行中的事件循环。"
+        if kind == "parse":
+            coro = self._nlu_async_parse(umo, match_id)
+            note = "已开始检查并申请解析"
+        else:
+            coro = self._nlu_async_match_detail(umo, uid, match_id)
+            note = "已开始复盘"
+        task = loop.create_task(coro)
+        # 记进任务表，避免模型重复调同一个工具时重复起任务（它会重复申请解析）。
+        key = self._parse_task_key(umo, match_id, f"tool:{uid}")
+        self._parse_tasks[key] = task
+        task.add_done_callback(lambda _t, _key=key: self._parse_tasks.pop(_key, None))
+        logger.info(f"[dota2] 工具发起后台任务 {kind}: 比赛 {match_id}（{umo}）")
+        return (
+            f"✅ {note}，请求已被受理。"
+            "这一步在后台跑（复盘可能要等录像解析几分钟到十几分钟），"
+            "结果会由插件**直接发到本会话**，不需要再调用这个工具。"
+            "请简短告诉用户「已经开始了，稍后发到本群」，不要复述细节。"
+        )
+
+    async def _nlu_async_parse(self, umo: str, match_id: int) -> None:
+        """后台任务：检查解析状态并按需提交申请（``request_match_parse`` 的落地）。
+
+        与 ``/d2 催解析`` 完全同口径，只是把「回给用户的话」从 yield 改成
+        ``_send_to_session`` —— 工具路径的调用方早就把话说完返回了。
+        """
+        try:
+            match = await self.api.get_match(match_id)
+        except Exception as e:  # noqa: BLE001 - 后台任务绝不能把异常抛给事件循环
+            logger.error(f"[dota2] 工具催解析：拉取比赛 {match_id} 失败: {e}")
+            await self._send_to_session(umo, f"❌ 比赛 {match_id} 的解析检查失败：{e}")
+            return
+        if not match:
+            await self._send_to_session(
+                umo,
+                f"❌ 找不到比赛 {match_id}，或它还没被数据源收录。\n"
+                "未被收录时提交解析申请没有意义，一般等几分钟到几十分钟会自动收录。",
+            )
+            return
+        state = dota_parse.parse_state(match)
+        if state.parsed:
+            await self._send_to_session(
+                umo,
+                f"✅ 比赛 {match_id} 已经解析完成（{state.describe()}），无需催解析。\n"
+                f"想看复盘：说「复盘这一局」或 `/d2 单场 {match_id}`。",
+            )
+            return
+        try:
+            granted = await dota_parse.submit_parse(self.api, match_id)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[dota2] 工具催解析：提交失败 {match_id}: {e}")
+            await self._send_to_session(umo, f"⚠️ 比赛 {match_id} 的解析申请提交失败：{e}")
+            return
+        if granted:
+            await self._send_to_session(
+                umo,
+                f"📨 已提交比赛 {match_id} 的解析申请，任务已排队。\n"
+                f"当前状态：{state.describe()}\n\n"
+                "解析通常要几分钟到几十分钟。想拿到结果后自动出复盘，"
+                "说一句「复盘这一局」即可（会等着解析，最多十分钟）。",
+            )
+        else:
+            await self._send_to_session(
+                umo,
+                f"⚠️ 解析申请没有返回排队凭据（可能：该局无法解析 / 已在队列中 / 被限流）。\n"
+                f"当前状态：{state.describe()}",
+            )
+
+    async def _nlu_async_match_detail(
+        self, umo: str, uid: str, match_id: int
+    ) -> None:
+        """后台任务：单场复盘（``query_match_detail`` 的落地）。
+
+        与 ``/d2 单场`` 同一条流水线：未解析就先交给
+        :meth:`_parse_and_analyze` 去催解析并等（它会自己发进度与报告），
+        已解析（或排队失败）则直接生成报告发到会话。
+        """
+        try:
+            match = await self.api.get_match(match_id)
+            if not match:
+                await self._send_to_session(
+                    umo,
+                    f"❌ 查不到比赛 {match_id}：数据源里没有这盘。\n"
+                    "可能原因：比赛 ID 写错、该局刚结束还没被收录、或对局方未公开比赛数据。",
+                )
+                return
+            heroes = await self._heroes()
+            items = await self._items()
+            self._nlu_remember_match(umo, match_id, start_time=match.get("start_time"))
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[dota2] 工具复盘：拉取比赛 {match_id} 失败: {e}")
+            await self._send_to_session(umo, f"❌ 拉取比赛 {match_id} 的数据失败：{e}")
+            return
+
+        # 焦点玩家：本会话提问者绑定的那个人若在本局里，就自动聚焦。
+        # 与指令路径同一套判据（指令路径用的是 _effective_binding(event)，
+        # 这里没有 event，直接按 uid 取绑定 —— 语义一致）。
+        focus_ids: list[int] = []
+        focus_names: dict[int, str] = {}
+        binding = None
+        try:
+            binding = self.store.get_binding(umo, uid)
+        except Exception:  # noqa: BLE001
+            binding = None
+        if binding:
+            candidate = int(binding.get("account_id") or 0)
+            if candidate and any(
+                isinstance(player, dict) and player.get("account_id") == candidate
+                for player in match.get("players") or []
+            ):
+                focus_ids.append(candidate)
+                focus_names[candidate] = str(binding.get("personaname") or "")
+
+        state = dota_parse.parse_state(match)
+
+        # ---------- 未解析：交给既有的「催解析 + 等 + 出报告」流水线 ----------
+        if not state.parsed and self.cfg("parse_wait_enabled", True):
+            if self._spawn_parse_task(
+                umo=umo,
+                uid=uid,
+                match_id=match_id,
+                focus_ids=focus_ids,
+                focus_names=focus_names,
+            ):
+                options = self._parse_wait_options()
+                minutes = max(1, round(int(options["timeout"]) / 60))
+                fallback_hint = (
+                    "仍未解析就自动改用现有数据出一份基础数据版的报告"
+                    if self.cfg("parse_fallback_unparsed", True)
+                    else "等不到会通知你"
+                )
+                await self._send_to_session(
+                    umo,
+                    f"⏳ 比赛 {match_id} 数据完整度：{state.describe()}\n"
+                    f"AI 复盘依赖逐分钟经济、团战与出装数据，"
+                    f"{'已提交催解析并' if self.cfg('parse_submit_request', True) else ''}"
+                    f"开始等待（最多 {minutes} 分钟，{fallback_hint}）。\n"
+                    "报告出来后会自动发到本会话，可以先忙别的。",
+                )
+                return
+            await self._send_to_session(
+                umo,
+                f"⚠️ 当前等待解析的任务过多，无法排队，"
+                f"已改用基础数据（{state.describe()}）生成复盘。",
+            )
+
+        # ---------- 已解析 / 不等解析 / 排队失败：直接出报告 ----------
+        await self._nlu_deliver_match_report(
+            umo, match_id, match, heroes, items, focus_ids, focus_names, state.parsed
+        )
+
+    async def _nlu_deliver_match_report(
+        self,
+        umo: str,
+        match_id: int,
+        match: dict,
+        heroes: dict,
+        items: dict,
+        focus_ids: list[int],
+        focus_names: dict[int, str],
+        parsed: bool,
+    ) -> None:
+        """生成并发送单场复盘（工具路径的最终一段）。
+
+        报告正文走 :meth:`_generate_report_for_umo`（不依赖 event），
+        发送走 :meth:`_send_to_session`（**纯文本**，与监听推送同一条通道）。
+        刻意不做图片渲染：后台任务里没有 event，而渲染失败时的回退分支
+        会让「报告已生成」这件事变得难以判断；文本先保证一定送达。
+        """
+        try:
+            headline = self.match_headline(
+                match, heroes, focus_ids or None, parsed, focus_names
+            )
+            extra_context = await self._build_recent_context(
+                match_id, focus_ids, focus_names, heroes
+            )
+            abilities = await self._ability_constants()
+            curve_ids = self._curve_targets(match, focus_ids)
+            prompt = build_single_match_analysis_prompt(
+                match=match,
+                heroes=heroes,
+                items=items,
+                focus_account_ids=focus_ids or None,
+                focus_names=focus_names or None,
+                extra_context=extra_context,
+                abilities=abilities,
+                curve_ids=curve_ids,
+            )
+            report = await self._generate_report_for_umo(umo, prompt)
+        except Exception as e:  # noqa: BLE001 - 生成失败要发出去，不能只留日志
+            logger.error(f"[dota2] 工具复盘：生成报告失败 {match_id}: {e}", exc_info=True)
+            await self._send_to_session(umo, f"⚠️ 比赛 {match_id} 的复盘生成失败：{e}")
+            return
+
+        if report:
+            await self._send_to_session(umo, headline)
+            await self._send_to_session(umo, report)
+            logger.info(f"[dota2] 工具复盘已推送: 比赛 {match_id} → {umo}")
+            return
+        # 模型不可用：退化成原始数据，至少让用户拿到东西
+        raw = (
+            f"{headline}\n\n"
+            "⚠️ 未启用大模型分析或模型不可用，以下为从数据源获取的完整原始数据：\n\n"
+            + build_match_data_text(
+                match,
+                heroes,
+                items,
+                focus_account_ids=focus_ids or None,
+                abilities=abilities,
+                curve_ids=curve_ids,
+            )
+        )
+        await self._send_to_session(umo, raw)
 
     async def _nlu_chat_agent(
         self,
         event: AstrMessageEvent,
         prompt: str,
         system_prompt: str,
-    ) -> tuple[str | None, str]:
+    ) -> tuple[str | None, str, list[str]]:
         """带工具的多轮问答。
 
         流程就是标准的 function calling 循环：把问题与工具清单发给模型，
@@ -2209,12 +2544,14 @@ class Dota2Plugin(Star):
         问题能让模型把数据源查个底朝天。
 
         Returns:
-            ``(回答, 工具调用轨迹)``。回答为 ``None`` 表示这条链路没能产出
-            内容（没配 Key、模型报错等），调用方回落到单轮带数据的回答。
+            ``(回答, 工具调用轨迹, 待发给用户的确认请求)``。回答为 ``None``
+            表示这条链路没能产出内容（没配 Key、模型报错等），调用方回落到
+            单轮带数据的回答。第三项来自写操作工具：**必须由插件原样发出**，
+            不能让模型转述（确认文案要和用户逐字对齐）。
         """
         client = self._dedicated_client()
         if client is None:
-            return None, ""
+            return None, "", []
 
         tool_ctx = self._nlu_chat_tool_ctx(event)
         tools = dota_tools.build_tool_specs()
@@ -2246,7 +2583,11 @@ class Dota2Plugin(Star):
                 logger.error(
                     f"[dota2] 兜底工具对话第 {round_index + 1} 轮失败: {e}"
                 )
-                return (answer or None), "; ".join(tool_ctx.trace)
+                return (
+                    (answer or None),
+                    "; ".join(tool_ctx.trace),
+                    list(tool_ctx.pending_prompts),
+                )
 
             if not reply.has_tool_calls:
                 answer = reply.content or answer
@@ -2302,23 +2643,31 @@ class Dota2Plugin(Star):
         trace = "; ".join(tool_ctx.trace)
         if trace:
             logger.info(f"[dota2] 兜底工具调用: {trace}")
-        return (answer or None), trace
+        return (answer or None), trace, list(tool_ctx.pending_prompts)
 
-    async def _nlu_chat_reply(self, event: AstrMessageEvent, question: str):
-        """闲聊兜底：没识别出指令时，带着插件内部数据让模型回答。
+    async def _nlu_agent_reply(
+        self, event: AstrMessageEvent, question: str
+    ) -> tuple[str | None, list[str]]:
+        """**工具优先**路径：带着插件数据与全套工具，让模型自己决定干什么。
 
-        只在「命中唤醒词」之后才会走到这里（见 :meth:`_nlu_should_handle`
-        的返回值），因为唤醒词就是用户明确点名了插件。
+        这是自然语言入口的主路径（规则识别只在没有专用模型通道时兜底）。
+        模型可以：
+
+        * 直接回答（闲聊、解释、建议）；
+        * 调用只读工具补数据（查战绩 / 英雄池 / 版本榜 …）；
+        * 调用写操作工具改设置 —— 那只会**登记待确认**，插件随后把确认
+          请求发出去，用户回「确认」才真的执行；
+        * 发起后台任务（单场复盘 / 催解析）—— 只受理，正文稍后自动发到
+          本会话。
 
         典型场景：
 
         * 「dota2助手 对比一下目前监听的几个人谁最菜」
           —— 需要监听列表 + 每个人的近期战绩；
-        * 「dota2助手 我要转辅助该怎么练」
-          —— 需要提问者自己的英雄池 + 近期表现；
-        * 「dota2助手 昨天群里开黑谁最牛逼」
-          —— 需要**会话语境**（监听推送过的比赛）+ 近期战绩 +
-            时间窗口（把统计收窄到昨天）+ 按 match_id 归并出的同场局。
+        * 「dota2助手 钢板最近打得怎么样？顺便给他推荐几个轮椅」
+          —— 一句里要两样东西，工具调用才能都答上；
+        * 「dota2助手 以后每天七点通报群里战绩」
+          —— 走写操作工具 + 确认闸门。
 
         上下文里永远带三样「坐标系」：当前时间、会话语境里的比赛列表、
         以及（识别到时间词时的）时间窗口 —— 少了它们，数据再全也答不准。
@@ -2327,13 +2676,16 @@ class Dota2Plugin(Star):
 
         * **数据收集失败不算失败**。少拉一块上下文照样能回答，最多在
           上下文里注明「某人数据没取到」。
-        * **模型不可用才算失败**。此时一条结果都不产出，由
-          ``@take_over_event(declinable=True)`` 原样放行，消息会正常落到
-          AstrBot 的默认大模型手里 —— 绝不能既不回答、又把消息吃掉。
+        * **模型不可用才算失败**。此时返回 ``(None, [])``，调用方回落到
+          规则识别 —— 绝不能既不回答、又把消息吃掉。
+
+        Returns:
+            ``(回答, 待发送的确认请求)``。两者都为空表示这条链路没产出，
+            调用方应当继续走降级路径。
         """
         # 用户明确关闭了「启用 LLM 分析」：不要偷偷替他调用模型
         if not self.cfg("enable_llm_analysis", True):
-            return
+            return None, []
 
         umo = event.unified_msg_origin
         uid = str(event.get_sender_id())
@@ -2346,7 +2698,7 @@ class Dota2Plugin(Star):
             context = await self._collect_chat_context(question, umo, uid, binding, focus)
         except Exception as e:  # noqa: BLE001 - 兜底失败也要放行，不能吞消息
             logger.error(f"[dota2] 闲聊兜底收集数据失败: {e}", exc_info=True)
-            return
+            return None, []
 
         prompt = dota_chat.build_chat_prompt(question, context)
         system_prompt = dota_chat.build_chat_system_prompt(
@@ -2358,27 +2710,30 @@ class Dota2Plugin(Star):
         # 带数据回答 —— 功能不会因为模型不支持工具就消失。
         reply: str | None = None
         trace = ""
+        pending: list[str] = []
         if tools_on:
-            reply, trace = await self._nlu_chat_agent(event, prompt, system_prompt)
+            reply, trace, pending = await self._nlu_chat_agent(
+                event, prompt, system_prompt
+            )
         if not reply:
             reply = await self._call_report_llm(
                 prompt, umo=umo, system_prompt=system_prompt
             )
-        if not reply:
+        if not reply and not pending:
             logger.info("[dota2] 闲聊兜底：模型不可用，消息交回默认大模型")
-            return
+            return None, []
 
         logger.info(
-            f"[dota2] 闲聊兜底回答: {question[:48]!r} "
+            f"[dota2] 工具优先回答: {question[:48]!r} "
             f"needs={sorted(context.needs)} "
             f"玩家数={len(context.snapshots)} "
             f"收窄={focus or '-'} "
             f"时间窗口={context.window.label if context.window else '-'} "
             f"会话比赛={len(context.session_matches)} "
-            f"工具调用={len([x for x in trace.split('; ') if x]) if trace else 0}次"
+            f"工具调用={len([x for x in trace.split('; ') if x]) if trace else 0}次 "
+            f"待确认={len(pending)}项"
         )
-        async for item in self._emit(event, reply, as_image=False):
-            yield item
+        return reply, pending
 
     async def _collect_chat_context(
         self,
@@ -2451,7 +2806,23 @@ class Dota2Plugin(Star):
     @filter.event_message_type(filter.EventMessageType.ALL)
     @take_over_event(declinable=True)
     async def d2_natural(self, event: AstrMessageEvent):
-        """自然语言入口：把「帮我看看我的战绩」这类人话转成对应功能。
+        """自然语言入口：把「帮我看看我的战绩」这类人话交给模型去办。
+
+        处理顺序（**改过一轮，别按旧印象读**）：
+
+        1. **确认 / 取消回复**。用户对上一条待确认动作的回话先处理掉，
+           且不受唤醒词限制 —— 逼他再打一遍「dota2助手 确认」是没必要的摩擦。
+           定时任务计划另走一套（确认对象是「已解析好的计划」而不是
+           「(意图名, 参数)」，混在一起会让用户陷进「确认 → 又让你确认」）。
+        2. **闸门**（:meth:`_nlu_should_handle`）：总开关、指令前缀、唤醒词、
+           群聊 @ 要求。没通过就直接 ``return``，消息留给别人。
+        3. **工具优先**（:meth:`_nlu_agent_reply`）：把插件的**全部能力**
+           作为工具交给模型，由它决定调什么、调几次、还是直接回答。
+           写操作工具只登记待确认，确认请求由插件原样发给用户；
+           慢任务（单场复盘 / 催解析）只发起后台任务。
+        4. **规则降级**：专用模型通道不可用（没配 Key / 关掉工具 /
+           模型报错）时，才退到「大模型判意图 → 关键词规则」→ 指令 handler；
+           规则也认不出来且有唤醒词时，退回「单轮带数据回答」。
 
         .. important::
 
@@ -2520,7 +2891,45 @@ class Dota2Plugin(Star):
             return
         effective = gate.text
 
-        # ---------- 3. 识别意图 ----------
+        # ---------- 3. 工具优先：整条消息交给带工具的模型 ----------
+        # 这是自然语言入口的**主路径**：把插件的全部能力（查数据 / 改设置 /
+        # 发起后台复盘）作为工具交给模型，由它自己决定调哪些、调几次、
+        # 还是直接回答。
+        #
+        # 为什么不再先做意图分类：一句话里常常要好几样东西
+        # （「钢板最近打得怎么样？顺便给他推荐几个轮椅」），而意图分类一次
+        # 只能给一个 label，无论判成哪个都必然漏答一半。把「该调什么」交给
+        # 模型，复合问题才解得开；写操作也因此多了一道确认闸门（见
+        # `_nlu_ask_confirm`），群里误触的代价不会比原来更高。
+        #
+        # 规则识别没有删，它整体退到下面做**降级兜底**：没有专用模型通道
+        # （没配 Key / 关掉了工具 / 没开 LLM 分析）或模型整个不可用时，
+        # 依旧能靠关键词把指令认出来，功能不会消失。
+        #
+        # 要求 `keyword_matched`：唤醒词是**用户明确点名**插件的信号。
+        # 没有它（即 `nlu_require_keyword=false` 且只 @ 了机器人）时不能
+        # 走这条路 —— 那等于让插件接管所有 @ 消息，抢答风险太大。
+        agent_ready = (
+            gate.keyword_matched
+            and self.cfg("nlu_chat_fallback", True)
+            and self._chat_tools_available()
+        )
+        if agent_ready:
+            reply, pending_prompts = await self._nlu_agent_reply(event, effective)
+            if reply or pending_prompts:
+                if reply:
+                    async for item in self._emit(event, reply, as_image=False):
+                        yield item
+                # 写操作的确认请求**由插件原样发出**，不让模型转述：
+                # 确认文案（尤其定时任务的计划文本）必须和用户逐字对齐。
+                for prompt_text in pending_prompts:
+                    yield event.plain_result(prompt_text)
+                return
+            # 模型通道在这里没产出（Key 失效 / 接口挂了）。继续往下走规则，
+            # 而不是把消息吃掉 —— 用户至少还能用指令把事办成。
+            logger.info("[dota2] 工具优先路径无产出，回落到规则识别")
+
+        # ---------- 4. 识别意图（降级路径）----------
         # 关键词只负责**唤醒插件**（见闸门）；判意图以大模型为准。
         # 「详细分析这一盘」里「分析」4 分压过「这盘」3 分，关键词会把它判成
         # 「分析近期 1 场表现」——这种词频游戏只有模型看得懂，而且它还带着
@@ -2571,19 +2980,30 @@ class Dota2Plugin(Star):
             intent.args = effective
 
         if intent is None:
-            # 没识别出内置指令。分两种情况：            #
-            # a) 用户写了唤醒词 —— 这是**明确点名**插件。此时直接把消息
-            #    扔回默认大模型是浪费：默认大模型看不到本会话的监听列表、
-            #    绑定关系与战绩数据，只能反问或编造。改为由插件带着这些
-            #    数据回答（「闲聊兜底」）。
-            # b) 没写唤醒词（仅 @，且配置允许）—— 说明只是随口一提，
-            #    原样放行，别抢答。
+            # 规则也没认出来。分两种情况：
+            #
+            # a) 工具路径**压根没试过**（没有专用模型 Key / 关掉了工具）——
+            #    此时退回「单轮带数据回答」：默认大模型看不到本会话的监听名单、
+            #    绑定关系与战绩，直接放行只会得到反问或编造。这条路径不调工具，
+            #    只是把数据一次性喂给它。
+            # b) 工具路径试过但没产出 —— 说明模型整个不可用，再问一次也是白问，
+            #    原样放行给默认大模型，绝不既不回答又把消息吃掉。
             #
             # 注意 keyword_matched 在 `nlu_require_keyword=false` 时恒为假，
             # 所以关掉唤醒词限制不会让插件变成「什么都插一嘴」。
-            if gate.keyword_matched and self.cfg("nlu_chat_fallback", True):
-                async for item in self._nlu_chat_reply(event, effective):
-                    yield item
+            if (
+                not agent_ready
+                and gate.keyword_matched
+                and self.cfg("nlu_chat_fallback", True)
+            ):
+                reply, pending_prompts = await self._nlu_agent_reply(
+                    event, effective
+                )
+                if reply:
+                    async for item in self._emit(event, reply, as_image=False):
+                        yield item
+                for prompt_text in pending_prompts:
+                    yield event.plain_result(prompt_text)
             return
 
         handler_name = self.NLU_DISPATCH.get(intent.name)
