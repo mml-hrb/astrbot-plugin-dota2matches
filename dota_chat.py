@@ -67,12 +67,13 @@ from typing import Any, Iterable
 from astrbot.api import logger
 
 try:  # 插件目录被作为包加载时的相对导入
-    from . import dota_pool
+    from . import dota_format, dota_pool
 except ImportError:  # 兜底：以普通模块方式加载时，把插件目录加入 sys.path
     import os
     import sys
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import dota_format  # type: ignore[no-redef]
     import dota_pool  # type: ignore[no-redef]
 
 # ======================================================================
@@ -625,29 +626,14 @@ def row_win(match: dict) -> bool | None:
     返回 ``None`` 表示**判不出来** —— 这时候不能按负处理，否则胜率会
     被系统性低估（这和「缺失值不能伪装成 0」是同一类问题）。
 
-    判定顺序：
-
-    1. ``player_win`` / ``isVictory`` / ``win``（数据源直接给的权威布尔）；
-    2. ``radiant_win`` + ``is_radiant``（两个都是布尔才敢用）；
-    3. ``radiant_win`` + ``player_slot``（``<128`` 为天辉）。
+    .. important::
+       这里是 :func:`dota_format.match_result` 的**薄委托**，不再是独立实现。
+       历史上本函数与 ``dota_format.player_win`` 各写了一套判定，而后者
+       **不认 ``player_win`` 这个键**（STRATZ 写的恰恰是它），于是同一份数据
+       在「事实底表」与「逐场明细」里给出相反的胜负 —— 模型看到两套矛盾
+       数字，就会把用户的胜局讲成负局。判定只能有一处实现。
     """
-    for key in ("player_win", "isVictory", "is_victory", "win"):
-        flag = match.get(key)
-        if isinstance(flag, bool):
-            return flag
-
-    radiant_win = match.get("radiant_win")
-    if not isinstance(radiant_win, bool):
-        return None
-
-    is_radiant = match.get("is_radiant")
-    if isinstance(is_radiant, bool):
-        return radiant_win == is_radiant
-
-    slot = _as_int(match.get("player_slot"))
-    if slot is None:
-        return None
-    return radiant_win == (slot < 128)
+    return dota_format.match_result(match)
 
 
 def mode_label(match: dict) -> str:
@@ -1040,13 +1026,9 @@ class PlayerSnapshot:
             return []
         lines = []
         for match in rows[:DETAIL_ROWS]:
-            win = row_win(match)
-            if win is True:
-                flag = "胜"
-            elif win is False:
-                flag = "负"
-            else:
-                flag = "胜负未知"
+            # 主语写进行内（「该玩家负」而不是「负」）：模型手上同时有「天辉/夜魇
+            # 获胜」和「胜负」两套说法时，不带主语的简写最容易读反。
+            flag = f"该玩家{dota_format.result_text(match)}"
             kills = _as_int(match.get("kills"))
             deaths = _as_int(match.get("deaths"))
             assists = _as_int(match.get("assists"))
@@ -1589,6 +1571,12 @@ CHAT_TOOL_REQUIREMENTS = """=== 回答要求 ===
      不要拿别人的数据凑。
 3. **只讲工具真正返回过的数字**。工具报错、超时、说「没取到」时，就如实说
    这块没拿到；工具里没有的字段（段位高低、对手水平、真实心情）不要补。
+   · **胜负只能引用，不能反推**：工具返回的逐场战绩都自带主语（「该玩家胜 /
+     该玩家负 / 该玩家胜负未知」），直接照搬这几个字就行。**绝对不要**根据
+     KDA、补刀、经济、时长或「这数据看着该赢」去判断输赢 —— 把用户自己的
+     胜局说成负局，是这类回答里最严重、也最容易犯的错。
+   · 单场数据里的「天辉阵营获胜 / 夜魇阵营获胜」说的是**两个阵营**谁赢，
+     跟某个玩家的胜负是两件事，不要混用、更不要拿它去覆盖球员的个人胜负。
 4. 多人相关的问题（「群里谁最猛 / 谁最菜 / 谁在掉分」「昨天谁打得好」
    「我们昨晚开黑怎么样」）用 `compare_players` 一次调完，它给的分项排名与
    「同场局」就是横向比较的唯一依据。

@@ -368,19 +368,70 @@ def is_radiant(player_slot: Any) -> bool:
         return True
 
 
-def player_win(match: dict) -> bool:
-    """判断该玩家在这场比赛中是否获胜。
+def match_result(match: dict) -> bool | None:
+    """判断「**该玩家视角**的一行比赛」是胜、是负，还是**判不出来**。
 
-    优先用数据源自带的 ``isVictory`` / ``win``（最权威，不依赖 slot 编码）；
-    没有时再按 ``player_slot`` 推。这样即使某个源的 slot 归一化出了岔子，
-    胜负也不会反 —— 早期 STRATZ 侧 slot 缺失就曾导致「天辉获胜 + 焦点❌负」。
+    ``None`` = 判不出来。**绝不能把 ``None`` 当成负**：那会让胜率被系统性
+    低估，更会让模型手上同时出现「这句是胜、那处标着负」的自相矛盾数据 ——
+    它就会把胜负讲反（真实故障：用户说「他说我的敌法师输了，但实际上赢了」）。
+
+    判定顺序（**权威字段优先，绝不用 slot 去推翻数据源给的结论**）：
+
+    1. ``player_win`` / ``isVictory`` / ``is_victory`` / ``win`` —— 数据源
+       直接给的、**该玩家视角**的胜负布尔。STRATZ 写的是 ``player_win``
+       （见 :mod:`dota_stratz`），OpenDota 的行使里没有这些键，会落到第 2、3 条。
+    2. ``radiant_win`` + ``is_radiant``（两个都是布尔才敢用）。
+    3. ``radiant_win`` + ``player_slot``（``<128`` 为天辉）。
+
+    .. note::
+       这里**不用** :func:`is_radiant` 去兜底 —— 它「无法解析时默认天辉」的
+       约定在「阵营未知」时会把夜魇玩家算成胜方（历史故障：标题「天辉获胜」
+       配「焦点❌负」）。阵营取不到就老实返回 ``None``。
     """
-    for key in ("isVictory", "is_victory", "win"):
+    for key in ("player_win", "isVictory", "is_victory", "win"):
         flag = match.get(key)
         if isinstance(flag, bool):
             return flag
-    radiant_win = bool(match.get("radiant_win"))
-    return radiant_win if is_radiant(match.get("player_slot")) else not radiant_win
+
+    radiant_win = match.get("radiant_win")
+    if not isinstance(radiant_win, bool):
+        return None
+
+    is_rad = match.get("is_radiant")
+    if isinstance(is_rad, bool):
+        return radiant_win == is_rad
+
+    try:
+        slot = int(match.get("player_slot"))
+    except (TypeError, ValueError):
+        return None
+    return radiant_win == (slot < 128)
+
+
+def player_win(match: dict) -> bool | None:
+    """:func:`match_result` 的旧名（保留，调用方不必改名）。
+
+    .. warning::
+       返回值是**三态**：``True`` 胜 / ``False`` 负 / ``None`` 判不出来。
+       渲染时 ``None`` 要写成「胜负未知」而不是「负」；统计时也要把它
+       从胜率分母里剔除（见 :func:`summarize_matches`）。
+    """
+    return match_result(match)
+
+
+def result_text(match: dict) -> str:
+    """胜负的**三态文字**：``胜`` / ``负`` / ``胜负未知``。
+
+    所有面向用户与模型的逐场渲染都走这里，避免出现「胜 / 负」二选一却把
+    未知场次也说成负。**不要加 ✅❌ 之类的 emoji**：模型会把它和相邻文字
+    脱钩，从而把「胜」读成负（真实故障就是这么来的）。
+    """
+    win = match_result(match)
+    if win is True:
+        return "胜"
+    if win is False:
+        return "负"
+    return "胜负未知"
 
 
 def mode_text(match: dict) -> str:
@@ -432,15 +483,24 @@ def format_match_list(
         return f"没有查询到 {player_name} 的比赛记录。"
 
     wins = 0
+    losses = 0
+    unknown = 0
     lines: list[str] = []
     for index, match in enumerate(matches, start=1):
-        win = player_win(match)
-        wins += 1 if win else 0
+        flag = result_text(match)
+        if flag == "胜":
+            wins += 1
+        elif flag == "负":
+            losses += 1
+        else:
+            unknown += 1
+        # 每一行都自带主语（「该玩家胜」而不是「✅胜」）：模型有过把 emoji 与
+        # 相邻文字读脱钩、进而把胜负讲反的真实故障，主语写进行内最不易误读。
+        flag = f"该玩家{flag}"
         kills = match.get("kills", 0) or 0
         deaths = match.get("deaths", 0) or 0
         assists = match.get("assists", 0) or 0
         kda = (kills + assists) / max(1, deaths)
-        flag = "✅胜" if win else "❌负"
         lines.append(
             f"{index:>2}. {time.strftime('%m-%d %H:%M', time.localtime(int(match.get('start_time') or 0)))} "
             f"{flag} · {hname(heroes, match.get('hero_id'))} · KDA {kills}/{deaths}/{assists} ({kda:.2f}) "
@@ -451,10 +511,19 @@ def format_match_list(
 
     total = len(matches)
     head = title or f"{player_name} 的最近 {total} 场比赛"
-    summary = (
-        f"{wins} 胜 {total - wins} 负 · 胜率 {wins / total * 100:.1f}%"
+    decided = wins + losses
+    summary = f"{wins} 胜 {losses} 负"
+    if unknown:
+        summary += f"（另有 {unknown} 场胜负未知，不计入胜率）"
+    if decided:
+        summary += f" · 胜率 {wins / decided * 100:.1f}%（按 {decided} 场可判定场次计算）"
+    else:
+        summary += " · 胜率不可计算"
+    note = (
+        "（每行开头的「该玩家胜 / 该玩家负」是**这名玩家**这一场的胜负，"
+        "不是天辉或夜魇的胜负；请直接引用，不要根据 KDA、补刀或经济反推输赢。）"
     )
-    return f"{head}\n账号 ID {account_id} · {summary}\n\n" + "\n".join(lines)
+    return f"{head}\n账号 ID {account_id} · {summary}\n{note}\n\n" + "\n".join(lines)
 
 
 def summarize_matches(matches: list[dict], economy_samples: int | None = None) -> dict[str, Any]:
@@ -469,10 +538,23 @@ def summarize_matches(matches: list[dict], economy_samples: int | None = None) -
     if not valid:
         return result
 
-    wins = [m for m in valid if player_win(m)]
-    result["wins"] = len(wins)
-    result["losses"] = len(valid) - len(wins)
-    result["winrate"] = len(wins) / len(valid) * 100
+    # 胜负三态：胜 / 负 / 判不出来。**判不出来既不是负也不能进胜率分母** ——
+    # 把未知当败会让胜率被系统性低估，还会和「逐场明细里的胜负」对不上。
+    results = [match_result(m) for m in valid]
+    wins = sum(1 for r in results if r is True)
+    losses = sum(1 for r in results if r is False)
+    decided = wins + losses
+    result["wins"] = wins
+    result["losses"] = losses
+    result["unknown"] = len(valid) - decided
+    result["decided"] = decided
+    result["winrate"] = wins / decided * 100 if decided else 0.0
+
+    def _winrate(rows: list[dict]) -> float:
+        """一段场次的胜率（分母只用**判得出胜负**的场次）。"""
+        flags = [match_result(m) for m in rows]
+        known = [f for f in flags if f is not None]
+        return sum(1 for f in known if f) / len(known) * 100 if known else 0.0
 
     def _nums(key: str) -> list[float]:
         nums: list[float] = []
@@ -529,11 +611,13 @@ def summarize_matches(matches: list[dict], economy_samples: int | None = None) -
     )
     result["kp_samples"] = len(kp_values)
 
-    # 胜负走势：从最近一场往前看
+    # 胜负走势：从最近一场往前看（遇到判不出来的场次就停，不猜）
     streak_kind = None
     streak_len = 0
     for match in valid:
-        win = player_win(match)
+        win = match_result(match)
+        if win is None:
+            break
         if streak_kind is None:
             streak_kind, streak_len = win, 1
         elif streak_kind == win:
@@ -544,16 +628,11 @@ def summarize_matches(matches: list[dict], economy_samples: int | None = None) -
 
     # 最近 10 场胜率
     recent10 = valid[:10]
-    result["recent10_winrate"] = (
-        sum(1 for m in recent10 if player_win(m)) / len(recent10) * 100
-    )
+    result["recent10_winrate"] = _winrate(recent10)
     # 前后半段胜率对比，用于判断状态趋势
     half = max(1, len(valid) // 2)
-    result["half_winrate_newer"] = sum(1 for m in valid[:half] if player_win(m)) / half * 100
-    older = valid[half:]
-    result["half_winrate_older"] = (
-        sum(1 for m in older if player_win(m)) / len(older) * 100 if older else 0.0
-    )
+    result["half_winrate_newer"] = _winrate(valid[:half])
+    result["half_winrate_older"] = _winrate(valid[half:]) if valid[half:] else 0.0
 
     # 分路倾向
     lane_counter: Counter = Counter()
@@ -564,17 +643,25 @@ def summarize_matches(matches: list[dict], economy_samples: int | None = None) -
     result["lanes"] = lane_counter
     result["roaming_games"] = sum(1 for m in valid if m.get("is_roaming"))
 
-    # 英雄池
+    # 英雄池（每个英雄的胜率分母同样只算**判得出胜负**的场次）
     hero_counter: Counter = Counter()
     hero_wins: Counter = Counter()
+    hero_decided: Counter = Counter()
     for match in valid:
         hid = match.get("hero_id")
-        if hid:
-            hero_counter[int(hid)] += 1
-            if player_win(match):
-                hero_wins[int(hid)] += 1
+        if not hid:
+            continue
+        hid = int(hid)
+        hero_counter[hid] += 1
+        win = match_result(match)
+        if win is None:
+            continue
+        hero_decided[hid] += 1
+        if win:
+            hero_wins[hid] += 1
     result["hero_counter"] = hero_counter
     result["hero_wins"] = hero_wins
+    result["hero_decided"] = hero_decided
 
     # 组队情况（是否单排）
     party = Counter()
@@ -612,9 +699,18 @@ def format_summary_block(
 
     hero_counter: Counter = summary.get("hero_counter") or Counter()
     hero_wins: Counter = summary.get("hero_wins") or Counter()
+    hero_decided: Counter = summary.get("hero_decided") or Counter()
+
+    def _hero_rate(hid: int) -> str:
+        """该英雄的胜率；分母只用判得出胜负的场次，一场都判不出就给 "-"。"""
+        decided = hero_decided.get(hid, 0)
+        if not decided:
+            return "-"
+        return f"{hero_wins.get(hid, 0) / decided * 100:.0f}%"
+
     hero_text = (
         "、".join(
-            f"{hname(heroes, hid)} {count}场(胜率{hero_wins.get(hid, 0) / count * 100:.0f}%)"
+            f"{hname(heroes, hid)} {count}场(胜率{_hero_rate(hid)})"
             for hid, count in hero_counter.most_common(6)
         )
         or "无"
@@ -639,9 +735,13 @@ def format_summary_block(
             f"（样本 {summary.get('kp_samples', 0)} 场）\n"
         )
 
+    unknown = int(summary.get("unknown", 0) or 0)
+    unknown_note = f"，另有 {unknown} 场胜负未知（未计入胜率）" if unknown else ""
     return (
+        "说明: 本块的「胜 / 负」都是**该玩家**的胜负，直接引用即可；"
+        "不要根据 KDA、GPM、补刀或经济反推输赢。\n"
         f"样本场次: {summary['games']} 场（{summary.get('wins', 0)} 胜 "
-        f"{summary.get('losses', 0)} 负，胜率 {summary.get('winrate', 0):.1f}%）\n"
+        f"{summary.get('losses', 0)} 负{unknown_note}，胜率 {summary.get('winrate', 0):.1f}%）\n"
         f"最近 10 场胜率: {summary.get('recent10_winrate', 0):.1f}%\n"
         f"状态趋势: 后一半场次胜率 {summary.get('half_winrate_newer', 0):.1f}% "
         f"vs 前一半 {summary.get('half_winrate_older', 0):.1f}%\n"

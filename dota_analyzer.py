@@ -33,10 +33,11 @@ try:  # 插件目录被作为包加载时的相对导入
         hero_meta_label,
         hname,
         match_quality_block,
+        match_result,
         mode_text,
         normalize_focus_ids,
-        player_win,
         rank_text,
+        result_text,
         recent_hero_usage,
         summarize_hero_history,
         summarize_matches,
@@ -61,10 +62,11 @@ except ImportError:  # 兜底：以普通模块方式加载时，把插件目录
         hero_meta_label,
         hname,
         match_quality_block,
+        match_result,
         mode_text,
         normalize_focus_ids,
-        player_win,
         rank_text,
+        result_text,
         recent_hero_usage,
         summarize_hero_history,
         summarize_matches,
@@ -157,11 +159,10 @@ def _watch_focus_line(
     if player is None:
         # 玩家不在本局名单里（数据源没给全 / 焦点已过期）：如实说明，别编数据
         return f"{label}：本局数据里没有这名玩家"
-    win = player_win(player)
     return (
         f"{label}：{hname(heroes, player.get('hero_id'))} · "
         f"{player.get('kills', 0)}/{player.get('deaths', 0)}/{player.get('assists', 0)} · "
-        f"{'胜' if win else '负'}"
+        f"该玩家{result_text(player)}"
     )
 
 
@@ -314,7 +315,7 @@ def build_recent_analysis_prompt(
         lines.append(
             f"{index} | {match.get('match_id')} | {fmt_timestamp(match.get('start_time'))} | "
             f"{hname(heroes, match.get('hero_id'))} | "
-            f"{'胜' if player_win(match) else '负'} | "
+            f"该玩家{result_text(match)} | "
             f"{match.get('kills', 0)}/{match.get('deaths', 0)}/{match.get('assists', 0)} | "
             f"{match.get('gold_per_min') or '-'} | {match.get('xp_per_min') or '-'} | "
             f"{match.get('last_hits') or '-'} | {match.get('hero_damage') or '-'} | "
@@ -564,17 +565,22 @@ def build_hero_pick_prompt(
                 lane_text = "未知"
             lines.append(
                 f"{hname(heroes, match.get('hero_id'))} | "
-                f"{'胜' if player_win(match) else '负'} | "
+                f"该玩家{result_text(match)} | "
                 f"{match.get('kills', 0)}/{match.get('deaths', 0)}/"
                 f"{match.get('assists', 0)} | "
                 f"{match.get('gold_per_min') or '-'} | {lane_text} | "
                 f"{fmt_timestamp(match.get('start_time'))}"
             )
-        win_count = sum(1 for match in matches if player_win(match))
+        flags = [match_result(m) for m in matches]
+        win_count = sum(1 for f in flags if f is True)
+        loss_count = sum(1 for f in flags if f is False)
+        decided = win_count + loss_count
+        unknown = len(matches) - decided
+        rate = f"{win_count / decided * 100:.1f}%" if decided else "不可计算"
         lines.append(
-            f"近期汇总: {len(matches)} 场 · {win_count} 胜 "
-            f"{len(matches) - win_count} 负 · 胜率 "
-            f"{win_count / len(matches) * 100:.1f}%"
+            f"近期汇总: {len(matches)} 场 · {win_count} 胜 {loss_count} 负"
+            + (f" · {unknown} 场胜负未知" if unknown else "")
+            + f" · 胜率 {rate}"
         )
         gpm_values = [
             int(match.get("gold_per_min"))

@@ -1143,6 +1143,43 @@ OpenDota 作为后备。主源失效时自动切后备，无需人工干预。
 - 在配置里把 **「数据源优先级」** 改成 `opendota`，可以让两者对调
   （OpenDota 主 / STRATZ 后备）。
 
+#### 单场胜负的口径（v2.4.2）
+
+「这一场该玩家赢了没有」只有**一处判定**：`dota_format.match_result()`，
+返回 `True` / `False` / `None`（`None` = 判不出来）。`dota_chat.row_win()`
+只是它的薄委托。判定顺序：
+
+| 顺序 | 依据 | 说明 |
+|------|------|------|
+| 1 | `player_win` / `isVictory` / `is_victory` / `win` | 数据源直接给的**该玩家视角**布尔。STRATZ 归一化写的正是 `player_win` |
+| 2 | `radiant_win` + `is_radiant` | 两个都是布尔才敢用 |
+| 3 | `radiant_win` + `player_slot` | `<128` 为天辉 |
+
+**阵营取不到就返回 `None`，不用 `is_radiant()` 去兜底** —— 它「无法解析时默认
+天辉」的约定会把夜魇玩家算成胜方（历史故障：8997093262 标题「天辉获胜」配
+「焦点❌负」）。
+
+两条踩过的坑：
+
+- **判定分叉**：`dota_format.player_win` 曾经自己写了一套，键列表里**没有
+  `player_win`**，而 STRATZ 写的恰恰是它（`dota_stratz` 的注释还写着
+  「player_win 会优先用它」）。于是同一份数据在「事实底表」（走 `row_win`）
+  里是胜、在「逐场明细」（走 `player_win`）里成了负 —— 模型同时拿到两套互相
+  矛盾的数字，就会把用户的胜局讲成负局（用户报告：「他说我的虚无之灵一胜一负
+  （实际两负），说我的敌法师输了（实际赢了）」）。现在由
+  `tests/win_result_check.py` 穷举 243 种字段组合钉住「两处必须同值」。
+- **emoji 标记**：逐场明细曾写成 `✅胜` / `❌负`，模型会把 emoji 与相邻文字读
+  脱钩，同样把胜负讲反。现在统一成**带主语的纯文字**：`该玩家胜` /
+  `该玩家负` / `该玩家胜负未知`，并在 `TOOL_GUIDE` 与 `CHAT_TOOL_REQUIREMENTS`
+  里写死「**胜负只能引用、不能反推**，不要根据 KDA / 补刀 / 经济判断输赢」。
+
+单场数据里同时出现的「天辉阵营获胜」说的是**阵营**结果，与某个玩家的胜负是
+两件事，措辞上刻意分开（标题写「天辉阵营获胜」，焦点玩家行写「该玩家胜」）。
+
+**判不出来 ≠ 负**：未知场次不进胜率分母（`summarize_matches` 另给 `unknown` /
+`decided`，英雄池胜率同理），摘要里如实写「另有 N 场胜负未知」。渲染一律走
+`dota_format.result_text()`，不要在调用处现拼「胜 / 负」二选一。
+
 ### 名称中文化
 
 数据源只提供英文名：英雄是 `Juggernaut`、道具是 `Blink Dagger`、技能是
@@ -1360,7 +1397,7 @@ astrbot_plugin_dota2/
 ├── dota_schedule.py     # 定时任务的口径层：中文时间 → cron、任务动作、确认/列表文案（纯逻辑）
 ├── dota_cron.py         # AstrBot「未来任务」桥接：只建 basic 任务，启动时接管既有任务
 ├── dota_store.py        # 绑定 / 监听 / 计数型定时任务的落盘读写
-├── dota_format.py       # 原始数据 → 可读文本 / 结构化提示词素材
+├── dota_format.py       # 原始数据 → 可读文本 / 结构化提示词素材（含胜负的唯一判定 match_result）
 ├── dota_analyzer.py     # 提示词构造 + 大模型调用
 ├── _conf_schema.json    # 插件配置 Schema
 ├── metadata.yaml        # 插件元数据
@@ -1397,6 +1434,8 @@ python tests/llm_channel_check.py    # 专用模型 API Key：地址归一 / 返
 python tests/fallback_check.py       # 主/后备数据源：降级触发、不降级情形、插件组装、按 SOURCE_KIND 定位 OpenDota
 python tests/hero_meta_check.py      # 版本强势英雄（轮椅）：自适应门槛、位置互斥判定、三段榜去重、趋势留白、榜内推荐
 python tests/hero_pool_check.py      # 英雄池口径：当前版本过滤、样本不足向前并入、加速模式不被静默丢弃、无版本维度时降级标注
+python tests/win_result_check.py     # 单场胜负口径：只有一处判定（穷举 243 种字段组合两处必须同值）、逐场明细用带主语的纯文字（无 ✅❌）、判不出来不计入胜率、提示词禁止反推胜负
+python tests/stratz_identity_check.py # STRATZ 归一化的阵营 / 胜负 / 昵称与 OpenDota 口径一致
 python tests/schedule_check.py       # 定时任务：时间→cron、拒绝纯提醒、意图优先级、控制词解析（别名/编号/整批/改时间）、CronBridge 建/列/停/删/改/接管、计数窗口、到点执行、一次性自删
 python tests/stratz_client_live.py   # STRATZ 客户端真实 API 验证（需在文件内填 Key）
 python tests/od_data_probe.py        # 真实拉取指定比赛的 od_data，探查解析状态
@@ -1415,6 +1454,13 @@ python tests/od_data_probe.py        # 真实拉取指定比赛的 od_data，探
   修复落在 tag 之外，等于「checkout vX 拿不到 vX 的东西」。
 - **推送前必须先升版本号**：否则同一个版本号会对应两批内容，事后无法定位。
   这一点由下面的脚本拦截，不靠人记得。
+- **新功能 / 行为变化写进 `README.md`，`metadata.yaml` 的 `desc` 不动。**
+  AstrBot 加载插件时会把整条元数据打进日志（`star_manager.py` 的
+  `logger.info(metadata)`，而 `PluginMetadata.__str__` 直接拼 `desc`），
+  `desc` 有多长、加载日志就有多长 —— 它曾被历代更新的功能说明一层层追加到
+  **4091 字**，每次加载与热重载都刷一屏。`desc` 的口径固定为「一两句话：
+  是什么 + 能做什么 + 怎么用」（现在约 150 字）；**变更记录一律进 README**。
+  以后要发布到插件市场、需要一份详细描述时另写一份，不要就地膨胀 `desc`。
 - 历史已补全：`v1.2.0`（首个提交）到 `v2.4.0` 共 22 个 tag，覆盖全部提交里出现过的
   版本号。中间有跳号（`v1.7.1 → v1.9.1`、`v2.0.2 → v2.2.1`），那些版本号在
   仓库建立之前或没有对应提交，补不了也不该编。

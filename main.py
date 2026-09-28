@@ -65,7 +65,7 @@ try:  # 插件目录被作为包加载时的相对导入
         normalize_focus_ids,
         parsed_state,
         pick_heroes_for_player,
-        player_win,
+        result_text,
         rank_text,
         summarize_hero_history,
         summarize_matches,
@@ -123,7 +123,7 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
         normalize_focus_ids,
         parsed_state,
         pick_heroes_for_player,
-        player_win,
+        result_text,
         rank_text,
         summarize_hero_history,
         summarize_matches,
@@ -6284,8 +6284,15 @@ class Dota2Plugin(Star):
         """
         _ = parsed  # 兼容保留：判定改用 parsed_state(match)，见下
         focus_ids = normalize_focus_ids(focus_account_ids)
-        radiant_win = bool(match.get("radiant_win"))
-        winner = "天辉" if radiant_win else "夜魇"
+        radiant_win = match.get("radiant_win")
+        # 阵营胜负与「该玩家胜负」是两个东西，措辞必须分开写死：
+        # 历史上这里标题写「天辉获胜」、焦点行写「❌负」，模型把两者当成
+        # 同一件事，于是把焦点玩家的胜负讲反。
+        winner = (
+            "天辉阵营获胜"
+            if radiant_win is True
+            else ("夜魇阵营获胜" if radiant_win is False else "阵营胜负未知")
+        )
         lines = [
             f"🏁 比赛回顾 · {match.get('match_id')}",
             f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(int(match.get('start_time') or 0)))}"
@@ -6293,7 +6300,7 @@ class Dota2Plugin(Star):
             f" · 时长 {fmt_duration(match.get('duration'))}"
             f" · {mode_text(match)}",
             f"天辉 {match.get('radiant_score', 0)} : {match.get('dire_score', 0)} 夜魇"
-            f" · {winner}获胜",
+            f" · {winner}",
         ]
 
         if focus_ids:
@@ -6306,7 +6313,7 @@ class Dota2Plugin(Star):
                 player = by_account.get(int(focus_id))
                 if player is None:
                     continue
-                win = player_win(player)
+                flag = result_text(player)
                 # 只有一位焦点玩家时沿用「焦点玩家」的措辞，多位时逐行列出来
                 label = "👤 焦点玩家" if len(focus_ids) == 1 else f"👤 焦点玩家 {index + 1}"
                 display = (
@@ -6319,7 +6326,7 @@ class Dota2Plugin(Star):
                     f"{label}：{display} · "
                     f"{hname(heroes, player.get('hero_id'))} · "
                     f"{player.get('kills', 0)}/{player.get('deaths', 0)}/{player.get('assists', 0)} "
-                    f"{'✅胜' if win else '❌负'}"
+                    f"该玩家{flag}"
                 )
 
         if with_parsed_note:
