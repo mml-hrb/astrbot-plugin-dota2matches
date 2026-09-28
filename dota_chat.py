@@ -153,8 +153,49 @@ PARTY_MATCH_ROWS = 6
 #: 「1 月 2 日」的窗口，把统计悄悄改错。宁可漏识别。
 _ABS_DATE_RE = re.compile(r"(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]?")
 
-#: 「最近 N 天 / 近 N 天 / 这几天」形式的相对窗口。
-_REL_DAYS_RE = re.compile(r"(?:最近|近|前)\s*([1-9]\d?)\s*(?:天|日)")
+#: 中文数字（时间窗口里出现的量级）。
+_CN_DIGITS = {
+    "一": 1,
+    "两": 2,
+    "二": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+
+#: 天数片段：阿拉伯数字或中文数字（``3`` / ``三`` / ``十五``）。
+#:
+#: **必须支持中文数字**。原先只认 ``[1-9]\d?``，于是群里最常见的
+#: 「这三天」「最近三天」全部解析不出来（2026-09-28 实测：「给群里这三天的
+#: 战绩做个总结」返回 ``None``），统计口径静默退回「最近 N 场」——
+#: 用户说的是三天，模型拿到的是最近十场。
+_NUM_TOKEN = r"(?:\d{1,2}|[一两二三四五六七八九十]{1,3})"
+
+#: 「最近 N 天 / 近 N 天 / 前 N 天 / 这 N 天」形式的**多日**窗口。
+#:
+#: 前缀比早期多了「这」：「这三天」「这两日」是很自然的说法。
+#: 只跟「天 / 日」搭配，所以「这周」「这个月」「这两场」都不会被误伤。
+_REL_DAYS_RE = re.compile(rf"(?:最近|近|前|这)\s*({_NUM_TOKEN})\s*(?:天|日)")
+
+#: 「这几天 / 最近几天 / 近几天」这类**没给数字**的模糊说法。
+#:
+#: 按 :data:`VAGUE_DAYS` 天处理：中文里「这几天」强调「很近」，
+#: 与「这三天」同量级；算 7 天会把用户根本没想看的日子拉进来。
+_VAGUE_DAYS_RE = re.compile(r"(?:最近|近|这|前)\s*几\s*(?:天|日)")
+
+#: 「这几天」没给数字时按几天算。
+VAGUE_DAYS = 3
+
+#: 「N 天前」形式的**单日**窗口（``三天前`` = 大前天）。
+#:
+#: 与 :data:`_REL_DAYS_RE` 是**反序**的，两者必须分开判：
+#: 「前 3 天」是「3 天这么一个范围」，「3 天前」是「3 天之前那一天」。
+#: 漏掉它的后果是「三天前谁打得好」解析成 ``None``，退回最近 N 场。
+_DAYS_AGO_RE = re.compile(rf"({_NUM_TOKEN})\s*(?:天|日)\s*(?:前|以前|之前)")
 
 #: 「一天」的分界点（小时）。默认 **凌晨 4 点**，不是 0 点。
 #:
@@ -391,6 +432,54 @@ def _day_window(offset: int, label: str, now: float | None = None) -> TimeWindow
     return TimeWindow(label=label, start=start, end=start + 86400)
 
 
+def parse_day_count(token: str) -> int | None:
+    """把 ``3`` / ``三`` / ``十五`` 这类天数片段转成整数；认不出返回 ``None``。"""
+    token = (token or "").strip()
+    if not token:
+        return None
+    if token.isdigit():
+        return int(token)
+    if "十" in token:
+        left, _, right = token.partition("十")
+        # 「十五」= 15、「二十」= 20、「十」= 10：左边空着按 1 个十算
+        tens = _CN_DIGITS.get(left, 1) if left else 1
+        ones = _CN_DIGITS.get(right, 0) if right else 0
+        return tens * 10 + ones or None
+    return _CN_DIGITS.get(token)
+
+
+def recent_days_window(days: int, now: float | None = None) -> TimeWindow | None:
+    """「最近 N 天」的窗口（**含今天**），两端落在游戏日的 04:00 上。
+
+    ``days=3`` ⇒ ``[今天-2 天 04:00, 明天 04:00)``，即今天 / 昨天 / 前天。
+
+    **解析器与工具参数共用这一份**：``query_matches`` 的 ``days`` 参数也调它。
+    两边各写一套算式迟早在跨游戏日边界时对不上（一个含今天、一个不含），
+    而「工具查出来的数」与「上下文里的统计」对不上是最难查的一类问题。
+    """
+    if not isinstance(days, int) or not 1 <= days <= 30:
+        return None
+    today = local_day_start(_now_ts(now))
+    if today is None:
+        return None
+    start = today - (days - 1) * 86400
+    return TimeWindow(f"最近 {days} 天", start, today + 86400)
+
+
+def scope_matches(
+    matches: Iterable[dict], window: TimeWindow | None
+) -> list[dict]:
+    """按时间窗口筛场次；``window`` 为 ``None`` 时原样返回。
+
+    **全插件唯一一份窗口过滤实现**：上下文快照（:attr:`Snapshot.scoped`）与
+    工具层 ``query_matches`` 都走它。各写一份的话迟早出现「上下文按三天统计、
+    工具却把十场全算进去」——两条路径的数字对不上，而用户看的是同一句话。
+    """
+    if window is None:
+        return list(matches)
+    return [m for m in matches if window.contains(m.get("start_time"))]
+
+
 def detect_time_window(
     question: str, now: float | None = None
 ) -> TimeWindow | None:
@@ -403,7 +492,9 @@ def detect_time_window(
 
     * ``大前天`` / ``前天`` / ``昨天`` / ``今天``（含 昨晚 / 今早 / 刚才 这类变体）；
     * ``这周 / 本周``、``上周``（周一为一周之始，符合中文习惯）；
-    * ``最近 3 天 / 近 5 天``（含今天，即从 N-1 天前算起）；
+    * ``N 天前``（含中文数字：``三天前`` = 大前天）；
+    * ``最近 3 天 / 近 5 天 / 前 3 天 / 这三天``（含今天，即从 N-1 天前算起）；
+    * ``这几天 / 最近几天``（模糊说法，按 :data:`VAGUE_DAYS` 天算）；
     * ``9月14日``（若该**自然日**晚于今天，则当成去年的同一天）。
 
     没提时间时**必须返回 None**：此时统计口径是「最近 N 场」，
@@ -438,14 +529,26 @@ def detect_time_window(
             this_monday = today - time.localtime(today).tm_wday * 86400
             return TimeWindow("本周", this_monday, today + 86400)
 
+    match = _DAYS_AGO_RE.search(text)
+    if match:
+        days_ago = parse_day_count(match.group(1))
+        if days_ago is not None and days_ago >= 1:
+            window = _day_window(days_ago, rel_day_label_key(days_ago), current)
+            if window is not None:
+                return window
+
     match = _REL_DAYS_RE.search(text)
     if match:
-        days = int(match.group(1))
-        if 1 <= days <= 30:
-            today = local_day_start(current)
-            if today is not None:
-                start = today - (days - 1) * 86400
-                return TimeWindow(f"最近 {days} 天", start, today + 86400)
+        days = parse_day_count(match.group(1))
+        if days is not None:
+            window = recent_days_window(days, current)
+            if window is not None:
+                return window
+
+    if _VAGUE_DAYS_RE.search(text):
+        window = recent_days_window(VAGUE_DAYS, current)
+        if window is not None:
+            return window
 
     match = _ABS_DATE_RE.search(text)
     if match:
@@ -697,9 +800,7 @@ class PlayerSnapshot:
     @property
     def scoped(self) -> list[dict]:
         """参与统计的场次：有窗口就只留窗口内的，没有就是全部。"""
-        if self.window is None:
-            return self.matches
-        return [m for m in self.matches if self.window.contains(m.get("start_time"))]
+        return scope_matches(self.matches, self.window)
 
     @property
     def excluded(self) -> int:

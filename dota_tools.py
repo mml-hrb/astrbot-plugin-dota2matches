@@ -47,7 +47,7 @@ try:  # 插件目录被作为包加载时的相对导入
         pick_heroes_for_player,
         summarize_matches,
     )
-    from . import dota_pool
+    from . import dota_chat, dota_pool
 except ImportError:  # 兜底：以普通模块方式加载时，把插件目录加入 sys.path
     import os
     import sys
@@ -64,6 +64,7 @@ except ImportError:  # 兜底：以普通模块方式加载时，把插件目录
         pick_heroes_for_player,
         summarize_matches,
     )
+    import dota_chat  # type: ignore[no-redef]
     import dota_pool  # type: ignore[no-redef]
 
 #: 单个工具返回给模型的文本上限。超出的部分截掉并标注 —— 只留最前面
@@ -204,12 +205,22 @@ def build_tool_specs() -> list[dict]:
             "query_matches",
             "查询某位玩家最近的 Dota2 对局：逐场明细（时间 / 英雄 / 胜负 / KDA / "
             "位置 / 模式）加汇总统计（胜率、场均 KDA、GPM、位置分布、组队情况）。"
-            "问「他最近打得怎么样」「谁最菜」时用。只查一个人，多个人要分别调用。",
+            "问「他最近打得怎么样」「谁最菜」时用。只查一个人，多个人要分别调用。"
+            "用户**明确说了时间范围**（「这三天」「最近一周」「这两天」）时必须填 days，"
+            "否则你会把好几天前的局当成这段时间的成绩。",
             {
                 "player": _PLAYER_PROP,
                 "count": {
                     "type": "integer",
                     "description": "查最近几场，默认 10，最多 50。",
+                },
+                "days": {
+                    "type": "integer",
+                    "description": (
+                        "只看**最近几天**的对局（含今天）。用户说了时间范围才填："
+                        "「这三天 / 最近三天」填 3，「最近一周」填 7，「这两天」填 2；"
+                        "用户没提时间就别填（此时按最近 N 场统计）。"
+                    ),
                 },
             },
             [],
@@ -521,21 +532,47 @@ async def _tool_list_players(args: dict, ctx: ToolContext) -> str:
 async def _tool_query_matches(args: dict, ctx: ToolContext) -> str:
     account_id, name = await _person(args, ctx)
     count = _clamp_int(args.get("count"), default=10, low=1, high=MAX_MATCHES_PER_CALL)
+    # days 缺省 0 = 不限时间（按最近 N 场统计）。
+    days = _clamp_int(args.get("days"), default=0, low=0, high=30)
+    window = dota_chat.recent_days_window(days, ctx.now or None) if days else None
+    if window is not None:
+        # 有时间范围就放宽取数：默认 10 场常常只覆盖一两天，
+        # 说「这三天」时手上可能根本没取全，会得出「他只打了 2 场」这种假否定。
+        count = max(count, min(dota_chat.WINDOW_FETCH_LIMIT, MAX_MATCHES_PER_CALL))
     matches = await _guarded(ctx.fetch_matches(account_id, count), ctx)
     if not matches:
         return (
             f"{name} 最近没有可用的对局记录"
             "（可能未公开比赛数据，或这段时间没打）。"
         )
+    scope_note = ""
+    if window is not None:
+        scoped = dota_chat.scope_matches(matches, window)
+        if not scoped:
+            return (
+                f"{name} 在{window.describe()}内没有对局记录"
+                f"（手上另有最近 {len(matches)} 场其它时段的记录，未计入本次统计）。"
+            )
+        scope_note = (
+            f"（统计口径：{window.describe()}——手上最近 {len(matches)} 场里"
+            f"有 {len(scoped)} 场落在范围内，其余 {len(matches) - len(scoped)} 场不计）"
+        )
+        matches = scoped
     heroes = await _guarded(ctx.heroes(), ctx)
     summary = summarize_matches(matches)
+    head = (
+        f"=== {name} {window.describe()} 共 {len(matches)} 场 ==="
+        if window is not None
+        else f"=== {name} 最近 {len(matches)} 场 ==="
+    )
     blocks = [
-        f"=== {name} 最近 {len(matches)} 场 ===",
+        head,
         format_summary_block(summary, heroes),
         "",
         format_match_list(name, account_id, matches, heroes, title="逐场明细"),
     ]
-    return "\n".join(blocks)
+    text = "\n".join(blocks)
+    return f"{text}\n\n{scope_note}" if scope_note else text
 
 
 async def _tool_query_hero_pool(args: dict, ctx: ToolContext) -> str:
