@@ -2064,7 +2064,18 @@ class Dota2Plugin(Star):
             "me",
             "my",
         }:
-            binding, _note = self._effective_binding(event)
+            # 定时任务到点执行时**没有「提问者」**（event 为 None）：退而取
+            # 本会话唯一的绑定；取不到就说清「定时上下文里没法确定『我』」，
+            # 不能照搬「提问者还没绑定」——那时根本没有提问者。
+            if event is not None:
+                binding, _note = self._effective_binding(event)
+            else:
+                binding = self._binding_for_umo(umo)
+                if not binding:
+                    raise TargetNotFoundError(
+                        "这是定时任务的上下文，没有「提问者」，所以「我」指的是谁"
+                        "没法确定。请改用昵称或账号 ID 说清要查的人。"
+                    )
             if not binding:
                 raise TargetNotFoundError(
                     "提问者还没有绑定账号，不知道要查谁。"
@@ -2088,7 +2099,14 @@ class Dota2Plugin(Star):
                 "本会话里绑定或监听过的人可以直接用昵称查，其他昵称建议给账号 ID。"
             ) from e
 
-    def _nlu_chat_tool_ctx(self, event: AstrMessageEvent) -> dota_tools.ToolContext:
+    def _nlu_chat_tool_ctx(
+        self,
+        event: AstrMessageEvent | None = None,
+        *,
+        umo: str = "",
+        uid: str = "",
+        allow_write: bool = True,
+    ) -> dota_tools.ToolContext:
         """构造一次工具调用的运行环境。
 
         六个外部能力全部以闭包注入，工具层因此不需要 import 插件主体，
@@ -2096,9 +2114,18 @@ class Dota2Plugin(Star):
         ``trigger_async`` / ``schedules_text`` 三个也接上：漏掉任何一个，
         对应的那类工具就会一律回「当前环境不支持」，写操作与单场复盘
         在自然语言里直接失效（界面上表现为「说了它说用不了」）。
+
+        Args:
+            event: 普通消息路径由 event 提供会话与用户标识；
+                **定时任务到点没有 event**，改为显式传 ``umo``。
+            umo / uid: 无 event 时的会话与用户标识（有 event 时以 event 为准）。
+            allow_write: 是否接上写操作的确认闸门。定时通道传 ``False``
+                —— 那一刻没有任何人守着回「确认」，写操作只会在群里留下
+                一句「已登记待确认」的假回执。注意这只是**兜底**：定时通道
+                的工具清单里本来就不含写操作（``build_tool_specs``）。
         """
-        umo = str(event.unified_msg_origin)
-        uid = str(event.get_sender_id())
+        umo = str(umo or (event.unified_msg_origin if event is not None else ""))
+        uid = str(uid or (event.get_sender_id() if event is not None else ""))
         timeout = float(
             self.cfg("nlu_chat_tool_timeout", dota_tools.DEFAULT_TOOL_TIMEOUT)
             or dota_tools.DEFAULT_TOOL_TIMEOUT
@@ -2110,7 +2137,11 @@ class Dota2Plugin(Star):
             resolve_player=lambda raw: self._nlu_resolve_person(umo, event, raw),
             session_players=lambda: self._nlu_session_players(umo),
             fetch_matches=self._fetch_chat_matches,
-            ask_confirm=lambda action: self._nlu_ask_confirm(umo, uid, action),
+            ask_confirm=(
+                (lambda action: self._nlu_ask_confirm(umo, uid, action))
+                if allow_write
+                else None
+            ),
             trigger_async=lambda kind, params: self._nlu_trigger_async(
                 umo, uid, event, kind, params
             ),
@@ -2444,7 +2475,13 @@ class Dota2Plugin(Star):
         await self._send_to_session(umo, raw)
 
     async def _run_tool_loop(
-        self, client: Any, prompt: str, system_prompt: str, tool_ctx: Any
+        self,
+        client: Any,
+        prompt: str,
+        system_prompt: str,
+        tool_ctx: Any,
+        *,
+        include_write: bool = True,
     ) -> tuple[str, bool]:
         """在**一条**通道上跑完多轮工具循环。
 
@@ -2460,7 +2497,7 @@ class Dota2Plugin(Star):
             中途失败（之前已经拿到过工具调用）不算 —— 换条通道重跑等于把
             同一批查询再烧一遍配额，没有意义。
         """
-        tools = dota_tools.build_tool_specs()
+        tools = dota_tools.build_tool_specs(include_write=include_write)
         rounds = max(1, int(self.cfg("nlu_chat_tool_rounds", 3) or 3))
         max_calls = max(1, int(self.cfg("nlu_chat_tool_max_calls", 6) or 6))
         temperature = float(self.cfg("llm_temperature", 0.7) or 0)
@@ -2550,9 +2587,13 @@ class Dota2Plugin(Star):
 
     async def _nlu_chat_agent(
         self,
-        event: AstrMessageEvent,
-        prompt: str,
-        system_prompt: str,
+        event: AstrMessageEvent | None = None,
+        prompt: str = "",
+        system_prompt: str = "",
+        *,
+        umo: str = "",
+        uid: str = "",
+        allow_write: bool = True,
     ) -> tuple[str | None, str, list[str]]:
         """带工具的多轮问答（闲聊主路径，走**默认模型**）。
 
@@ -2567,18 +2608,21 @@ class Dota2Plugin(Star):
             回落单轮带数据的回答。第三项来自写操作工具：**必须由插件原样
             发出**，不能让模型转述（确认文案要和用户逐字对齐）。
         """
-        clients = await self._chat_tool_clients(event.unified_msg_origin)
+        umo = str(umo or (event.unified_msg_origin if event is not None else ""))
+        clients = await self._chat_tool_clients(umo)
         if not clients:
             logger.info(
                 "[dota2] 闲聊工具通道不可用：既没有 AstrBot 模型提供商，也没配专用 API Key"
             )
             return None, "", []
 
-        tool_ctx = self._nlu_chat_tool_ctx(event)
+        tool_ctx = self._nlu_chat_tool_ctx(
+            event, umo=umo, uid=uid, allow_write=allow_write
+        )
         answer = ""
         for index, client in enumerate(clients):
             answer, channel_dead = await self._run_tool_loop(
-                client, prompt, system_prompt, tool_ctx
+                client, prompt, system_prompt, tool_ctx, include_write=allow_write
             )
             if answer:
                 if index:
@@ -4686,6 +4730,10 @@ class Dota2Plugin(Star):
             "session": str(umo),
             "action": str(request.action),
             "args": str(request.args or ""),
+            # 到点要**回放的原话**（v2.5.0 起）：定时任务真正执行的是这句话
+            # —— 到点交给带工具的模型按当时的数据办。`action` / `args` 留着
+            # 是给「升级前建好的老任务」兜底（它们没有这个键，走固定动作分支）。
+            "question": request.replay_text,
             "schedule_id": schedule_id,
             "once": bool(spec.once),
             "note": dota_schedule.task_note(request, session_label=session_text),
@@ -4715,12 +4763,10 @@ class Dota2Plugin(Star):
             yield event.plain_result(f"⚠️ 创建定时任务失败：{e}")
             return
 
-        label = dota_schedule.ACTION_LABELS.get(request.action, request.action)
-        if request.args and request.action in (
-            dota_schedule.ACTION_PLAYER,
-            dota_schedule.ACTION_MATCH,
-        ):
-            label = f"{label}（{request.args}）"
+        # 到点执行的**就是这句话本身** —— 回执里把它摆出来，比归纳成
+        # 「通报群里战绩情况」更不容易让人误解（也才说明得了「随便说一句
+        # 都能定时」这件事）。没原话时（理论上不会有）退回动作名。
+        label = request.describe()
         # 一次性任务的 cron 有两种绕法（见 dota_schedule._build_delta_once）：
         # 相对时间不到一天时写成「每天 H:M」、跨年时只钉「几号」。这两者用
         # cron_label 反渲染会读成「每天」/「每月」，**跟用户说的「两小时后」
@@ -4742,6 +4788,7 @@ class Dota2Plugin(Star):
         ]
         if spec is not None and spec.once:
             lines.append("这是一次性任务，执行完就自动结束。")
+        lines.append("到点我会把上面这句话交给模型，按**那一刻**的真实数据执行。")
         lines.append(
             "它也会出现在 AstrBot 的「未来任务」页面里（可以在那边改时间或停用）。"
         )
@@ -4761,6 +4808,7 @@ class Dota2Plugin(Star):
         schedule_id: str = "",
         once: bool = False,
         note: str = "",
+        question: str = "",
         **_extra: Any,
     ) -> None:
         """定时任务到点执行（AstrBot ``basic`` 任务的回调）。
@@ -4780,10 +4828,12 @@ class Dota2Plugin(Star):
             logger.warning(f"[dota2] 定时任务 {schedule_id} 没有目标会话，跳过")
             return
         logger.info(
-            f"[dota2] 定时任务 {schedule_id} 到点执行：{action} {args!r} -> {umo}"
+            f"[dota2] 定时任务 {schedule_id} 到点执行："
+            f"{action} {args!r}"
+            f"{' 原句=' + repr(str(question)[:32]) if question else ''} -> {umo}"
         )
         try:
-            await self._dispatch_scheduled(action, args, umo)
+            await self._dispatch_scheduled(action, args, umo, question)
         except Exception as e:  # noqa: BLE001
             logger.error(f"[dota2] 定时任务 {schedule_id} 执行失败：{e}", exc_info=True)
         finally:
@@ -4792,11 +4842,121 @@ class Dota2Plugin(Star):
                 # 不删掉的话明年同一天还会响一次。执行完自己收尾。
                 await self._delete_schedule(schedule_id)
 
-    async def _dispatch_scheduled(self, action: str, args: str, umo: str) -> None:
-        """按动作分派：三种动作各有各的取数与渲染链路。"""
+    async def _scheduled_replay(
+        self, question: str, umo: str, frozen: str = ""
+    ) -> None:
+        """定时任务到点执行：把用户当初那句话**重新交给模型**办。
+
+        这是「定时 = 到点把原话再发一次」的落地。与手动提问的三点不同：
+
+        1. **没有 event**（到点是平台调度器叫醒的），所以会话与用户标识要
+           显式传进去（见 :meth:`_nlu_chat_tool_ctx` 的 ``umo`` 参数）；
+        2. **写操作被摘掉**（``allow_write=False``）：那一刻没有任何人守着
+           回「确认」，留着写操作只会让模型在群里报一句「已登记待确认」的
+           假回执；
+        3. **原话里的时间词已经过期**：「两小时后重新查看一下这场」到点时
+           「两小时后」已经过去了。必须把这一点说清楚，否则模型会理解成
+           「从现在起再过两小时」。
+
+        Args:
+            question: 用户当初的原话（建任务时随负载存下来的）。
+            umo: 目标会话。
+            frozen: 建任务时解析出的对象（比赛 ID / 玩家名），用来兜住
+                「这场」这类**指代**——到点时本会话最近的比赛可能已经换了
+                一批，靠上下文重新猜会指错。
+        """
+        text = str(question or "").strip()
+        if not text:
+            return
+        if not self.cfg("enable_llm_analysis", True):
+            await self._send_quiet(
+                umo,
+                "⚠️ 定时任务没能执行：插件配置里关掉了 LLM 分析"
+                "（`enable_llm_analysis`），到点没有可用的模型通道。",
+            )
+            return
+        try:
+            context = await self._collect_chat_context(
+                text, umo, "", self._binding_for_umo(umo), local_only=True
+            )
+        except Exception as e:  # noqa: BLE001 - 收集失败也要出声，不能静默
+            logger.error(f"[dota2] 定时任务收集上下文失败：{e}", exc_info=True)
+            context = None
+        if context is None:
+            await self._send_quiet(
+                umo, "⚠️ 定时任务没能执行（收集会话上下文失败），本次跳过。"
+            )
+            return
+
+        hint = ""
+        frozen = str(frozen or "").strip()
+        if frozen:
+            if frozen.isdigit() and 6 <= len(frozen) <= 20:
+                hint = f"\n（原话里「这场」这类指代，指的就是比赛 {frozen}。）"
+            else:
+                hint = f"\n（这句话针对的对象是「{frozen}」。）"
+        ask = (
+            "【这是定时任务到点执行的正文】\n"
+            f"用户当初说的原话是：「{text}」{hint}\n"
+            "原话里的时间（例如「两小时后」）**指的就是现在**，那已经是过去时了 "
+            "—— 不要理解成「从现在起再过那么久」。\n"
+            "请按**现在**的真实数据把这件事办完，直接把结论发到群里；"
+            "不要复述这句话本身，也不要说「我这就去」这类空话。"
+        )
+        prompt = dota_chat.build_chat_prompt(ask, context, tooled=True)
+        system_prompt = dota_chat.build_chat_system_prompt(
+            str(self.cfg("nlu_chat_system_prompt", "") or "")
+        )
+        reply, trace, pending = await self._nlu_chat_agent(
+            None, prompt, system_prompt, umo=umo, allow_write=False
+        )
+        if pending:
+            # 定时通道的工具清单里没有写操作，正常不会产生待确认项。
+            # 真出现了说明契约被破坏（有人把写操作放回了定时清单），
+            # 记一笔便于发现；**不往群里发**——那一刻没人会回「确认」。
+            logger.warning(
+                f"[dota2] 定时任务意外产生 {len(pending)} 项待确认，已忽略"
+            )
+        if not reply:
+            # 工具通道没产出 → **回落单轮播报**（预取数据后直接问一次模型）。
+            # 这是定时任务最早、最朴素的形态，也是「默认模型不支持 function
+            # calling 且没配专用 Key」时**唯一**能走通的路。定时任务不能因为
+            # 工具用不了就整条失效 —— 那是纯粹的倒退，用户到点什么都收不到。
+            logger.info("[dota2] 定时任务：工具通道没产出，回落单轮播报")
+            reply = await self._scheduled_report(umo, text)
+        if not reply:
+            # 静默失败是最糟的：用户以为任务建好了，到点却什么都没发。
+            logger.warning(f"[dota2] 定时任务没拿到内容，跳过本次（{umo}）")
+            await self._send_quiet(
+                umo,
+                "⚠️ 定时任务没能生成内容（大模型不可用或数据源异常），本次跳过。\n"
+                "可以先用 `/d2 模型测试` 与 `/d2 数据源` 自检一下。",
+            )
+            return
+        calls = len([x for x in trace.split("; ") if x]) if trace else 0
+        logger.info(
+            f"[dota2] 定时任务到点执行（原句回放）：{text[:32]!r} 工具调用={calls}"
+        )
+        await self._send_to_session(umo, reply)
+
+    async def _dispatch_scheduled(
+        self, action: str, args: str, umo: str, question: str = ""
+    ) -> None:
+        """按动作分派。
+
+        **有 ``question`` 就走原句回放**（v2.5.0 起的新口径）：到点把用户
+        原话重新交给带工具的模型，按那一刻的真实数据执行 —— 于是用户的
+        **任何一句话**都能定时，不必事先归入某个固定动作。
+
+        ``question`` 为空的是**老任务**（建在 v2.5.0 之前，负载里没有这一
+        项），继续走下面那套固定动作分支 —— 升级不该让已建好的任务变哑。
+        """
+        # ① **有专用渲染链路**的动作优先，与有没有原话无关：
+        #    · 复查单场要「没解析好也出声」（下面那条播报通道遇到空内容会
+        #      静默跳过，而用户建它时说的正是「没解析就告诉我」）；
+        #    · 版本榜是**算出来的表格** —— 结构化、稳定、零模型调用，
+        #      丢给模型重新生成只会更差，还白烧一次调用。
         if action == dota_schedule.ACTION_MATCH:
-            # 复查单场**没解析好也要说话**，而下面那条播报通道遇到空内容
-            # 只会静默跳过 —— 所以它走自己的路。
             await self._match_recheck(args, umo)
             return
         if action == dota_schedule.ACTION_META:
@@ -4815,8 +4975,17 @@ class Dota2Plugin(Star):
             )
             return
 
-        question = dota_schedule.build_report_question(action, args)
-        reply = await self._scheduled_report(umo, question)
+        # ② 其余一律走**原句回放**（v2.5.0 起）：到点把用户原话交给带工具的
+        #    模型，按那一刻的真实数据执行 —— 于是**任何一句话**都能定时，
+        #    不必事先归入某个固定动作。
+        if question:
+            await self._scheduled_replay(question, umo, frozen=args)
+            return
+
+        # ③ 老任务（v2.5.0 之前建的，负载里没有 question）退回预设问题，
+        #    免得这次升级把已建好的任务变成哑的。
+        built = dota_schedule.build_report_question(action, args)
+        reply = await self._scheduled_report(umo, built)
         if not reply:
             # 静默失败是最糟的：用户以为任务建好了，其实每天早上什么都没发。
             # 一条短提示，让他知道该去看模型 / 数据源，而不是去查任务配置。

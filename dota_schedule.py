@@ -630,19 +630,36 @@ class TaskRequest:
     label: str = ""
     raw: str = ""
 
+    @property
+    def replay_text(self) -> str:
+        """到点**回放给模型**的正文 = 用户原话。
+
+        时间词一并留着不剥：到点那一刻插件会包一句「这是定时任务的正文，
+        原话里的时间词指的就是现在」再交给模型（见
+        ``main._scheduled_replay``）。在这里剥时间词反而会丢信息
+        （「两小时后**重新查看一下**这场」剥掉「两小时后」是干净的，
+          但「每天七点**通报**战绩」剥掉「每天七点」就得改动词）。
+        """
+        return str(self.raw or "").strip()
+
     def describe(self) -> str:
-        """给用户看的确认文案。"""
-        what = ACTION_LABELS.get(self.action, self.action)
-        if self.args:
-            what = f"{what}（{self.args}）"
+        """给用户看的说明（任务页面与确认文案共用）。
+
+        到点执行的就是用户那句话本身，所以**把它原样摆出来**最不容易
+        让人误解 —— 「通报群里战绩情况」这种归纳会让人以为插件只会做
+        清单里那几件事（而用户明明可以说任何一句）。
+        """
         if self.kind == "watch_count":
             return (
                 f"每监听到 {self.every} 场比赛，就为这个群生成一份这 "
                 f"{self.every} 场的总结"
             )
-        if self.time is None:  # pragma: no cover - cron 型必然有时间
-            return what
-        return f"{self.time.label} —— {what}"
+        text = self.replay_text
+        if text:
+            if len(text) > 40:
+                text = text[:40].rstrip() + "…"
+            return f"「{text}」"
+        return ACTION_LABELS.get(self.action, self.action)
 
 
 def parse_request(
@@ -1399,11 +1416,18 @@ def format_plan(
             lines.append("　　　　（你没说具体几点，用的是默认时刻）")
         if spec is not None and spec.once:
             lines.append("　　　　（一次性任务，执行完就自动结束）")
-        what = ACTION_LABELS.get(request.action, request.action)
-        if request.args:
-            slot = "比赛" if request.action == ACTION_MATCH else "对象"
-            what = f"{what}（{slot}：{request.args}）"
-        lines.append(f"　内容：{what}")
+        text = request.replay_text
+        if text:
+            # 到点执行的就是**这句话本身** —— 直接摆出来，并说明它会怎么被用。
+            # 归纳成「通报群里战绩情况」会让用户以为定时只能做清单里那几件事。
+            lines.append(f"　内容：{text}")
+            lines.append("　　　　（到点把这句话交给模型，按那一刻的真实数据执行）")
+        else:
+            what = ACTION_LABELS.get(request.action, request.action)
+            if request.args:
+                slot = "比赛" if request.action == ACTION_MATCH else "对象"
+                what = f"{what}（{slot}：{request.args}）"
+            lines.append(f"　内容：{what}")
         lines.append(f"　发到：{where}")
     lines.append("")
     lines.append("回复「确认」我就建好；回复「取消」就当我没说。")
