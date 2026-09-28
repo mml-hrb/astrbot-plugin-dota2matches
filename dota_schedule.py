@@ -23,6 +23,21 @@ AstrBot 的「未来任务」。两种任务在 ``/d2 定时`` 里是同一个�
 * 12 小时制靠前缀消歧：``早上/上午/凌晨`` 原样，``中午`` 归 12，
   ``下午/傍晚/晚上/夜里`` 小于 12 的加 12。**没有前缀就原样**（「7点」= 07:00，
   「20点」= 20:00）—— 宁可按字面来，也不要自作聪明把「7点」当成 19:00。
+
+### 相对时间（「两小时后」）与它的 cron 绕法
+
+「两小时后重新看一下这场」是**相对偏移**，解析成一次性任务（见
+:func:`parse_delta` / :func:`_build_delta_once`）。它和「明天早上八点」的区别
+只在「目标时刻怎么算」，落成 cron 时却要分三种情况 —— 原因是 **cron 表达不了
+年份**，而一次性任务是靠「月 日」钉出来的（见 :func:`once_cron`）：
+
+| 偏移 | cron 写法 | 为什么 |
+|---|---|---|
+| < 1 天 | ``M H * * *``（每天该时刻） | 目标落在未来 24 小时内 ⇒ 上一个同刻已过去 ⇒ **下一次触发必然就是它**，跨月跨年都对 |
+| ≥ 1 天且不跨年 | ``M H D M *``（钉月日） | 最直观，页面上直接显示那一天 |
+| ≥ 1 天且跨年 | ``M H D * *``（只钉几号） | 钉「月 日」会落到**今年**那个已过去的月份 ⇒ 要等到明年 |
+
+上限 :data:`MAX_DELTA_MINUTES`（30 天）：再远就别用相对说法了，让用户直接说日期。
 """
 
 from __future__ import annotations
@@ -38,6 +53,13 @@ from typing import Any, Iterable
 ACTION_GROUP = "group"
 ACTION_PLAYER = "player"
 ACTION_META = "meta"
+#: 「过一会儿再去看一眼这一场」。``args`` 是比赛 ID。
+#:
+#: 这是唯一一种**结果取决于执行时数据状态**的定时任务：到点时录像可能还没
+#: 解析好，于是没得可复盘。用户要的恰恰是「解析好了就出分析、没好就告诉我
+#: 还没好」——两条路都算正常结果，handler 里都必须**主动发消息**（见
+#: ``main._match_recheck``），不能像其它播报那样静默跳过。
+ACTION_MATCH = "match"
 #: 计数型任务的专用动作名（由 :data:`ACTION_GROUP` 转换而来）。
 ACTION_WATCH_SUMMARY = "watch_summary"
 
@@ -45,6 +67,7 @@ ACTION_LABELS = {
     ACTION_GROUP: "通报群里战绩情况",
     ACTION_PLAYER: "通报指定玩家的近期表现",
     ACTION_META: "推送当前版本强势英雄榜",
+    ACTION_MATCH: "复查指定比赛并出分析",
     ACTION_WATCH_SUMMARY: "生成这 N 场的战绩总结",
 }
 
@@ -66,6 +89,15 @@ _CN_DIGITS = {
     "三": 3, "叁": 3, "四": 4, "肆": 4, "五": 5, "伍": 5,
     "六": 6, "陆": 6, "七": 7, "柒": 7, "八": 8, "捌": 8, "九": 9, "玖": 9,
 }
+
+#: 中文数字的**正则片段**（含「两」）。各条正则统一用它，别再各写一份。
+#:
+#: 抽出来是因为踩过一次：``cn_to_int`` 明明认得「两」（:data:`_CN_DIGITS`
+#: 里有），但各条正则的字符集写的是 ``[一二三四五六七八九十]`` —— 少一个
+#: 「两」，「每隔两小时」「两小时后」「两天后」「打两盘」这一整类说法在
+#: **正则那一层就断了**，根本轮不到转换函数。线上症状是：用户说
+#: 「两小时后重新查看一下 9017256966 这场」，定时任务**静默建不上**。
+_CN_NUM = r"[一二两三四五六七八九十]{1,3}"
 
 
 def cn_to_int(token: str) -> int | None:
@@ -126,9 +158,12 @@ _WEEKLY_DAY_RE = re.compile(
 #: 每天/每周，就会被这条抢先生效，生成一个用户根本没要的月度任务。
 #: 现在要求必须先出现「每月 / 每个月」，再在同一句里找「几号」。
 _MONTHLY_RE = re.compile(r"每\s*个?\s*月")
-_MONTH_DAY_RE = re.compile(r"(\d{1,2}|[一二三四五六七八九十]{1,3})\s*[号日]")
+_MONTH_DAY_RE = re.compile(r"(\d{1,2}|" + _CN_NUM + r")\s*[号日]")
+#: 「每隔 N 小时」。
+#:
+#: 「两小时后」**不会**被它抢走（少了「每」），两者互不干扰。
 _INTERVAL_RE = re.compile(
-    r"每\s*(?:隔)?\s*(\d{1,3}|[一二三四五六七八九十]{1,3})\s*个?\s*小时"
+    r"每\s*(?:隔)?\s*(\d{1,3}|" + _CN_NUM + r")\s*个?\s*小时"
 )
 _HOURLY_RE = re.compile(r"每小时|每个小时")
 _ONCE_RE = re.compile(r"今天|明天|后天|今晚|明晚|明早|今早|今天早上|明天早上")
@@ -139,15 +174,58 @@ _PM_PREFIX_RE = re.compile(r"下午|傍晚|晚上|夜里|夜间|晚")
 _NOON_RE = re.compile(r"中午|正午")
 
 #: 钟点：``7点`` / ``7点半`` / ``7点30`` / ``7:30`` / ``7点30分``
+#:
+#: 两处细节都是踩出来的：
+#:
+#: * 数字集含「两」（「两点」是口语里最常见的说法之一）；
+#: * 「时」前面必须**不是「小」**（``(?<!小)``）—— 否则「两小时候/两小时后」
+#:   里的「两时」会被读成「02:00」，一个相对偏移就变成了一个绝对钟点。
+#:   中文里说「两点」不说「两时」，所以这道断言不会误伤正常写法。
 _CLOCK_RE = re.compile(
-    r"(?P<h>\d{1,2}|[一二三四五六七八九十]{1,3})"
-    r"\s*(?:[点时]|[:：])"
-    r"\s*(?:(?P<m>\d{1,2}|[一二三四五六七八九十]{1,3}|半)\s*分?)?"
+    r"(?P<h>\d{1,2}|" + _CN_NUM + r")"
+    r"\s*(?:点|(?<!小)时|[:：])"
+    r"\s*(?:(?P<m>\d{1,2}|" + _CN_NUM + r"|半)\s*分?)?"
 )
 
 #: 周末 / 工作日
 _WEEKEND_RE = re.compile(r"周末|星期六日|周六周日")
 _WEEKDAY_RANGE_RE = re.compile(r"工作日|周一至周五|星期一到星期五")
+
+#: **相对时间偏移**：``两小时后`` / ``30 分钟后`` / ``三天后`` / ``半小时后``。
+#:
+#: 这类说法没有绝对钟点，但用户很爱用（「两小时后帮我复查一下这场」）。
+#: 早先解析层只认「钟点」「周期」和「今天/明天 + 钟点」，于是这一类请求
+#: 被整批判成「没解析出时间」——**定时任务静默建不上**，用户只看到一句
+#: 含糊的失败提示，连模型都不知道该建议他换什么说法。
+#:
+#: 单位必须紧跟数字、且整段必须以「后」结尾：这样「每隔两小时」不会被
+#: 抢走（那是周期型，走 :data:`_INTERVAL_RE`），「下午三点」也不会。
+_DELTA_RE = re.compile(
+    r"(?P<n>\d{1,3}|" + _CN_NUM + r"|半)"
+    r"\s*(?P<unit>个?\s*(?:小时|钟头)|个?\s*分钟|天|日)"
+    r"\s*(?:之后|以后|后)"
+)
+
+#: 「过一会儿 / 待会儿 / 等会儿」—— 没给数字的模糊说法。按常量换算成
+#: 具体时刻，并在确认文案里**写明几点**，用户一眼能看出对不对。
+#:
+#: 「一会」和「一会儿」都要认：写成 ``一会儿|过会儿|…`` 时漏了不带「儿」的
+#: 那种，而口语里「一会后看看战绩」反而更常见。
+_SOON_RE = re.compile(r"(?:过|待|等)?\s*一会(?:儿)?|过会儿|待会儿|等会儿")
+
+#: 「这场 / 这一局」这类**指代**。句子本身没有 ID，得靠本会话最近提到的
+#: 比赛来补 —— 见 :func:`parse_request` 的 ``recent_matches``。
+_THIS_MATCH_RE = re.compile(r"这\s*(?:一)?\s*[场局把盘]|该\s*[场局]|那把|刚才那[场局把]")
+
+#: 「一会儿」按多少分钟算。取 30：比它小的说法用户会直接说「十分钟后」，
+#: 比它大的会说「一小时/两小时后」，30 分钟是这句模糊话的中间值。
+SOON_MINUTES = 30
+
+#: 相对偏移的上限（分钟）。超过就不接 —— 一次性任务最后要落成 cron，
+#: 而 cron 表达不了年份，偏得太远会撞上跨年那套绕法（见
+#: :func:`_build_delta_once`），不如让用户直接说日期。30 天够覆盖
+#: 「过几天再说」这类真实用法。
+MAX_DELTA_MINUTES = 30 * 24 * 60
 
 
 @dataclass
@@ -210,6 +288,92 @@ def parse_clock(text: str) -> Clock | None:
     return None
 
 
+def parse_delta(text: str) -> tuple[int, str] | None:
+    """解析「N 小时后 / 半小时后 / 三天后」这类**相对偏移**。
+
+    Returns:
+        ``(分钟数, 命中的原文)``；没有相对偏移表达返回 ``None``。
+
+    「一会儿」这类没数字的按 :data:`SOON_MINUTES` 算 —— 它是「相对」里
+    唯一没有数量的一种，用户说它时的意思是「别太久，但也别现在」。
+    """
+    raw = str(text or "")
+    if not raw:
+        return None
+    match = _DELTA_RE.search(raw)
+    if match:
+        minutes = _delta_minutes(match.group("n"), match.group("unit"))
+        if minutes:
+            return minutes, match.group(0).strip()
+    soon = _SOON_RE.search(raw)
+    if soon:
+        return SOON_MINUTES, soon.group(0).strip()
+    return None
+
+
+def _delta_minutes(token: str, unit: str) -> int | None:
+    """把「数量 + 单位」换算成分钟；不认识的组合返回 ``None``。"""
+    unit = re.sub(r"\s+", "", str(unit or ""))
+    if "小时" in unit or "钟头" in unit:
+        per = 60
+    elif "分钟" in unit:
+        per = 1
+    elif "天" in unit or "日" in unit:
+        per = 1440
+    else:  # pragma: no cover - 正则已经限定了单位
+        return None
+    if token == "半":
+        # 「半小时」= 30 分钟、「半天」= 12 小时。「半分钟」不成话，不认。
+        return None if per == 1 else per // 2
+    value = cn_to_int(token)
+    if not value:
+        return None
+    minutes = value * per
+    if not 1 <= minutes <= MAX_DELTA_MINUTES:
+        return None
+    return minutes
+
+
+def _human_delta(minutes: int) -> str:
+    """分钟数 → 「2 小时 / 30 分钟 / 3 天」（确认文案里复述用户的意图）。"""
+    if minutes % 1440 == 0:
+        return f"{minutes // 1440} 天"
+    if minutes >= 60 and minutes % 60 == 0:
+        return f"{minutes // 60} 小时"
+    return f"{minutes} 分钟"
+
+
+def _build_delta_once(minutes: int, detail: str = "") -> TimeSpec:
+    """相对偏移 → 一次性任务（cron 的选法见下，三种情况各有理由）。"""
+    now = _dt.datetime.now()
+    run_at = (now + _dt.timedelta(minutes=minutes)).replace(second=0, microsecond=0)
+    if minutes < 24 * 60:
+        # 一天以内：用「每天 H:M」表达。
+        #
+        # 看着绕（明明说的是「两小时后」，cron 里却写着「每天」），但这是
+        # **唯一**能同时躲开跨月与跨年两个坑的写法。cron 匹配不到年份，
+        # 钉死「月 日」在 12 月底会落到**今年**那个已经过去的月份上，任务
+        # 要等到明年才响；而「每天 H:M」的下一次触发**必然**就是这个目标
+        # 时刻 —— 因为目标落在未来 24 小时内，上一个同刻早已过去。
+        # 任务带 ``once``，响一次就自删，不会变成每天发。
+        cron = f"{run_at.minute} {run_at.hour} * * *"
+    elif run_at.month >= now.month:
+        # 一天以上、且不跨年：钉死日期最直观（页面上直接显示那一天）
+        cron = once_cron(run_at)
+    else:
+        # 一天以上、且跨年（12 月里说「N 天后」）：钉「月 日」会落到今年那个
+        # 已过去的月份，于是要等到明年。改成只钉「几号」——跨年时距月底很近，
+        # 本月那个日子已经过去，下一次「那一天」恰好就是目标。
+        cron = f"{run_at.minute} {run_at.hour} {run_at.day} * *"
+    return TimeSpec(
+        "once",
+        cron=cron,
+        run_at=run_at,
+        label=f"{run_at.strftime('%Y-%m-%d %H:%M')}（{_human_delta(minutes)}后）",
+        detail=detail,
+    )
+
+
 def parse_time_spec(text: str, *, default_time: str = DEFAULT_TIME) -> TimeSpec | None:
     """把一句话解析成 :class:`TimeSpec`；没有时间表达返回 ``None``。
 
@@ -254,7 +418,17 @@ def parse_time_spec(text: str, *, default_time: str = DEFAULT_TIME) -> TimeSpec 
         _DAILY_RE.search(raw) or _WEEKLY_ANY_RE.search(raw) or _MONTHLY_RE.search(raw)
     )
 
-    # ---- 2. 一次性：今天/明天/后天 + 钟点（有周期词就不算一次性）----
+    # ---- 2. 相对偏移：N 小时后 / 半小时后 / 三天后 ----
+    #
+    # 和「今天/明天」一样属于**一次性**，所以判据也一样：句子里只要出现
+    # 周期词（每天/每周/每月），相对偏移就不算数 —— 「每天晚上八点…」这种
+    # 句子的主体是那个每天的任务。
+    if not recurring:
+        delta = parse_delta(raw)
+        if delta is not None:
+            return _build_delta_once(delta[0], delta[1])
+
+    # ---- 3. 一次性：今天/明天/后天 + 钟点（有周期词就不算一次性）----
     once_word = _ONCE_RE.search(raw) if not recurring else None
     if once_word and clock is not None:
         return _build_once(raw, once_word.group(0), clock)
@@ -418,7 +592,7 @@ _SUMMARY_WORD_RE = re.compile(r"总结|汇总|小结|报告|回顾|复盘|统计
 #: 正则走不下去，于是不会被误判成计数型任务。
 _EVERY_COUNT_RE = re.compile(
     r"每\s*(?:隔)?\s*(?:(?:监听到|监听|收到|攒够|满|有|打了|打完)\s*)?"
-    r"(\d{1,3}|[一二三四五六七八九十]{1,3})\s*(?:盘|场|把|局|条)"
+    r"(\d{1,3}|" + _CN_NUM + r")\s*(?:盘|场|把|局|条)"
 )
 
 #: 动作特征词。顺序敏感：先判版本榜，再判个人，最后兜底群通报。
@@ -476,6 +650,7 @@ def parse_request(
     *,
     known_names: Iterable[str] = (),
     default_time: str = DEFAULT_TIME,
+    recent_matches: Iterable[Any] = (),
 ) -> TaskRequest | None:
     """把一句话解析成任务请求；认不出来返回 ``None``。
 
@@ -484,6 +659,8 @@ def parse_request(
         known_names: 本会话已知的人名（绑定 / 监听名单），用于判断
             「分析一下钢板最近的表现」里的目标是钢板。
         default_time: 只说频率没给钟点时的默认时刻。
+        recent_matches: 本会话最近提到过的比赛（新的在前），用于化解
+            「两小时后重新看一下**这场**」里的指代。
     """
     raw = str(text or "").strip()
     if not raw:
@@ -509,7 +686,7 @@ def parse_request(
         every = min(MAX_EVERY, every)
         # 「每盘点一下」这种没数字、又没监听词的，更像闲聊，不认
         if _WATCH_WORD_RE.search(raw) or _SUMMARY_WORD_RE.search(raw) or every > 1:
-            action, args = _detect_action(raw, known_names)
+            action, args = _detect_action(raw, known_names, recent_matches)
             if action == ACTION_META:
                 # 版本榜是「当下时点」的数据，按场次触发没有意义
                 action, args = ACTION_GROUP, ""
@@ -527,7 +704,21 @@ def parse_request(
     # ---- 2. 时间型 ----
     if time_spec is None:
         return None
-    has_hint = any(word in raw for word in _DOTA_HINT_WORDS)
+    # 句子里有一个像比赛编号的长数字，就说明这句话是冲着本插件的数据来的
+    # —— 「两小时后重新查看一下 9017256966 这场」里一个功能词都没有，
+    # 只看词表会把它当成「纯提醒」拒掉。
+    #
+    # 「这场」同理，但**只有在真的能补出 ID 时**才算数：补不出来说明用户
+    # 指的是一场我们不知道的比赛，这时候返回 ``None`` 让他补 ID，好过猜
+    # 一场或者建一个「通报群里战绩」的任务。
+    this_match = bool(_latest_match_id(recent_matches)) and bool(
+        _THIS_MATCH_RE.search(raw)
+    )
+    has_hint = (
+        any(word in raw for word in _DOTA_HINT_WORDS)
+        or bool(extract_match_id(raw))
+        or this_match
+    )
     if any(word in raw for word in _REMIND_ONLY_WORDS) and not has_hint:
         # 「每天七点提醒我喝水」：插件只认 Dota2 数据类任务，别硬接
         return None
@@ -535,7 +726,7 @@ def parse_request(
         # 一点 Dota2 的影子都没有（「每周一早上九点开会」）：宁可说不会，
         # 也不要给群里建一个每天发战绩的任务。
         return None
-    action, args = _detect_action(raw, known_names)
+    action, args = _detect_action(raw, known_names, recent_matches)
     return TaskRequest(
         kind="cron",
         action=action,
@@ -546,13 +737,64 @@ def parse_request(
     )
 
 
+#: 比赛 ID 的形状：Dota2 的比赛编号是 10 位左右的纯数字。取 6~20 位，
+#: 与 ``/d2 单场`` 指令的校验保持一致（``\d{6,20}``）。
+#:
+#: 两边用 ``(?<!\d)`` / ``(?!\d)`` 卡住边界：不这么写的话，一句里出现
+#: 更长的数字串时会把中间一段当成 ID。
+_MATCH_ID_RE = re.compile(r"(?<!\d)\d{6,20}(?!\d)")
+
+
+def extract_match_id(text: str) -> str:
+    """从句子里取比赛 ID（没有返回空串）。
+
+    这是个**很硬的信号**：用户话里的长数字几乎只会是比赛编号。因此它同时
+    被用来判「这句话跟 Dota2 有关」（见 :func:`parse_request`）—— 否则
+    「两小时后重新查看一下 9017256966 这场」里一个 Dota 功能词都没有，
+    会被「别做通用闹钟」那道闸门拒掉。
+    """
+    match = _MATCH_ID_RE.search(str(text or ""))
+    return match.group(0) if match else ""
+
+
+def _latest_match_id(recent_matches: Iterable[Any]) -> str:
+    """从「本会话最近提到过的比赛」里取最近一场的 ID（没有返回空串）。
+
+    入参允许两种形状：比赛 ID 本身，或含 ``match_id`` 的记录（插件侧的会话
+    上下文就是后者）。宽松一点，省得调用方为了喂这个参数再造一份数据。
+    """
+    for item in recent_matches or ():
+        raw_id = item.get("match_id") if isinstance(item, dict) else item
+        text = str(raw_id or "").strip()
+        if text.isdigit() and len(text) >= 6:
+            return text
+    return ""
+
+
 def _detect_action(
-    raw: str, known_names: Iterable[str]
+    raw: str,
+    known_names: Iterable[str],
+    recent_matches: Iterable[Any] = (),
 ) -> tuple[str, str]:
     """判断这句话要干什么，返回 ``(动作, 参数)``。"""
     for word in _META_WORDS:
         if word in raw:
             return ACTION_META, ""
+    match_id = extract_match_id(raw)
+    if match_id:
+        # 比赛 ID 是这里最硬的信号，排在「认人」与「群通报」之前。
+        # 不这么判的后果是**语义错**（比建不上更糟）：「两小时后重新查看
+        # 一下 9017256966」两个名字都没提，会被兜底成「通报群里战绩情况」，
+        # 用户得到一个每天往群里发战绩的任务 —— 而他想要的是去看那一场。
+        return ACTION_MATCH, match_id
+    if _THIS_MATCH_RE.search(raw):
+        # 「这场」这种指代：靠本会话最近提到过的那一场来补 ID。
+        # 只认**最近一场** —— 指代本来就该由上下文消歧，把候选全列出来
+        # 让模型挑反而可能在确认环节被换成另一场（用户核对的是他自己说的
+        # 「这场」，不是我们猜的编号）。
+        latest = _latest_match_id(recent_matches)
+        if latest:
+            return ACTION_MATCH, latest
     target = _match_known_name(raw, known_names)
     if target and any(word in raw for word in _PLAYER_WORDS):
         return ACTION_PLAYER, target
@@ -656,6 +898,7 @@ def format_task_list(
         lines.append(f"　{keyword} 每晚十点总结一下大家今天的表现")
         lines.append(f"　{keyword} 每监听到十盘战绩就生成一份这十盘的总结")
         lines.append(f"　{keyword} 明天早上八点通报一下战绩")
+        lines.append(f"　{keyword} 两小时后重新查看一下 9017256966 这场")
         return "\n".join(lines)
 
     if cron_rows:
@@ -663,7 +906,14 @@ def format_task_list(
         for index, row in enumerate(cron_rows, start=1):
             mark = "✅" if row.get("enabled", True) else "⏸"
             sid = short_id(str(row.get("schedule_id") or row.get("job_id") or ""))
-            when = cron_label(str(row.get("cron") or ""))
+            # 一次性任务优先显示它自己的绝对时刻：它的 cron 可能是「每天 H:M」
+            # 这类绕法（见 _build_delta_once），cron_label 会把它读成「每天」，
+            # 而它其实只响一次。
+            when = (
+                f"{row['once_at']}（一次性）"
+                if row.get("once_at")
+                else cron_label(str(row.get("cron") or ""))
+            )
             lines.append(
                 f" {index}. {mark} {sid}　{when}　{row.get('action_label') or ''}"
                 f"　（下次 {row.get('next_run_text') or '未知'}）"
@@ -713,6 +963,14 @@ def build_report_question(action: str, args: str = "") -> str:
         )
     if action == ACTION_META:
         return "请给出当前版本的强势英雄榜并点出重点。"
+    if action == ACTION_MATCH and args:
+        # 兜底：复查单场其实不走这里（``main._dispatch_scheduled`` 直接转给
+        # ``_match_recheck``，因为「没解析好」也要发消息，而这条播报通道
+        # 只会静默跳过）。留一句是为了将来有人把它接回来时不会问到空话。
+        return (
+            f"请复盘比赛 {args}：这局的关键转折、双方局势变化、"
+            "值得留意的问题。只依据数据，不要编造。"
+        )
     return GROUP_QUESTION
 
 
@@ -1139,9 +1397,12 @@ def format_plan(
         lines.append(f"　时间：{spec.label if spec is not None else '（没解析出时间）'}")
         if spec is not None and spec.used_default_time:
             lines.append("　　　　（你没说具体几点，用的是默认时刻）")
+        if spec is not None and spec.once:
+            lines.append("　　　　（一次性任务，执行完就自动结束）")
         what = ACTION_LABELS.get(request.action, request.action)
         if request.args:
-            what = f"{what}（对象：{request.args}）"
+            slot = "比赛" if request.action == ACTION_MATCH else "对象"
+            what = f"{what}（{slot}：{request.args}）"
         lines.append(f"　内容：{what}")
         lines.append(f"　发到：{where}")
     lines.append("")
@@ -1169,6 +1430,7 @@ def looks_like_task(
 __all__ = [
     "ACTION_GROUP",
     "ACTION_LABELS",
+    "ACTION_MATCH",
     "ACTION_META",
     "ACTION_PLAYER",
     "ACTION_WATCH_SUMMARY",
@@ -1178,7 +1440,9 @@ __all__ = [
     "DEFAULT_EVERY",
     "DEFAULT_TIME",
     "GROUP_QUESTION",
+    "MAX_DELTA_MINUTES",
     "MAX_EVERY",
+    "SOON_MINUTES",
     "TaskRequest",
     "TimeSpec",
     "WATCH_SUMMARY_SYSTEM_PROMPT",
@@ -1186,6 +1450,7 @@ __all__ = [
     "build_watch_summary_prompt",
     "cn_to_int",
     "cron_label",
+    "extract_match_id",
     "format_plan",
     "format_task_list",
     "job_name",
@@ -1197,6 +1462,7 @@ __all__ = [
     "once_cron",
     "parse_clock",
     "parse_control",
+    "parse_delta",
     "parse_request",
     "parse_time_spec",
     "retime_cron",

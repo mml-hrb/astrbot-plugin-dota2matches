@@ -139,6 +139,10 @@ class CronBridge:
             "action": str(payload.get("action") or ""),
             "args": str(payload.get("args") or ""),
             "schedule_id": str(payload.get("schedule_id") or ""),
+            # 一次性任务：cron 可能是「每天 H:M」这类绕法，反渲染会读成「每天」，
+            # 所以另带一个绝对时刻给列表用（见 dota_schedule.format_task_list）。
+            "once": bool(payload.get("once")),
+            "once_at": str(payload.get("once_at") or ""),
             "next_run": getattr(job, "next_run_time", None),
         }
 

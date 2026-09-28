@@ -2138,19 +2138,41 @@ class Dota2Plugin(Star):
            而契约与事实不一致的那一天，用户收到的是一句假话。
 
         Returns:
-            给用户看的确认文案；返回空串表示登记失败（工具层会据此让
-            模型改口让用户用指令），**绝不是「已执行」**。
+            给用户看的确认文案，**绝不是「已执行」**。
+
+        Raises:
+            dota_tools.ConfirmUnavailable: 登记不上时抛出，消息里带
+                「为什么 + 用户怎么改」。工具层会把它**原样转给模型**——
+                模型是唯一能向用户解释的地方，只回一句「没登记上」，
+                它就只能自己编理由（真机上编出的是「你定个 2 小时后的
+                手机闹钟」）。
         """
         kind = str(action.get("kind") or "")
         if kind == "schedule":
             if not self.cfg("schedule_enabled", True):
-                return ""
+                raise dota_tools.ConfirmUnavailable(
+                    "定时任务功能在插件配置里被关掉了（schedule_enabled = false），"
+                    "跟用户的说法无关。请如实告诉他去 WebUI 的插件配置里打开这一项，"
+                    "不要给他别的绕法。"
+                )
             request = self._parse_task_request(str(action.get("request") or ""), umo)
             if request is None:
-                return ""
+                raise dota_tools.ConfirmUnavailable(
+                    "没能从这句话里解析出「什么时候做」或「做什么」，所以没有登记。"
+                    "请让用户换一种说法，把时间说成下面任一种：钟点"
+                    "（「每天早上七点」「明天早上八点」）、相对时间（「两小时后」"
+                    "「半小时后」「三天后」）、或按场次（「每监听到十场」）；"
+                    "内容要跟 Dota2 数据有关（复盘某场比赛、通报战绩、看英雄池等）。"
+                    "如果他说的是「这场」而本会话没有可指的比赛，请让他把比赛 ID "
+                    "一起说上，例如「两小时后复盘 9017256966」。"
+                )
             # 计数型任务（「每监听到 N 场」）不依赖平台调度器，别一起拒了。
-            if request.kind != "watch_count" and self.schedules.unavailable_reason():
-                return ""
+            reason = self.schedules.unavailable_reason()
+            if request.kind != "watch_count" and reason:
+                raise dota_tools.ConfirmUnavailable(
+                    f"平台的定时调度能力当前不可用（{reason}），这个任务建不了。"
+                    "请把这一条如实告诉用户，不要换个说法让他再试一次。"
+                )
             self._schedule_plans[(umo, uid)] = {
                 "request": request,
                 "umo": umo,
@@ -2166,7 +2188,10 @@ class Dota2Plugin(Star):
         name = str(action.get("name") or "").strip()
         if name not in self.NLU_DISPATCH:
             logger.warning(f"[dota2] 工具请求了未知的写操作: {name!r}")
-            return ""
+            raise dota_tools.ConfirmUnavailable(
+                f"插件没有「{name}」这个写操作（工具名填错了）。"
+                "请重新调用工具，动作名只能用契约里列出的那几个。"
+            )
         args = str(action.get("args") or "")
         desc = str(action.get("desc") or "").strip()
         if not desc:
@@ -4256,6 +4281,9 @@ class Dota2Plugin(Star):
             text,
             known_names=self._nlu_known_names(umo),
             default_time=self._schedule_default_time(),
+            # 「过一会儿再看看**这场**」里的指代：会话里最近提到过的那一场。
+            # 不给它，用户就得手打比赛 ID —— 而他刚看完的正是「这场」。
+            recent_matches=self._nlu_recent_match_rows(umo, limit=8),
         )
 
     def _schedule_default_time(self) -> str:
@@ -4661,6 +4689,15 @@ class Dota2Plugin(Star):
             "schedule_id": schedule_id,
             "once": bool(spec.once),
             "note": dota_schedule.task_note(request, session_label=session_text),
+            # 一次性任务的 cron 是「每天 H:M」（相对时间不到一天）或「只钉几号」
+            # （跨年）这类**绕法**，反渲染会读成「每天 / 每月」，跟用户说的
+            # 「两小时后」对不上。把计划里那个绝对时间一并带上，列表才显示得对
+            # （见 dota_schedule.format_task_list）。
+            "once_at": (
+                spec.run_at.strftime("%m-%d %H:%M")
+                if (spec is not None and spec.once and spec.run_at)
+                else ""
+            ),
         }
         try:
             job = await self.schedules.create(
@@ -4679,11 +4716,24 @@ class Dota2Plugin(Star):
             return
 
         label = dota_schedule.ACTION_LABELS.get(request.action, request.action)
-        if request.action == dota_schedule.ACTION_PLAYER and request.args:
+        if request.args and request.action in (
+            dota_schedule.ACTION_PLAYER,
+            dota_schedule.ACTION_MATCH,
+        ):
             label = f"{label}（{request.args}）"
+        # 一次性任务的 cron 有两种绕法（见 dota_schedule._build_delta_once）：
+        # 相对时间不到一天时写成「每天 H:M」、跨年时只钉「几号」。这两者用
+        # cron_label 反渲染会读成「每天」/「每月」，**跟用户说的「两小时后」
+        # 对不上**（回执里同时出现「每天 16:51」和「一次性任务」自相矛盾）。
+        # 所以一次性任务直接显示计划里那个绝对时间。
+        when_text = (
+            spec.label
+            if (spec is not None and spec.once)
+            else dota_schedule.cron_label(cron)
+        )
         lines = [
             "✅ 定时任务已建好",
-            f"· 时间：{dota_schedule.cron_label(cron)}",
+            f"· 时间：{when_text}",
             f"· 内容：{label}",
             f"· 发到：{session_text}",
             f"· 编号：{dota_schedule.short_id(schedule_id)}",
@@ -4743,7 +4793,12 @@ class Dota2Plugin(Star):
                 await self._delete_schedule(schedule_id)
 
     async def _dispatch_scheduled(self, action: str, args: str, umo: str) -> None:
-        """按动作分派：版本榜是纯数据（不用模型），其余走模型播报。"""
+        """按动作分派：三种动作各有各的取数与渲染链路。"""
+        if action == dota_schedule.ACTION_MATCH:
+            # 复查单场**没解析好也要说话**，而下面那条播报通道遇到空内容
+            # 只会静默跳过 —— 所以它走自己的路。
+            await self._match_recheck(args, umo)
+            return
         if action == dota_schedule.ACTION_META:
             try:
                 parts = await self._hero_meta_board_parts()
@@ -4773,6 +4828,106 @@ class Dota2Plugin(Star):
             )
             return
         await self._send_to_session(umo, reply)
+
+    async def _match_recheck(self, args: str, umo: str) -> None:
+        """「过一会儿再看一眼这场」到点执行：**复查解析状态**。
+
+        这是唯一一种「结果取决于执行时数据状态」的定时任务，也是唯一一种
+        **没解析好也必须发消息**的任务 —— 用户建它的时候说的就是「还没解析
+        就通知我它没解析」。所以两条路都主动出声，不像别的播报那样静默跳过
+        （静默跳过正是最容易让人以为「功能坏了」的那种失败）。
+        """
+        found = re.search(r"\d{6,20}", str(args or ""))
+        match_id = int(found.group(0)) if found else 0
+        if match_id <= 0:
+            await self._send_quiet(
+                umo, "⚠️ 定时复查没拿到比赛 ID（任务参数不对），本次跳过。"
+            )
+            return
+        try:
+            match = await self.api.get_match(match_id)
+        except OpenDotaError as e:
+            await self._send_quiet(umo, f"⚠️ 到点复查比赛 {match_id} 时取数失败：{e}")
+            return
+        if not match:
+            await self._send_quiet(
+                umo,
+                f"⚠️ 到点复查了，但比赛 {match_id} 在 STRATZ 与 OpenDota 都查不到。\n"
+                "可能比赛 ID 写错，或者这局还没被收录。",
+            )
+            return
+
+        state = dota_parse.parse_state(match)
+        if not state.parsed:
+            await self._send_quiet(
+                umo,
+                f"📭 比赛 {match_id} 到现在还没解析好"
+                f"（数据完整度：{state.describe()}）。\n"
+                "AI 复盘要用逐分钟经济、团战与出装数据，解析没完成时给不出"
+                "有意义的分析，所以这次先只告诉你进度。\n"
+                f"· 现在就想要一份基础数据版的：`/d2 单场 {match_id} skip`\n"
+                f"· 想再等等：`{self._nlu_keyword()} 一小时后重新看一下 {match_id}`",
+            )
+            return
+
+        await self._send_quiet(
+            umo, f"✅ 比赛 {match_id} 已经解析好了，这就出分析。"
+        )
+        heroes = await self._heroes()
+        items = await self._items()
+        focus_ids, focus_names = self._recheck_focus(umo, match)
+        headline = self.match_headline(
+            match, heroes, focus_ids or None, True, focus_names
+        )
+        extra_context = await self._build_recent_context(
+            match_id, focus_ids, focus_names, heroes
+        )
+        abilities = await self._ability_constants()
+        curve_ids = self._curve_targets(match, focus_ids)
+        prompt = build_single_match_analysis_prompt(
+            match=match,
+            heroes=heroes,
+            items=items,
+            focus_account_ids=focus_ids or None,
+            focus_names=focus_names or None,
+            extra_context=extra_context,
+            abilities=abilities,
+            curve_ids=curve_ids,
+        )
+        report = await self._generate_report_for_umo(umo, prompt)
+        if not report:
+            await self._send_quiet(
+                umo,
+                "⚠️ 比赛已经解析好了，但复盘没生成出来（大模型不可用或未启用）。\n"
+                f"可以先用 `/d2 模型测试` 自检，也可以手动看一次："
+                f"`/d2 单场 {match_id} skip`",
+            )
+            return
+        await self._send_quiet(umo, headline)
+        for chunk in self._chunk_text(report):
+            await self._send_quiet(umo, chunk)
+
+    def _recheck_focus(self, umo: str, match: dict) -> tuple[list[int], dict[int, str]]:
+        """复查单场时的焦点玩家：本会话**唯一**绑定的那位，且得在这局里。
+
+        定时任务不知道是谁建的（建任务的人可能早退群了），所以只在「本会话
+        只有一个绑定」时才认 —— 和定时播报的 ``_binding_for_umo`` 同一口径。
+        没人可聚焦就出一份不带焦点的全场复盘，不影响其余内容。
+        """
+        binding = self._binding_for_umo(umo)
+        if not binding:
+            return [], {}
+        candidate = int(binding.get("account_id") or 0)
+        if not candidate:
+            return [], {}
+        in_match = any(
+            isinstance(player, dict)
+            and int(player.get("account_id") or 0) == candidate
+            for player in (match.get("players") or [])
+        )
+        if not in_match:
+            return [], {}
+        return [candidate], {candidate: str(binding.get("personaname") or "")}
 
     async def _scheduled_report(self, umo: str, question: str) -> str | None:
         """定时播报：用与闲聊兜底**同一份**数据上下文生成一段播报。
