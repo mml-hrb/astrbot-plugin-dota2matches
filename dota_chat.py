@@ -1113,6 +1113,10 @@ class ChatContext:
     #: **本会话近期涉及过的比赛**（监听推送 / 单场复盘 / 战绩列表都算），
     #: 由调用方从会话语境里取，形如 ``{match_id, desc, start_time, ts}``。
     session_matches: list[dict] = field(default_factory=list)
+    #: **最近几轮对话**（``["用户: …", "机器人: …"]``，新的在后）。
+    #: 交给模型消解指代用：「那他昨天呢」里的「他」只在上一条消息里出现过，
+    #: 没有这份背景，模型只能反问「你说的是谁」。
+    history: list[str] = field(default_factory=list)
 
 
 def _self_hero_positions(ctx: ChatContext) -> dict[int, str]:
@@ -1426,9 +1430,23 @@ def _watcher_label(watcher: dict) -> str:
     return "（" + "，".join(bits) + "）" if len(bits) > 1 else f"（{bits[0]}）"
 
 
-def format_context_block(ctx: ChatContext) -> str:
-    """把上下文渲染成给模型看的纯文本（无 markdown 表格）。"""
+def format_context_block(ctx: ChatContext, *, tooled: bool = False) -> str:
+    """把上下文渲染成给模型看的纯文本（无 markdown 表格）。
+
+    Args:
+        tooled: ``True`` 表示这份提示词是发给**带工具**的模型的（自然语言
+            主路径）。此时的上下文里**没有任何网络数据**，只有本会话的事实
+            底表，所以要在抬头把这件事讲清楚，否则模型会以为「没写战绩」
+            等于「这些人都没打过」。
+    """
     lines: list[str] = ["=== 本会话的插件数据 ==="]
+
+    if tooled:
+        lines.append(
+            "（这里只有**本会话的事实**：有哪些人在名单里、最近发生过哪几场、"
+            "当前时间。**没有任何战绩数字** —— 要具体战绩 / 英雄池 / 版本数据，"
+            "必须自己调工具去查。下面只是底表。）"
+        )
 
     # ---- 当前时间：一切「今天/昨天/前天」的基准 ----
     # 没有这一行，模型只能拿自己的训练时间或系统提示里的时间去猜，
@@ -1547,7 +1565,68 @@ def format_context_block(ctx: ChatContext) -> str:
         lines.append("【注意事项】")
         lines.extend(f"· {note}" for note in ctx.notes)
 
+    # ---- 最近几轮对话 ----
+    # 放在最后：它是**背景**，不是事实。写清楚这一点，免得模型把别人上一句
+    # 里提到的数字当成本次查询的结果。
+    if ctx.history:
+        lines.append("")
+        lines.append(
+            "【最近对话】（只用来理解上文在说谁、在说哪件事；"
+            "里面的数字都不是本次查到的数据）"
+        )
+        lines.extend(f"· {row}" for row in ctx.history[-6:])
+
     return "\n".join(lines)
+
+
+CHAT_TOOL_REQUIREMENTS = """=== 回答要求 ===
+1. 用中文口语化地回答，像群里老玩家聊天；不要写标题、不要用 markdown 表格、
+   不要罗列「一、二、三」这种报告格式（除非用户明确要正式分析）。
+2. **凡涉及具体数据的，一律先调工具查，再开口**。具体数据包括：某个人的战绩 /
+   胜率 / KDA / 英雄 / 位置、英雄池、版本强势英雄、比赛详情、定时任务列表。
+   上面的上下文里**没有任何战绩数字**，凭印象或记忆作答一律算答错。
+   · 问「我的战绩」而上下文里【提问者】显示未绑定时，先如实说需要先绑定，
+     不要拿别人的数据凑。
+3. **只讲工具真正返回过的数字**。工具报错、超时、说「没取到」时，就如实说
+   这块没拿到；工具里没有的字段（段位高低、对手水平、真实心情）不要补。
+4. 多人相关的问题（「群里谁最猛 / 谁最菜 / 谁在掉分」「昨天谁打得好」
+   「我们昨晚开黑怎么样」）用 `compare_players` 一次调完，它给的分项排名与
+   「同场局」就是横向比较的唯一依据。
+   · 不同场次之间的 KDA / GPM **不能直接比高下**（对手强度、位置、时长都不同）；
+     要讲就必须说明「这是跨场次的分项对比，不是同一局里的对位」。
+   · 「谁跟谁一起开黑」只能看 `compare_players` 返回的「同场局」；没有就
+     如实说「这几场没看到你们一起打」，不要替他们编队友。
+   · 「开黑N人」只说明他这局跟 N 个人一起排，队友是不是群里人要靠同场局判断。
+   · **没有 party 标记 ≠ 单排**：把它说成单排是编造，只有明确标了「单排」的才算。
+5. 判断强弱时要避开这几个坑，必要时在回答里点一句：
+   · GPM 受位置影响，辅助 / 游走位天然偏低，别只看 GPM 判强弱；
+   · Turbo（加速）局的经济数值约为常规局的两倍，标了 Turbo 的场次不要跟常规局直接比；
+   · 场次很少（个位数）时说明「样本少，仅供参考」。
+   · 英雄池类工具返回的口径行会写明覆盖了哪个版本、共多少场、其中加速多少场。
+     这群人多数对局是加速局，「加速占比很高」是常态、别当异常；但也别把加速局的
+     胜率直接说成天梯强度，提胜率时把口径一起说清楚。
+6. 如果用户在问「谁最菜」「谁最强」这类问题：先给结论和一句理由，再补上关键数据；
+   可以调侃，但不要人身攻击。
+7. 如果用户问的是练什么、怎么提升、或者想转位置：结合他的英雄池与近期数据给具体建议
+   （先练哪个英雄、哪项能力、怎么练），不要只给网上通用套话。
+   · 摘要里的「近期位置」来自他**每场比赛的真实位置记录**，是判断打什么位置的第一依据。
+   · 用户自称打某个位置、但数据里的位置分布对不上时，**先把这个矛盾点出来**再给建议。
+   · 给「转位置」建议时必须说清：现有英雄池里哪些英雄在目标位置能用、缺的是哪类英雄、
+     先从哪个英雄上手。推荐英雄要挑他真打过、场次/胜率站得住的，**不要推荐一场没打过的**。
+8. 如果问题与 Dota2 和本插件的数据都无关（例如问天气、写代码、聊别的），
+   就直接正常聊天回答，不要为了用工具而硬查数据。
+9. **时间口径**：
+   · 上下文开头给了【当前时间】，一切相对时间以它为准，不要用你的记忆猜日期。
+   · 本插件把**凌晨 4 点**作为一天的分界（玩家普遍熬夜）：0:00~3:59 打的局算
+     **前一天**。所以「昨晚」包含凌晨那几局，不要按自然日 0 点理解。
+   · 用户说了时间范围（「这三天」「昨天」「最近一周」）就**必须把它转成工具的
+     `days` 参数**：「这三天」=3、「昨天」=1、「最近一周」=7。不填 days
+     等于按「最近 N 场」统计，会把好几天前的局当成这段时间的成绩。
+   · 工具返回里标着「时间未知」的场次不要替它猜日期；比赛时间是空的就承认不知道。
+10. 需要比赛 ID 的工具（`query_match_detail`）：ID 要么用户直接给了，要么来自
+    上下文里「本会话涉及过的比赛」。**不要编造比赛 ID**，拿不准就先问用户。
+11. 篇幅控制在 400 字以内；用户明确要求详细分析时才展开。
+12. 结尾不要反问「还需要我做什么吗」这类客套。"""
 
 
 CHAT_REQUIREMENTS = """=== 回答要求 ===
@@ -1604,15 +1683,22 @@ CHAT_REQUIREMENTS = """=== 回答要求 ===
 12. 结尾不要反问「还需要我做什么吗」这类客套。"""
 
 
-def build_chat_prompt(question: str, ctx: ChatContext) -> str:
-    """拼出最终发给模型的用户提示词。"""
+def build_chat_prompt(question: str, ctx: ChatContext, *, tooled: bool = False) -> str:
+    """拼出最终发给模型的用户提示词。
+
+    Args:
+        tooled: ``True`` 走**带工具**的自然语言主路径 —— 数据靠模型自己调工具
+            取，上下文里只给事实底表，回答要求也换成
+            :data:`CHAT_TOOL_REQUIREMENTS`。``False`` 是给定时播报用的
+            「数据已预取好、单轮回答」模式，沿用 :data:`CHAT_REQUIREMENTS`。
+    """
     blocks = [
         "=== 用户的问题 ===",
         (question or "").strip(),
         "",
-        format_context_block(ctx),
+        format_context_block(ctx, tooled=tooled),
         "",
-        CHAT_REQUIREMENTS,
+        CHAT_TOOL_REQUIREMENTS if tooled else CHAT_REQUIREMENTS,
     ]
     return "\n".join(blocks)
 
@@ -1714,6 +1800,8 @@ async def collect_chat_context(
     localizer: Any = None,
     now: float | None = None,
     hero_pool_cfg: dict | None = None,
+    local_only: bool = False,
+    history: Iterable[str] = (),
 ) -> ChatContext:
     """收集一次闲聊回答所需的插件数据。
 
@@ -1734,6 +1822,10 @@ async def collect_chat_context(
         hero_pool_cfg: 英雄池口径配置（``min_games`` / ``max_patches`` /
             ``include_turbo`` / ``patch_scope``），由插件主体从配置读好传入；
             不传则用 :mod:`dota_pool` 的默认值。
+        local_only: ``True`` 时**只返回本地事实底表**（时间、名单、本会话
+            涉及过的比赛），不打任何接口、也不做 needs / 时间窗口判断。
+            自然语言主路径（带工具的模型）用这个 —— 数据由模型自己调工具取。
+        history: 最近几轮对话（``["用户: …"]``），给模型消解指代用。
 
     Returns:
         :class:`ChatContext`。**不会抛异常** —— 任何一块数据拿不到，
@@ -1750,11 +1842,23 @@ async def collect_chat_context(
         watchers=watcher_list,
         now=_now_ts(now),
         session_matches=[r for r in recent_matches if isinstance(r, dict)],
+        history=[str(row) for row in history if str(row or "").strip()],
     )
 
     self_account = (
         _as_int(self_binding.get("account_id")) if self_binding else None
     )
+
+    if local_only:
+        # 自然语言主路径（带工具的模型）：数据一律由模型自己调工具取，
+        # 这里只给**事实底表** —— 当前时间、名单、本会话涉及过的比赛。
+        #
+        # 为什么连 needs / 时间窗口都不算：这三个判断都是**关键词正则**在做
+        # 「用户想要什么数据」，而正则永远兜不住新说法（「给群里这三天的
+        # 战绩做个总结」就因为没收录「三天」而被判成「不打接口」）。既然
+        # 模型手上已经有全套工具，要什么由它自己决定，插件不猜。
+        return ctx
+
     ctx.needs = detect_needs(
         question,
         names=[str(w.get("personaname") or "") for w in watcher_list],

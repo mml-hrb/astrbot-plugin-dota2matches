@@ -78,6 +78,13 @@ DEFAULT_TOOL_TIMEOUT = 30.0
 #: 战绩类工具一次最多取多少场
 MAX_MATCHES_PER_CALL = 50
 
+#: ``compare_players`` 一次最多比几个人。六七个是群规模，再多也没人真要看，
+#: 反而会把调用预算烧光（每人一次取数）。
+MAX_COMPARE_PLAYERS = 8
+
+#: 没点名比谁时，默认拿本会话名单里的前几位。
+DEFAULT_COMPARE_PLAYERS = 6
+
 #: 同一个工具**连续失败**多少次之后就不再真的执行、直接短路。
 #:
 #: 起因是一次真实故障（2026-09-18，OpenDota 大面积 521/500）：模型为了回答
@@ -221,6 +228,38 @@ def build_tool_specs() -> list[dict]:
                         "「这三天 / 最近三天」填 3，「最近一周」填 7，「这两天」填 2；"
                         "用户没提时间就别填（此时按最近 N 场统计）。"
                     ),
+                },
+            },
+            [],
+        ),
+        _spec(
+            "compare_players",
+            "把**多位玩家**放在同一时间范围里横向对比：每人的战绩摘要与逐场明细、"
+            "胜率 / KDA / GPM 的分项排名、以及他们**一起打过哪些场**（判断是否开黑）。"
+            "问「群里谁最猛 / 谁最菜 / 谁在掉分」「昨天谁打得好」「我们昨晚开黑打得怎么样」"
+            "这类**涉及多人**的问题就用它，一次调用把所有人一起比完。"
+            "只问一个人时用 query_matches，不要用这个。",
+            {
+                "players": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "要比的玩家昵称列表，例如 [\"钢板\", \"天鸽\"]。"
+                        "用户说的就是「群里的人 / 被监听的几个人 / 所有人」时不填，"
+                        "默认比本会话全部绑定与监听的人。"
+                    ),
+                },
+                "days": {
+                    "type": "integer",
+                    "description": (
+                        "只看**最近几天**的对局（含今天）。用户说了时间范围才填："
+                        "「这三天 / 最近三天 / 这三天」填 3，「最近一周」填 7，"
+                        "「昨天」填 1；用户没提时间就别填（此时按最近 N 场统计）。"
+                    ),
+                },
+                "count": {
+                    "type": "integer",
+                    "description": "每人取最近几场，默认 10，最多 50。",
                 },
             },
             [],
@@ -391,6 +430,7 @@ def build_tool_specs() -> list[dict]:
 TOOL_READ_NAMES: tuple[str, ...] = (
     "list_players",
     "query_matches",
+    "compare_players",
     "query_hero_pool",
     "query_profile",
     "query_meta",
@@ -573,6 +613,201 @@ async def _tool_query_matches(args: dict, ctx: ToolContext) -> str:
     ]
     text = "\n".join(blocks)
     return f"{text}\n\n{scope_note}" if scope_note else text
+
+
+def _split_names(raw: Any) -> list[str]:
+    """把模型给的玩家列表归一成字符串列表（容忍它填成逗号分隔的一整串）。"""
+    if isinstance(raw, (list, tuple, set)):
+        items = [str(x) for x in raw]
+    else:
+        text = str(raw or "")
+        for sep in ("，", "、", ",", ";", "；", "/", "|", "\n"):
+            text = text.replace(sep, "\n")
+        items = text.split("\n")
+    out: list[str] = []
+    for item in items:
+        token = item.strip()
+        if token and token not in out:
+            out.append(token)
+    return out
+
+
+async def _compare_one(
+    ctx: ToolContext,
+    account_id: int,
+    name: str,
+    relation: str,
+    count: int,
+    window: "dota_chat.TimeWindow | None",
+) -> tuple["dota_chat.PlayerSnapshot", int]:
+    """取一位玩家的近期战绩并套上时间窗口，返回 ``(快照, 窗口外场次数)``。
+
+    单人失败**不影响**其他人：这一位的快照带上 ``error``，其余照常比。
+    """
+    snapshot = dota_chat.PlayerSnapshot(
+        account_id=account_id, name=name, relation=relation
+    )
+    try:
+        rows = await _guarded(ctx.fetch_matches(account_id, count), ctx)
+    except asyncio.TimeoutError:
+        snapshot.error = "请求超时"
+        return snapshot, 0
+    except Exception as e:  # noqa: BLE001 - 单人失败不该拖垮整次对比
+        # 带上原始消息：模型要靠它判断「是这人没数据」还是「数据源在抖」，
+        # 只给一个类型名（`RuntimeError`）等于什么都没说。
+        snapshot.error = f"{type(e).__name__}: {str(e)[:80]}"
+        logger.warning(f"[dota2] compare_players 取 {name}({account_id}) 失败: {e}")
+        return snapshot, 0
+    rows = [m for m in (rows or []) if isinstance(m, dict)]
+    if window is None:
+        snapshot.matches = rows
+        return snapshot, 0
+    # 口径只在一处生效：``window`` 同时挂到快照上，摘要/明细/对比三处
+    # 读的都是 ``scoped``，不会出现「胜率按窗口算、明细却不是」的错位。
+    snapshot.matches = dota_chat.scope_matches(rows, window)
+    snapshot.window = window
+    return snapshot, len(rows) - len(snapshot.matches)
+
+
+async def _tool_compare_players(args: dict, ctx: ToolContext) -> str:
+    """多人横向对比：一次把若干玩家的战绩摊开，并找出同场开黑。
+
+    为什么要有这个工具：横向对比（谁最猛 / 谁最菜 / 谁跟谁一起打的）需要
+    **多个人在同一口径下的数据**，而其余查询类工具都是单人视角。让模型逐个调
+    ``query_matches`` 会串行取六次数（用户干等好几分钟），且各次的时间范围
+    一旦不一致，比出来的高下就站不住。这里一次取完，口径天然一致。
+    """
+    count = _clamp_int(args.get("count"), default=10, low=1, high=MAX_MATCHES_PER_CALL)
+    days = _clamp_int(args.get("days"), default=0, low=0, high=30)
+    window = dota_chat.recent_days_window(days, ctx.now or None) if days else None
+    if window is not None:
+        # 同 query_matches：默认 10 场往往只覆盖一两天，说「这三天」时
+        # 手上可能压根没取全，会得出「他就打了 2 场」这种假否定。
+        count = max(count, min(dota_chat.WINDOW_FETCH_LIMIT, MAX_MATCHES_PER_CALL))
+
+    names = _split_names(args.get("players"))
+    problems: list[str] = []
+    targets: list[tuple[int, str, str]] = []
+
+    if names:
+        limit = _clamp_int(
+            ctx.cfg("nlu_chat_max_players", DEFAULT_COMPARE_PLAYERS),
+            default=DEFAULT_COMPARE_PLAYERS,
+            low=1,
+            high=MAX_COMPARE_PLAYERS,
+        )
+        if len(names) > limit:
+            problems.append(f"一次最多比 {limit} 个人，后面的先略过了。")
+        for raw in names[:limit]:
+            try:
+                account_id, label = await ctx.resolve_player(raw)
+            except Exception as e:  # noqa: BLE001 - 认不出人要让模型自己换说法
+                problems.append(f"「{raw}」没认出来：{str(e)[:80]}")
+                continue
+            targets.append((account_id, label, ""))
+    else:
+        rows = ctx.session_players() or []
+        limit = _clamp_int(
+            ctx.cfg("nlu_chat_max_players", DEFAULT_COMPARE_PLAYERS),
+            default=DEFAULT_COMPARE_PLAYERS,
+            low=1,
+            high=MAX_COMPARE_PLAYERS,
+        )
+        for row in rows[:limit]:
+            try:
+                account_id = int(row.get("account_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if account_id > 0:
+                targets.append(
+                    (
+                        account_id,
+                        str(row.get("name") or f"账号{account_id}"),
+                        str(row.get("relation") or ""),
+                    )
+                )
+
+    if not targets:
+        hint = "、".join(problems) if problems else ""
+        return (
+            "没有可对比的对象：本会话既没有绑定 / 监听的玩家，也没认出你点的人。"
+            + (f"\n（{hint}）" if hint else "")
+            + "\n可以先让用户说清楚要比谁的昵称。"
+        )
+
+    results = await asyncio.gather(
+        *(
+            _compare_one(ctx, account_id, name, relation, count, window)
+            for account_id, name, relation in targets
+        )
+    )
+    snapshots = [item[0] for item in results]
+    excluded = sum(item[1] for item in results)
+    heroes = await _guarded(ctx.heroes(), ctx)
+    now = ctx.now or None
+
+    with_data = [s for s in snapshots if s.games]
+    failed = [s for s in snapshots if s.error]
+    empty = [s for s in snapshots if not s.error and not s.games]
+    if not with_data:
+        period = window.describe() if window is not None else "最近一段时间"
+        detail = "；".join(
+            f"{s.name}（{s.error}）" if s.error else f"{s.name}（{period}内 0 场）"
+            for s in snapshots
+        )
+        return f"{period}内这 {len(snapshots)} 个人都没有可用的对局记录：{detail}。"
+
+    head = (
+        f"=== {len(snapshots)} 人横向对比（口径：{window.describe()}）==="
+        if window is not None
+        else f"=== {len(snapshots)} 人横向对比（每人最近 {count} 场）==="
+    )
+    lines = [head]
+    if window is not None and excluded:
+        lines.append(
+            f"（时间范围外的场次已剔除，共 {excluded} 场不计入任何统计；"
+            "下面每人的数字都只算范围内的场次）"
+        )
+    lines.append("")
+
+    for snap in snapshots:
+        lines.append(snap.summary_line(now))
+        detail = snap.detail_lines(heroes, now)
+        if detail:
+            lines.extend(detail)
+    lines.append("（上面缩进的行是对应玩家的逐场明细）")
+
+    comparison = dota_chat.format_comparison_block(snapshots)
+    if comparison:
+        lines.append("")
+        lines.append(comparison)
+
+    # 同场开黑：唯一能直接横向比高下的场景（同一局里对位 / 同队）。
+    party = dota_chat.format_party_block(snapshots, heroes, now)
+    if party:
+        lines.append("")
+        lines.append(party)
+
+    tail: list[str] = []
+    if failed:
+        tail.append(
+            "没取到数据的："
+            + "、".join(f"{s.name}（{s.error}）" for s in failed)
+            + " —— 别提他们的数字。"
+        )
+    if empty:
+        period = window.describe() if window is not None else "最近这段时间"
+        tail.append(
+            f"{'、'.join(s.name for s in empty)} 在{period}内一场没打"
+            "（这是「确实没打」，不是数据没取到）。"
+        )
+    if problems:
+        tail.append("另外：" + " ".join(problems))
+    if tail:
+        lines.append("")
+        lines.extend(tail)
+
+    return "\n".join(lines)
 
 
 async def _tool_query_hero_pool(args: dict, ctx: ToolContext) -> str:
@@ -907,6 +1142,7 @@ async def _tool_manage_schedule(args: dict, ctx: ToolContext) -> str:
 _DISPATCH: dict[str, Callable[[dict, ToolContext], Awaitable[str]]] = {
     "list_players": _tool_list_players,
     "query_matches": _tool_query_matches,
+    "compare_players": _tool_compare_players,
     "query_hero_pool": _tool_query_hero_pool,
     "query_profile": _tool_query_profile,
     "query_meta": _tool_query_meta,
@@ -1003,16 +1239,17 @@ TOOL_GUIDE = """=== 你可以调用工具查数据、也可以调用工具改设
 3. 工具返回的就是插件的真实数据。**只讲工具给过的内容**，不要补充记忆里的
    战绩、段位、数字；工具报错或明确说没取到，就如实说这块没拿到。
 4. **不要重复调用**同一个工具同一组参数；信息够了就停止调用，直接回答。
-5. **多人横向对比（「谁最惨 / 谁最强 / 昨天谁打得好」）不要逐个调 `query_matches`**：
-   上面上下文里的「近期战绩快照」与「横向对比」已经**按时间窗口**统计好了每个人，
-   直接用它们下判断。只有当上下文里**确实没有**某个人、或明确标了「没取到」而你
-   还需要他时，才为那一个人单独查一次。逐个查六个人会让用户干等好几分钟，
-   答案并不会更准。
+5. **多人横向对比（「谁最惨 / 谁最强 / 昨天谁打得好」「我们昨晚开黑怎么样」）
+   一律用 `compare_players` 一次调完**，不要逐个调 `query_matches`。
+   它把这些玩家放在**同一个时间范围**里一次取完，直接给你每人的摘要、
+   分项排名与「同场局」；逐个查六个人既慢（用户要干等好几分钟），
+   各次口径还可能不一致，比出来的高下站不住。
 6. 工具回「本次不可用 / 已经连续失败」时就**别再调它了**，换别的数据或直接作答 ——
    那说明数据源整体有问题，重试不会有新结果。
-7. 工具查不到「谁跟谁一起开黑」这类**关系型**结论：同场开黑只能从同一场比赛里
-   出现两人以上来判断，而工具是单人视角。要回答开黑问题就用上面上下文里的
-   「同场局」信息。
+7. 「谁跟谁一起开黑」是**关系型**结论，单人视角的 `query_matches` 答不了：
+   要用 `compare_players` —— 它会把各人取到的场次按比赛 ID 归并，列出
+   「同场局」（同一场比赛里出现两人以上，这是开黑的确凿证据）。没有同场局
+   就如实说「这几场没看到你们一起打」，不要替他们编队友。
 8. 英雄池类工具（`query_hero_pool` / `recommend_heroes`）返回的口径行里会写明
    **覆盖了哪个版本、共多少场、其中加速模式多少场**。这群人多数对局是加速局，
    所以「加速占比很高」是常态，别当成异常；但也别把加速局的胜率直接说成

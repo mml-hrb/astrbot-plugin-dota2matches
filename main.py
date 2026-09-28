@@ -264,10 +264,6 @@ def _fmt_clock(seconds: float) -> str:
 # ======================================================================
 # 自然语言入口相关的常量
 # ======================================================================
-#: 多义意图：这几个意图既可能是闲聊，也可能是真要操作。在群里直接执行
-#: 有误触风险，因此先回一句确认，等用户回「确认」再动手。
-NLU_CONFIRM_INTENTS = {"bind", "unbind", "watch"}
-
 #: 确认 / 取消词（命中即认为用户回的是确认或放弃）
 NLU_CONFIRM_WORDS = frozenset(
     {"确认", "确定", "是的", "对", "对的", "ok", "okay", "好", "好的", "嗯", "yes", "y"}
@@ -1893,38 +1889,6 @@ class Dota2Plugin(Star):
                 return None
         return NluGate(text=effective, keyword_matched=keyword_matched)
 
-    async def _nlu_classify_with_llm(
-        self, event: AstrMessageEvent, text: str, umo: str = ""
-    ) -> tuple[bool, dota_nlu.Intent | None]:
-        """用大模型判意图。
-
-        返回 ``(是否真的问过模型, 意图)``。这两个值**必须分开**：
-
-        * 问过模型、模型说 ``none`` → 这就是结论，不能再拿关键词兜底
-          （「详细分析这一盘」正是被关键词判成了 analyze）；
-        * 没问成（未启用 / 没有 provider / 调用报错）→ 返回 ``(False, None)``，
-          调用方回落到规则，保证模型不可用时功能不至于全瘫。
-        """
-        if not self.cfg("nlu_llm_fallback", False):
-            return False, None
-        provider = await resolve_provider(
-            self.context, event.unified_msg_origin, self.cfg("llm_provider_id", "")
-        )
-        if not provider:
-            return False, None
-        umo = umo or str(event.unified_msg_origin)
-        prompt = dota_nlu.build_classifier_prompt(
-            text,
-            recent_lines=self._nlu_chat_lines(umo),
-            recent_matches=self._nlu_recent_match_rows(umo),
-        )
-        try:
-            reply = await call_llm(provider, dota_nlu.CLASSIFIER_SYSTEM_PROMPT, prompt)
-        except Exception as e:  # noqa: BLE001
-            logger.debug(f"[dota2] 自然语言分类调用失败: {e}")
-            return False, None
-        return True, dota_nlu.parse_classifier_reply(reply)
-
     def _nlu_session_players(self, umo: str) -> list[dict]:
         """本会话里「有名字的人」：已绑定 + 已监听，按 account_id 去重。
 
@@ -1996,106 +1960,6 @@ class Dota2Plugin(Star):
                 return int(row["account_id"]), str(row["name"])
         return None
 
-    def _nlu_sanitize_llm_intent(
-        self, intent: dota_nlu.Intent, text: str, umo: str
-    ) -> bool:
-        """给模型的判断做一次安检。**会就地修改** ``intent``。
-
-        Returns:
-            ``True`` 表示整个意图都不可信，调用方按「没识别出指令」处理。
-
-        模型再聪明也会犯错，而有些错误的代价不对称：
-
-        * **判成复合问题里的一半**。「昨天群里谁输得最惨？给他找两个轮椅让他
-          翻身」被判成 wheelchair —— 前半句「谁输得最惨」被静默丢掉，而且
-          因为句子里没点名玩家，连轮椅都是不带人的通用榜单。这类句子必须
-          整条交给兜底对话逐项查，不能只执行一半 ⇒ 整个丢弃；
-        * 把「对比一下监听的几个人谁最菜」判成「添加监听」→ 会真的往监听
-          列表里加人，是改数据的动作，宁可交给闲聊兜底 ⇒ 整个丢弃；
-        * 凭空编一个比赛 ID → 会去查一场不存在的比赛。这种**只丢 ID**，
-          意图本身保留，后面的语境解析（推送过 / 复盘过的那一场）还能救回来。
-
-        .. important::
-
-           复合判定（:func:`dota_nlu.looks_composite`）**必须放在这里**，
-           不能只放在 :func:`dota_nlu.parse` 里 —— ``parse`` 只在「模型没问成」
-           时才执行，而实际跑的是模型路径（日志里的 ``via=llm``）。
-           上一版把护栏加在规则层，结果就是现场照样漏答。
-        """
-        if dota_nlu.looks_composite(text or ""):
-            logger.info(
-                f"[dota2] 自然语言：复合问题（模型判为 {intent.name}），"
-                "单个功能覆盖不全，改交给兜底对话逐项查"
-            )
-            return True
-        if intent.name in {"bind", "unbind", "watch", "unwatch"} and (
-            dota_nlu.ANALYSIS_QUESTION_RE.search(text or "")
-        ):
-            return True
-        if intent.name in {"match", "forceparse"} and intent.args:
-            digits = (intent.args or "").strip()
-            if not re.fullmatch(r"\d{6,20}", digits):
-                intent.args = ""
-                return False
-            if digits in (text or ""):
-                return False
-            known = {str(row.get("match_id")) for row in self._nlu_recent_match_rows(umo)}
-            if digits not in known:
-                logger.info(
-                    f"[dota2] 自然语言：模型给的比赛 ID {digits} 既不在原句也不在"
-                    "会话语境里，判定为编造，改按语境解析"
-                )
-                intent.args = ""
-        return False
-
-    async def _nlu_resolve_match_id(
-        self, umo: str, event: AstrMessageEvent, text: str
-    ) -> int | None:
-        """「这一盘」到底是哪一盘：按语境猜一个比赛 ID。
-
-        顺序是**由便宜到贵**：
-
-        1. 本会话语境里最近提到过的比赛（推送 / 复盘 / 战绩列表记下的）；
-        2. 本会话监听记录里的 ``last_match_id``（已经推送过的那一场）；
-        3. 提问者在当前会话绑定的账号的最近一场。
-
-        猜不出来返回 ``None``，由调用方提示用户补比赛 ID——**绝不瞎猜**。
-        """
-        rows = self._nlu_recent_match_rows(umo, limit=1)
-        if rows:
-            return int(rows[0]["match_id"])
-
-        newest = 0
-        for watcher in self.store.list_watchers(umo) or []:
-            try:
-                value = int(watcher.get("last_match_id") or 0)
-            except (TypeError, ValueError):
-                continue
-            if value > newest:
-                newest = value
-        if newest:
-            return newest
-
-        binding, _note = self._effective_binding(event)
-        if binding:
-            try:
-                matches, _ = await self.api.get_player_matches_enriched(
-                    int(binding.get("account_id") or 0), 1
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.debug(f"[dota2] 解析「这一盘」时拉取最近一场失败: {e}")
-                return None
-            for row in matches or []:
-                try:
-                    value = int(row.get("match_id") or 0)
-                except (TypeError, ValueError):
-                    continue
-                if value > 0:
-                    return value
-        return None
-
-    # ------------------------------------------------------------------
-    # 兜底对话：工具调用（一次回答可以调多个功能）
     # ------------------------------------------------------------------
     def _chat_tools_available(self) -> bool:
         """闲聊的**工具模式**是否启用 —— 只看配置，不看通道此刻通不通。
@@ -2160,31 +2024,6 @@ class Dota2Plugin(Star):
             chain.append(client)
         return chain
 
-    def _nlu_chat_focus(self, question: str, umo: str) -> list[int]:
-        """问题只点名了**一个**人、又没有横向对比语义时，返回那个人的账号。
-
-        用途是省掉一轮全量取数：监听列表可能有六七个人，而问「钢板最近
-        打得怎么样」时把所有人拉一遍，既慢又费接口配额。判据**宁可漏**：
-        漏了只是多拉几个人的数据（结果仍然正确），错了则会让模型手上的
-        数据缺人、答出「他没打」这种假结论。
-
-        * 出现「谁 / 对比 / 大家 / 开黑 / 最菜」这类多人词 → 不收窄；
-        * 原句里命中两个及以上名单昵称（「钢板和天鸽最近怎么样」）→ 不收窄。
-        """
-        text = str(question or "")
-        if not text or dota_chat.MULTI_PLAYER_HINT_RE.search(text):
-            return []
-        players = self._nlu_session_players(umo)
-        if not players:
-            return []
-        hits = [
-            row
-            for row in players
-            if dota_nlu.match_session_name(text, (str(row.get("name") or ""),))
-        ]
-        if len(hits) != 1:
-            return []
-        return [int(hits[0]["account_id"])]
 
     async def _fetch_chat_matches(self, account_id: int, limit: int) -> list[dict]:
         """拉近期对局，**复用闲聊兜底的缓存**。
@@ -2730,10 +2569,10 @@ class Dota2Plugin(Star):
     async def _nlu_agent_reply(
         self, event: AstrMessageEvent, question: str
     ) -> tuple[str | None, list[str]]:
-        """**工具优先**路径：带着插件数据与全套工具，让模型自己决定干什么。
+        """自然语言入口的**唯一**路径：带着全套工具，让模型自己决定干什么。
 
-        这是自然语言入口的主路径，走的是**默认模型**（AstrBot 全局配置的那个）；
-        规则识别只在一条模型通道都拿不到时才兜底。模型可以：
+        走的是**默认模型**（AstrBot 全局配置的那个，见
+        :meth:`_chat_tool_clients`）。模型可以：
 
         * 直接回答（闲聊、解释、建议）；
         * 调用只读工具补数据（查战绩 / 英雄池 / 版本榜 …）；
@@ -2751,19 +2590,19 @@ class Dota2Plugin(Star):
         * 「dota2助手 以后每天七点通报群里战绩」
           —— 走写操作工具 + 确认闸门。
 
-        上下文里永远带三样「坐标系」：当前时间、会话语境里的比赛列表、
-        以及（识别到时间词时的）时间窗口 —— 少了它们，数据再全也答不准。
+        上下文里只放**事实**：当前时间、本会话的名单、本会话涉及过的比赛。
+        具体战绩 / 英雄池 / 版本数据一律由模型调工具取 —— 插件不再用关键词
+        预判用户想要哪块数据（那种预判正是「兜不住」的来源，见
+        :func:`dota_chat.collect_chat_context` 的 ``local_only``）。
 
         失败语义（很重要）：
 
-        * **数据收集失败不算失败**。少拉一块上下文照样能回答，最多在
-          上下文里注明「某人数据没取到」。
-        * **模型不可用才算失败**。此时返回 ``(None, [])``，调用方回落到
-          规则识别 —— 绝不能既不回答、又把消息吃掉。
+        * **数据收集失败不算失败**。名单 / 会话比赛拿不到照样能回答。
+        * **模型不可用才算失败**。此时返回 ``(None, [])``，调用方
+          **不吞消息**（交回默认大模型），绝不既不回答又把消息吃掉。
 
         Returns:
-            ``(回答, 待发送的确认请求)``。两者都为空表示这条链路没产出，
-            调用方应当继续走降级路径。
+            ``(回答, 待发送的确认请求)``。两者都为空表示这条链路没产出。
         """
         # 用户明确关闭了「启用 LLM 分析」：不要偷偷替他调用模型
         if not self.cfg("enable_llm_analysis", True):
@@ -2772,28 +2611,23 @@ class Dota2Plugin(Star):
         umo = event.unified_msg_origin
         uid = str(event.get_sender_id())
         binding, _note = self._effective_binding(event)
-        # 工具模式可用时，问题若只点名了一个人（且没有横向对比语义），
-        # 就只拉那个人的数据 —— 监听列表六七个人全拉一遍纯属浪费。
         tools_on = self._chat_tools_available()
-        focus = self._nlu_chat_focus(question, umo) if tools_on else []
         try:
-            context = await self._collect_chat_context(question, umo, uid, binding, focus)
+            # local_only：只拿本地事实，不预取任何网络数据。要什么数据
+            # 由模型自己调工具要 —— 插件猜错一次，答案就整段跑偏。
+            context = await self._collect_chat_context(
+                question, umo, uid, binding, local_only=True
+            )
         except Exception as e:  # noqa: BLE001 - 兜底失败也要放行，不能吞消息
             logger.error(f"[dota2] 闲聊兜底收集数据失败: {e}", exc_info=True)
             return None, []
 
-        prompt = dota_chat.build_chat_prompt(question, context)
+        prompt = dota_chat.build_chat_prompt(
+            question, context, tooled=tools_on
+        )
         system_prompt = dota_chat.build_chat_system_prompt(
             str(self.cfg("nlu_chat_system_prompt", "") or "")
         )
-        # 先走「带工具的多轮问答」：一句复合问题（既看战绩又要推荐英雄）
-        # 靠意图分类只能二选一，只有让模型自己按需追加查询才能都答上。
-        # 这条路走不通（没有可用模型通道 / 模型报错）时，回落到原来的单轮
-        # 带数据回答 —— 功能不会因为模型不支持工具就消失。
-        #
-        # 注意单轮兜底走的是 `_call_chat_llm`（默认模型优先），**不是**
-        # `_call_report_llm` —— 后者是比赛分析通道（专用 Key 优先），
-        # 拿它来接闲聊等于把闲聊的账记到分析 Key 上。
         reply: str | None = None
         trace = ""
         pending: list[str] = []
@@ -2801,22 +2635,23 @@ class Dota2Plugin(Star):
             reply, trace, pending = await self._nlu_chat_agent(
                 event, prompt, system_prompt
             )
-        if not reply:
+        else:
+            # 关掉工具（``nlu_chat_tools=false``）时的形态：**仍然是大模型**，
+            # 只是手上没有工具，能聊不能查。留这条是因为它便宜
+            # （不触发任何数据源请求），不是因为它能替代工具路径。
             reply = await self._call_chat_llm(
                 prompt, umo=umo, system_prompt=system_prompt
             )
         if not reply and not pending:
-            logger.info("[dota2] 闲聊兜底：模型不可用，消息交回默认大模型")
+            logger.info("[dota2] 自然语言：模型没产出（通道不可用或报错），消息交回默认大模型")
             return None, []
 
+        tool_calls = len([x for x in trace.split("; ") if x]) if trace else 0
         logger.info(
-            f"[dota2] 工具优先回答: {question[:48]!r} "
-            f"needs={sorted(context.needs)} "
-            f"玩家数={len(context.snapshots)} "
-            f"收窄={focus or '-'} "
-            f"时间窗口={context.window.label if context.window else '-'} "
+            f"[dota2] 自然语言交给模型: {question[:48]!r} "
+            f"名单={len(context.watchers)}人 "
             f"会话比赛={len(context.session_matches)} "
-            f"工具调用={len([x for x in trace.split('; ') if x]) if trace else 0}次 "
+            f"工具调用={tool_calls if tools_on else '未启用'} "
             f"待确认={len(pending)}项"
         )
         return reply, pending
@@ -2827,7 +2662,9 @@ class Dota2Plugin(Star):
         umo: str,
         uid: str,
         binding: dict | None,
-        focus: list[int],
+        focus: list[int] | None = None,
+        *,
+        local_only: bool = False,
     ) -> dota_chat.ChatContext:
         """收集一次「带插件数据的回答」所需的会话语境。
 
@@ -2839,6 +2676,8 @@ class Dota2Plugin(Star):
         Args:
             binding: 提问者的绑定（定时播报没有「提问者」，传 ``None``）。
             focus: 只取这几个人的数据；空列表表示按常规规则取。
+            local_only: 只给本地事实、不预取任何网络数据。自然语言主路径
+                （带工具的模型）用这个开关 —— 数据由模型自己调工具取。
         """
         return await dota_chat.collect_chat_context(
             self.api,
@@ -2851,6 +2690,9 @@ class Dota2Plugin(Star):
             # 纯本地数据、零网络开销，永远注入。它带来的是「这个群
             # 最近发生过什么」以及每场比赛自己的开赛时间。
             recent_matches=self._nlu_recent_match_rows(umo, limit=8),
+            # 最近几轮对话：模型要靠它消解指代（「那他昨天呢」）。
+            # 去掉最后一条 —— 那是本次这句话，已经在【用户的问题】里了。
+            history=self._nlu_chat_lines(umo)[:-1],
             self_binding=binding,
             focus_accounts=focus,
             recent_limit=int(
@@ -2865,6 +2707,7 @@ class Dota2Plugin(Star):
             cache=self._chat_cache,
             localizer=self._localize_heroes,
             now=time.time(),
+            local_only=local_only,
             hero_pool_cfg={
                 "min_games": int(
                     self.cfg("hero_pool_min_games", dota_pool.DEFAULT_MIN_GAMES) or 0
@@ -2894,7 +2737,7 @@ class Dota2Plugin(Star):
     async def d2_natural(self, event: AstrMessageEvent):
         """自然语言入口：把「帮我看看我的战绩」这类人话交给模型去办。
 
-        处理顺序（**改过一轮，别按旧印象读**）：
+        处理顺序（**v2.4.0 起只剩三步，别再按旧印象读**）：
 
         1. **确认 / 取消回复**。用户对上一条待确认动作的回话先处理掉，
            且不受唤醒词限制 —— 逼他再打一遍「dota2助手 确认」是没必要的摩擦。
@@ -2902,13 +2745,18 @@ class Dota2Plugin(Star):
            「(意图名, 参数)」，混在一起会让用户陷进「确认 → 又让你确认」）。
         2. **闸门**（:meth:`_nlu_should_handle`）：总开关、指令前缀、唤醒词、
            群聊 @ 要求。没通过就直接 ``return``，消息留给别人。
-        3. **工具优先**（:meth:`_nlu_agent_reply`）：把插件的**全部能力**
+        3. **交给模型**（:meth:`_nlu_agent_reply`）：把插件的**全部能力**
            作为工具交给模型，由它决定调什么、调几次、还是直接回答。
            写操作工具只登记待确认，确认请求由插件原样发给用户；
            慢任务（单场复盘 / 催解析）只发起后台任务。
-        4. **规则降级**：专用模型通道不可用（没配 Key / 关掉工具 /
-           模型报错）时，才退到「大模型判意图 → 关键词规则」→ 指令 handler；
-           规则也认不出来且有唤醒词时，退回「单轮带数据回答」。
+
+        **没有第 4 步。** v2.3.x 这里还有一层「大模型判意图 → 关键词规则 →
+        指令 handler」的降级路径，v2.4.0 整层删掉了：只要规则还在主路径上，
+        它就会一直漏（「这三天」「战报」这类新说法一个个补词表，补不完），
+        而且判意图一次只能给一个 label，复合问题必然答一半。模型没产出时
+        这里**不猜、也不吞消息**，直接放行给默认大模型。
+        规则只剩下三处与「理解意图」无关的用途：唤醒词 / @ 闸门、确认 /
+        取消词、`/d2` 指令前缀。
 
         .. important::
 
@@ -2977,30 +2825,29 @@ class Dota2Plugin(Star):
             return
         effective = gate.text
 
-        # ---------- 3. 工具优先：整条消息交给带工具的模型 ----------
-        # 这是自然语言入口的**主路径**：把插件的全部能力（查数据 / 改设置 /
-        # 发起后台复盘）作为工具交给模型，由它自己决定调哪些、调几次、
-        # 还是直接回答。
+        # ---------- 3. 交给大模型（唯一路径）----------
+        # 把插件的全部能力（查数据 / 改设置 / 发起后台复盘）作为工具交给
+        # 模型，由它自己决定调哪些、调几次、还是直接回答。**没有第二条路**。
         #
-        # 为什么不再先做意图分类：一句话里常常要好几样东西
-        # （「钢板最近打得怎么样？顺便给他推荐几个轮椅」），而意图分类一次
-        # 只能给一个 label，无论判成哪个都必然漏答一半。把「该调什么」交给
-        # 模型，复合问题才解得开；写操作也因此多了一道确认闸门（见
-        # `_nlu_ask_confirm`），群里误触的代价不会比原来更高。
+        # 为什么不做意图识别（关键词打分 / 分类器判 label）：
         #
-        # 规则识别没有删，它整体退到下面做**降级兜底**：没有专用模型通道
-        # （没配 Key / 关掉了工具 / 没开 LLM 分析）或模型整个不可用时，
-        # 依旧能靠关键词把指令认出来，功能不会消失。
+        # 1. 分类一次只能给一个 label。一句话里常常要好几样东西
+        #    （「钢板最近打得怎么样？顺便给他推荐几个轮椅」），判成哪个都
+        #    必然漏答一半。工具调用天然支持一次调多个，复合问题才解得开。
+        # 2. 更根本的是**兜不住**。用正则猜「这句话属于哪个功能」，词表再长
+        #    也是穷举：实测「给群里这三天的战绩做个总结」因为词表里没有
+        #    「三天」，被判成「不用打接口」，答出来的却是「最近 N 场」。
+        #    后来把词表补齐了，下一个新说法照样会漏。规则只要还在主路径上，
+        #    就得一直打补丁 —— 干脆不让它参与。
+        #
+        # 所以规则层整体退场：只保留三种与「理解意图」无关的用途 ——
+        # 唤醒词 / @ 闸门（决定要不要理会这条消息）、确认 / 取消词
+        # （协议回复）、以及 `/d2` 指令前缀。
         #
         # 要求 `keyword_matched`：唤醒词是**用户明确点名**插件的信号。
         # 没有它（即 `nlu_require_keyword=false` 且只 @ 了机器人）时不能
         # 走这条路 —— 那等于让插件接管所有 @ 消息，抢答风险太大。
-        agent_ready = (
-            gate.keyword_matched
-            and self.cfg("nlu_chat_fallback", True)
-            and self._chat_tools_available()
-        )
-        if agent_ready:
+        if gate.keyword_matched and self.cfg("nlu_chat_fallback", True):
             reply, pending_prompts = await self._nlu_agent_reply(event, effective)
             if reply or pending_prompts:
                 if reply:
@@ -3010,169 +2857,16 @@ class Dota2Plugin(Star):
                 # 确认文案（尤其定时任务的计划文本）必须和用户逐字对齐。
                 for prompt_text in pending_prompts:
                     yield event.plain_result(prompt_text)
-                return
-            # 模型通道在这里没产出（Key 失效 / 接口挂了）。继续往下走规则，
-            # 而不是把消息吃掉 —— 用户至少还能用指令把事办成。
-            logger.info("[dota2] 工具优先路径无产出，回落到规则识别")
-
-        # ---------- 4. 识别意图（降级路径）----------
-        # 关键词只负责**唤醒插件**（见闸门）；判意图以大模型为准。
-        # 「详细分析这一盘」里「分析」4 分压过「这盘」3 分，关键词会把它判成
-        # 「分析近期 1 场表现」——这种词频游戏只有模型看得懂，而且它还带着
-        # 会话上下文，能知道「这一盘」是哪一场。
-        # 模型不可用（未启用 / 没 provider / 调用失败）时才回落到规则，
-        # 免得模型一挂整个自然语言入口就废掉。
-        intent: dota_nlu.Intent | None = None
-        consulted = False
-        if self.cfg("nlu_llm_first", True):
-            consulted, intent = await self._nlu_classify_with_llm(
-                event, effective, umo
-            )
-            if consulted and intent is not None and self._nlu_sanitize_llm_intent(
-                intent, effective, umo
-            ):
-                logger.info(
-                    f"[dota2] 自然语言：模型判为 {intent.name} 但不可信，按未识别处理"
-                )
-                intent = None
-        # 只有**没问成模型**时才回落到关键词。问过模型、模型说「不是指令」
-        # 就是结论，再让关键词翻案等于把上面那段白做。
-        if not consulted:
-            intent = dota_nlu.parse(effective)
-        # 「查版本强势英雄」的重点是**给谁看**，而这一步最容易丢人：
-        # 现场日志取证 —— 「dota2助手，帮我推荐几个轮椅」被模型正确判成
-        # wheelchair，但 target 是空的，于是只出了一份通用榜单，没有个人推荐。
-        # 原因有二：模型不把「帮我」当成「我」，而「天鸽的轮椅」这类句子
-        # 在规则里也压根没抽昵称。这里统一用规则重建一次参数（模型 / 关键词
-        # 两条路径共用同一份构造），顺带把位置词从 target 里摘出去。
-        if intent is not None and intent.name == "wheelchair":
-            rebuilt = dota_nlu.build_wheelchair_args(
-                effective,
-                llm_target=intent.args,
-                known_names=tuple(self._nlu_known_names(umo)),
-            )
-            if rebuilt != (intent.args or ""):
-                logger.info(
-                    f"[dota2] 自然语言：轮椅参数由 {intent.args!r} 重建为 {rebuilt!r}"
-                )
-            intent.args = rebuilt
-
-        # 定时任务的参数同理，而且更彻底：**必须**是用户原话。
-        # 模型返回的那几个字段（target / count / match_id）根本装不下
-        # 「每监听到十盘战绩就生成一份这十盘的总结」里的「每…十盘」，
-        # 拼回去就成了一个语义完全不同的任务。这里直接换成原句，
-        # 由 dota_schedule 去解析（它才是唯一定义「什么算定时请求」的地方）。
-        if intent is not None and intent.name == "schedule":
-            intent.args = effective
-
-        if intent is None:
-            # 规则也没认出来。分两种情况：
-            #
-            # a) 工具路径**压根没试过**（没有专用模型 Key / 关掉了工具）——
-            #    此时退回「单轮带数据回答」：默认大模型看不到本会话的监听名单、
-            #    绑定关系与战绩，直接放行只会得到反问或编造。这条路径不调工具，
-            #    只是把数据一次性喂给它。
-            # b) 工具路径试过但没产出 —— 说明模型整个不可用，再问一次也是白问，
-            #    原样放行给默认大模型，绝不既不回答又把消息吃掉。
-            #
-            # 注意 keyword_matched 在 `nlu_require_keyword=false` 时恒为假，
-            # 所以关掉唤醒词限制不会让插件变成「什么都插一嘴」。
-            if (
-                not agent_ready
-                and gate.keyword_matched
-                and self.cfg("nlu_chat_fallback", True)
-            ):
-                reply, pending_prompts = await self._nlu_agent_reply(
-                    event, effective
-                )
-                if reply:
-                    async for item in self._emit(event, reply, as_image=False):
-                        yield item
-                for prompt_text in pending_prompts:
-                    yield event.plain_result(prompt_text)
+            # 模型没产出（通道挂了 / 接口报错）时**不吞消息**：直接放行，
+            # 交回默认大模型。这里从前会回落规则识别，结果是用户得去猜
+            # 「为什么有时候认得出、有时候认不出」—— 不如干脆不猜。
             return
 
-        handler_name = self.NLU_DISPATCH.get(intent.name)
-        if not handler_name:
-            return
-
-        # 「这一盘」「上面那局」这类指代：模型或规则都给不出比赛 ID 时，
-        # 用会话语境补一个（推送过 / 复盘过 / 监听过的那一场）。
-        if intent.name == "match" and not intent.args:
-            resolved = await self._nlu_resolve_match_id(umo, event, effective)
-            if resolved:
-                intent.args = str(resolved)
-                logger.info(
-                    f"[dota2] 自然语言：按会话语境把 {effective!r} 解析为比赛 {resolved}"
-                )
-
-        # 缺参数的意图直接告诉用户怎么补，别去猜
-        if intent.name in dota_nlu.INTENT_NEEDS_TARGET and not intent.args:
-            if intent.name == "unwatch":
-                pass  # 取消监听允许不带目标（按当前绑定来）
-            elif intent.name == "match":
-                if dota_nlu.looks_like_single_match(effective):
-                    yield event.plain_result(
-                        "你说的是哪一盘？本会话里还没有刚提到过的比赛。\n"
-                        f"直接给比赛 ID 最快："
-                        f"`{self._nlu_keyword()} 这局 8993438099 复盘一下`；\n"
-                        f"也可以先说「{self._nlu_keyword()} 我的战绩」，"
-                        "从列表里挑一局的编号。"
-                    )
-                else:
-                    yield event.plain_result(
-                        "复盘单场需要比赛 ID，例如："
-                        f"`{self._nlu_keyword()} 这局 8993438099 帮我复盘一下`。\n"
-                        "比赛 ID 可以从「我的战绩」里拿，或直接用 Dota 客户端的比赛编号。"
-                    )
-                return
-            elif intent.name == "forceparse":
-                yield event.plain_result(
-                    "催解析需要指定是哪一局，例如："
-                    f"`{self._nlu_keyword()} 催一下 8993438099 的解析`。\n"
-                    "想让插件等解析完再自动出复盘，"
-                    f"说「{self._nlu_keyword()} 这局 8993438099 复盘一下」即可。"
-                )
-                return
-            elif intent.name in {"bind", "info", "heroes", "matches", "analyze", "watch"}:
-                # 无法确定是谁：交给 handler，它会回落到当前会话的绑定
-                pass
-
-        handler = getattr(self, handler_name, None)
-        if handler is None:
-            return
-
-        # ---------- 4. 多义意图先确认，避免群里误触 ----------
-        if (
-            intent.name in NLU_CONFIRM_INTENTS
-            and intent.args
-            and self.cfg("nlu_confirm_sensitive", True)
-        ):
-            self._nlu_confirm[(umo, uid)] = (
-                intent.name,
-                intent.args,
-                time.time() + NLU_CONFIRM_TTL,
-            )
-            verb = {
-                "bind": "绑定账号",
-                "unbind": "解除绑定",
-                "watch": "添加监听",
-            }.get(intent.name, intent.name)
-            yield event.plain_result(
-                f"你刚才是想让我{verb}「{intent.args}」吗？\n"
-                f"回复「确认」我就执行；回复「取消」就当我没说。"
-            )
-            return
-
-        logger.info(
-            f"[dota2] 自然语言识别: {intent.name} args={intent.args!r} "
-            f"score={intent.score} via={intent.via}"
-        )
-        agen = self._nlu_invoke(intent.name, event, intent.args)
-        if agen is None:
-            return
-        async for item in agen:
-            yield item
+        # 走到这里说明「闸门通过了，但这条消息不该由模型处理」—— 例如
+        # 用户关掉了 nlu_chat_fallback / 没开 LLM 分析 / 只 @ 了机器人而没写
+        # 唤醒词。原样放行（不 yield、不 take over），交给默认大模型或别的
+        # 插件。**不能什么都不做又不放行**，那等于把消息吃掉。
+        return
 
     # ==================================================================
     # 指令：绑定 / 解绑
