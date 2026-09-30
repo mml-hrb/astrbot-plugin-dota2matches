@@ -73,6 +73,7 @@ try:  # 插件目录被作为包加载时的相对导入
     from .dota_store import DotaStore
     from . import dota_chat
     from . import dota_cron
+    from . import dota_history
     from . import dota_nlu
     from . import dota_parse
     from . import dota_pool
@@ -132,6 +133,7 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
 
     import dota_chat  # type: ignore[no-redef]
     import dota_cron  # type: ignore[no-redef]
+    import dota_history  # type: ignore[no-redef]
     import dota_nlu  # type: ignore[no-redef]
     import dota_parse  # type: ignore[no-redef]
     import dota_pool  # type: ignore[no-redef]
@@ -582,6 +584,18 @@ class Dota2Plugin(Star):
         self.data_dir = self._resolve_data_dir()
         self.store = DotaStore(self.data_dir)
         self.store.load()
+        #: **会话对话历史**（用户说的 + 机器人说的 + 报告类产出），按 umo 分开存。
+        #:
+        #: 它解决的是「聊着聊着就接不上了」：以前历史里**只有用户自己说的话**
+        #: （机器人回复从未被记进去），报告类产出（复盘报告 / 定时播报 / 监听
+        #: 推送）也一条都不进，而且只存内存、热重载即清空。详见
+        #: :mod:`dota_history`。
+        self.history = dota_history.ChatHistoryStore(
+            self.data_dir,
+            enabled=bool(self.cfg("nlu_history_enabled", True)),
+            ttl_hours=float(self.cfg("nlu_history_ttl_hours", 12) or 12),
+        )
+        self.history.load()
         self.api = self._build_data_source()
         #: 中文名服务：本地对照表 + 磁盘缓存 + 缺词补译。
         #:
@@ -672,9 +686,12 @@ class Dota2Plugin(Star):
         #: 只放在内存里：重启后语境清空是合理的（「这一盘」本来就是会话内的
         #: 概念，隔天再问没有意义）。
         self._nlu_recent_matches: dict[str, deque[dict]] = {}
-        #: 会话语境：每个会话最近几轮对话（含机器人自己说过的话），
-        #: ``{umo: deque[(角色, 文本)]}``。用于给意图分类器消歧（「上面那盘」）。
-        self._nlu_chat_log: dict[str, deque[tuple[str, str]]] = {}
+        #: 会话语境：每个会话最近几轮对话。
+        #:
+        #: 实体是 :attr:`history`（可落盘、带 TTL 与预算，见 :mod:`dota_history`）；
+        #: 这里**故意不再留第二份内存副本** —— 两套记录一定会分叉，而分叉的
+        #: 表现就是「有时候接得上、有时候接不上」。读写一律走
+        #: :meth:`_nlu_log_line` / :meth:`_nlu_chat_lines` 两个薄委托。
         #: 闲聊兜底用的战绩快照缓存：``{(account_id, limit): (时间戳, matches)}``。
         #: 由插件实例持有、跨会话复用；里面只放**纯数据**，快照对象每次新建
         #: —— 同一个账号在 A 群是「本人」、在 B 群是「被监听」，
@@ -1740,20 +1757,34 @@ class Dota2Plugin(Star):
     # ------------------------------------------------------------------
     # 会话语境（供「这一盘」这类指代消歧）
     # ------------------------------------------------------------------
-    def _nlu_log_line(self, umo: str, role: str, text: str) -> None:
-        """记一行会话日志。``role`` 为 ``user`` / ``bot``。"""
-        umo = str(umo or "")
-        text = (text or "").strip().replace("\n", " ")
-        if not umo or not text:
-            return
-        if len(text) > 80:
-            text = text[:80] + "…"
-        self._nlu_chat_log.setdefault(umo, deque(maxlen=12)).append((role, text))
+    def _nlu_log_line(
+        self, umo: str, role: str, text: str, *, kind: str = "chat"
+    ) -> None:
+        """记一行会话日志。``role`` 为 ``user`` / ``bot``。
+
+        ``kind`` 区分「对话」（``chat``）与「报告类产出」（``report``：复盘报告、
+        定时播报、监听推送）。两者都进历史 —— 用户接着问「刚才那份报告里他
+        补刀多少」时，模型手上必须有那份报告 —— 但排版与读出时的前缀不同。
+        """
+        self.history.append(umo, role, text, kind=kind)
 
     def _nlu_chat_lines(self, umo: str, limit: int = 8) -> list[str]:
-        """取出会话最近几轮对话，渲染成 ``角色: 内容`` 的形式。"""
-        rows = list(self._nlu_chat_log.get(str(umo or "")) or [])[-limit:]
-        return [f"{'用户' if role == 'user' else '机器人'}: {text}" for role, text in rows]
+        """取出会话最近几轮对话，渲染成 ``角色: 内容`` 的形式。
+
+        给提示词里的【最近对话】段用（定时播报那条**不接工具**的老路径，
+        以及模板渲染）。**工具路径改用** :meth:`_nlu_chat_messages` ——
+        真正的多轮消息序列比一段拼接文本强得多。
+        """
+        return self.history.text_lines(umo, limit=limit)
+
+    def _nlu_chat_messages(self, umo: str) -> list[dict[str, str]]:
+        """取出会话最近几轮对话，渲染成**真正的多轮消息序列**。
+
+        供带工具的主路径前置到 ``messages`` 里（``role`` 为 ``user`` /
+        ``assistant``）。末尾那条 user 会被丢掉：调用方在进模型**之前**已经
+        把本轮问题记进历史了，而本轮问题又会作为 ``user`` 消息单独放在最后。
+        """
+        return self.history.messages(umo)
 
     def _nlu_remember_match(
         self,
@@ -2486,6 +2517,7 @@ class Dota2Plugin(Star):
         tool_ctx: Any,
         *,
         include_write: bool = True,
+        history: list[dict[str, str]] | None = None,
     ) -> tuple[str, bool]:
         """在**一条**通道上跑完多轮工具循环。
 
@@ -2494,6 +2526,19 @@ class Dota2Plugin(Star):
         的消息回填，进入下一轮。上限由 ``nlu_chat_tool_rounds`` 与
         ``nlu_chat_tool_max_calls`` 双重把关 —— 没有上限的话，一个含糊的
         问题能让模型把数据源查个底朝天。
+
+        Args:
+            history: **上几轮对话**（``role=user`` / ``role=assistant``，
+                由 :meth:`_nlu_chat_messages` 备好），前置到本轮消息之前。
+
+                以前历史是被拼成一段文本塞进本轮 user 消息末尾的 ——
+                模型得从「用户: … 机器人: …」这段拼接里自己解析谁说了什么，
+                而且上一个问题与这一段之间隔着一大坨事实底表。改成真正的
+                多轮消息后，模型的对话连续性显著变好（这也是 AstrBot 的
+                ``text_chat`` 原生认的形态：非 system 消息原样进 contexts）。
+
+                这里只放**纯文本**消息，不带 ``tool_calls`` —— 历史里留一个
+                没有对应 ``tool`` 结果的 ``tool_calls`` 会让多数服务直接 400。
 
         Returns:
             ``(回答, 通道是否不可用)``。第二项只在**第一轮就失败**时为真：
@@ -2514,6 +2559,8 @@ class Dota2Plugin(Star):
                 + "\n\n"
                 + dota_tools.TOOL_GUIDE,
             },
+            # 上几轮对话（真正的 user / assistant 消息，不是拼接文本）
+            *[dict(row) for row in (history or []) if isinstance(row, dict)],
             {"role": "user", "content": prompt},
         ]
         used = 0
@@ -2598,6 +2645,7 @@ class Dota2Plugin(Star):
         umo: str = "",
         uid: str = "",
         allow_write: bool = True,
+        history: list[dict[str, str]] | None = None,
     ) -> tuple[str | None, str, list[str]]:
         """带工具的多轮问答（闲聊主路径，走**默认模型**）。
 
@@ -2605,6 +2653,11 @@ class Dota2Plugin(Star):
         :meth:`_chat_tool_clients`）：闲聊是高频交互，用 AstrBot 全局配置的
         模型即可；专用 Key 留给比赛分析。默认模型调不动工具（不支持 function
         calling）时才换专用 Key，保证「一句话里要好几件事」仍然答得全。
+
+        Args:
+            history: 上几轮对话（真正的 user / assistant 消息）。**闲聊路径
+                必须传**，否则模型接不上上一句；定时任务那条通道**不传**
+                （到点执行一件事，历史只会干扰它）。
 
         Returns:
             ``(回答, 工具调用轨迹, 待发给用户的确认请求)``。回答为 ``None``
@@ -2626,7 +2679,12 @@ class Dota2Plugin(Star):
         answer = ""
         for index, client in enumerate(clients):
             answer, channel_dead = await self._run_tool_loop(
-                client, prompt, system_prompt, tool_ctx, include_write=allow_write
+                client,
+                prompt,
+                system_prompt,
+                tool_ctx,
+                include_write=allow_write,
+                history=history,
             )
             if answer:
                 if index:
@@ -2685,11 +2743,20 @@ class Dota2Plugin(Star):
         uid = str(event.get_sender_id())
         binding, _note = self._effective_binding(event)
         tools_on = self._chat_tools_available()
+        # 上几轮对话：带工具时**作为真正的多轮消息**前置（见 _run_tool_loop），
+        # 不带工具时退化成一段文本注入上下文 —— 单轮调用没有 messages 序列，
+        # 只能这么给。两种形态给的都是同一份历史，口径不会分叉。
+        history = self._nlu_chat_messages(umo) if tools_on else []
         try:
             # local_only：只拿本地事实，不预取任何网络数据。要什么数据
             # 由模型自己调工具要 —— 插件猜错一次，答案就整段跑偏。
             context = await self._collect_chat_context(
-                question, umo, uid, binding, local_only=True
+                question,
+                umo,
+                uid,
+                binding,
+                local_only=True,
+                include_history=not tools_on,
             )
         except Exception as e:  # noqa: BLE001 - 兜底失败也要放行，不能吞消息
             logger.error(f"[dota2] 闲聊兜底收集数据失败: {e}", exc_info=True)
@@ -2706,7 +2773,7 @@ class Dota2Plugin(Star):
         pending: list[str] = []
         if tools_on:
             reply, trace, pending = await self._nlu_chat_agent(
-                event, prompt, system_prompt
+                event, prompt, system_prompt, history=history
             )
         else:
             # 关掉工具（``nlu_chat_tools=false``）时的形态：**仍然是大模型**，
@@ -2738,6 +2805,7 @@ class Dota2Plugin(Star):
         focus: list[int] | None = None,
         *,
         local_only: bool = False,
+        include_history: bool = True,
     ) -> dota_chat.ChatContext:
         """收集一次「带插件数据的回答」所需的会话语境。
 
@@ -2751,6 +2819,11 @@ class Dota2Plugin(Star):
             focus: 只取这几个人的数据；空列表表示按常规规则取。
             local_only: 只给本地事实、不预取任何网络数据。自然语言主路径
                 （带工具的模型）用这个开关 —— 数据由模型自己调工具取。
+            include_history: 是否把历史对话渲染成【最近对话】**文本段**注入
+                上下文。带工具的主路径传 ``False``：那边改用真正的多轮消息
+                序列（:meth:`_nlu_chat_messages`），两处都注入等于同一段
+                对话出现两遍，还会把提示词撑长。不带工具的单轮路径只能
+                用文本形态，传 ``True``。
         """
         return await dota_chat.collect_chat_context(
             self.api,
@@ -2765,7 +2838,10 @@ class Dota2Plugin(Star):
             recent_matches=self._nlu_recent_match_rows(umo, limit=8),
             # 最近几轮对话：模型要靠它消解指代（「那他昨天呢」）。
             # 去掉最后一条 —— 那是本次这句话，已经在【用户的问题】里了。
-            history=self._nlu_chat_lines(umo)[:-1],
+            # 带工具的路径传 include_history=False，改走真正的多轮消息。
+            history=(
+                self._nlu_chat_lines(umo)[:-1] if include_history else []
+            ),
             self_binding=binding,
             focus_accounts=focus,
             recent_limit=int(
@@ -2850,16 +2926,22 @@ class Dota2Plugin(Star):
         # 丢弃主动推送；这份记录就是重新补回那条信息的唯一来源。
         self._record_inbound_scene(event)
 
-        # 会话语境：无论这条消息最终有没有被处理，都记一笔。
-        # 后面用户说「上面那盘」「这一局」时全靠它消歧。
-        if text:
-            self._nlu_log_line(umo, "user", text)
-
         # ---------- 1. 先处理「确认 / 取消」回复 ----------
         # 这一步**不受唤醒词限制**：用户的确认是对上一轮已授权操作的收尾，
         # 再逼他打一遍「dota2助手 确认」是没必要的摩擦。为了两种写法都能用，
         # 统一拿剥离唤醒词后的正文来比对。
         head = self._nlu_head_text(text)
+
+        # 会话语境：无论这条消息最终有没有被处理，都记一笔。
+        # 后面用户说「上面那盘」「这一局」时全靠它消歧。
+        #
+        # 记的是**剥离唤醒词之后的正文**。三个理由：① 历史里每句都顶着
+        # 「dota2助手」既占位置，又会让模型以为每一轮都在点名；② 本轮问题
+        # （``build_chat_prompt`` 的【用户的问题】）用的正是剥离后的正文，
+        # 两边形态一致，模型读起来才像同一场对话；③ 唤醒词常常只是「叫一下
+        # 机器人」，本身没有语义。
+        if text:
+            self._nlu_log_line(umo, "user", head or text)
 
         # 定时任务的确认走**另一套**：确认的对象是一份已经解析好的计划
         # （几时、做什么、发到哪），而不是「(意图名, 参数)」。若塞进通用确认，
@@ -2924,6 +3006,10 @@ class Dota2Plugin(Star):
             reply, pending_prompts = await self._nlu_agent_reply(event, effective)
             if reply or pending_prompts:
                 if reply:
+                    # **记进会话历史**（这是「接不上话」的头号原因）：以前
+                    # 只记用户说的话，机器人自己的回复从来不记 —— 于是历史里
+                    # 全是用户自说自话，模型下一轮根本不知道上一轮答了什么。
+                    self._nlu_log_line(umo, "bot", reply)
                     async for item in self._emit(event, reply, as_image=False):
                         yield item
                 # 写操作的确认请求**由插件原样发出**，不让模型转述：
@@ -6569,9 +6655,18 @@ class Dota2Plugin(Star):
         （``target["creators"]``，配置项 ``watch_notify_at``），现已整体移除——
         想被提醒的成员自己看群消息即可。
 
+        顺带把**原文记进会话历史**（``kind="report"``，记未分块的整段，
+        不记分块）：这是复盘报告 / 定时播报 / 监听推送的**唯一出口**，
+        在这里记一笔才能让用户接着问「刚才那场他补刀多少」时答得上来。
+        不带这个记录时，报告发出去就再也进不了任何上下文 —— 那正是
+        「调用工具生成的报告不在上下文」的直接原因。
+
         Returns:
             是否全部发送成功。失败时调用方会保留该监听者的基线以便补推。
         """
+        # 先记再发：发送可能因为适配器抖动失败，但内容**已经产出**了，
+        # 用户下次追问时模型应该能看到它。
+        self._nlu_log_line(umo, "bot", text, kind="report")
         ok = True
         chunks = self._chunk_text(text)
         for index, chunk in enumerate(chunks, start=1):
