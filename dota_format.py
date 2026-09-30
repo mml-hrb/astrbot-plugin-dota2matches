@@ -64,8 +64,15 @@ LANE_ROLES: dict[int, str] = {
 }
 
 #: STRATZ 的 ``position`` 枚举 → 中文「几号位」。
-#: OpenDota 侧没有这个字段（只有 lane_role），但 STRATZ 直连时每个玩家都带，
-#: 是判断阵容分工最直接的依据，因此这里补一张映射表。
+#: STRATZ 直连时每个玩家都带这个字段，是判断阵容分工最直接的依据。
+#:
+#: OpenDota 侧**也有**一个等价物：``position_est``（整数 1~5）。这一点曾经被
+#: 误判成「OpenDota 只有 lane_role」，于是报告里只剩「优势路(Safe Lane) lane=1」
+#: 这种话 —— 而优势路上同时站着 1 号位和 5 号位，等于没说。样本
+#: ``8995536921`` 里两个字段的对照足以确认 ``position_est`` 就是号位估算：
+#: 净经济 40.9k / 补刀 174 的 Sniper 是 ``position_est=1``，而同一路（lane_role=1）
+#: 插了 9 假眼 16 真眼、补刀只有 17 的 Grimstroke 是 ``position_est=5``；
+#: 中路两人（lane_role=2）都是 ``position_est=2``。渲染见 :func:`_lane_text`。
 POSITION_TEXT: dict[str, str] = {
     "POSITION_1": "1号位（核心/优势路）",
     "POSITION_2": "2号位（中单）",
@@ -73,6 +80,37 @@ POSITION_TEXT: dict[str, str] = {
     "POSITION_4": "4号位（游走/打架辅助）",
     "POSITION_5": "5号位（保人辅助）",
 }
+
+#: OpenDota ``benchmarks`` 的键 → ``(中文名, 是否越低越好)``。
+#:
+#: ``benchmarks`` 是**同一个英雄**所有玩家的分位表，每条形如
+#: ``{"raw": 725, "pct": 0.1097}``，``pct`` 是原始值在该英雄总体里的分位（0~1）。
+#: 这是「这名选手这个英雄本局打得怎么样」唯一的外部参照系 —— 没有它，模型只能
+#: 对着「GPM 725」这种孤立绝对值硬猜水平，而 GPM 在辅助和核心身上根本不是一回事。
+#:
+#: 唯一需要反向的是 ``deaths_per_min``：原始值越大代表死得越多，直接照搬分位
+#: 会让模型把「死得多」读成「排得高所以打得好」。渲染见 :func:`benchmark_text`。
+BENCHMARK_METRICS: dict[str, tuple[str, bool]] = {
+    "gold_per_min": ("GPM", False),
+    "xp_per_min": ("XPM", False),
+    "kills_per_min": ("击杀频率", False),
+    "deaths_per_min": ("死亡频率", True),
+    "assists_per_min": ("助攻频率", False),
+    "last_hits_per_min": ("补刀频率", False),
+    "denies_per_min": ("反补频率", False),
+    "hero_damage_per_min": ("英雄伤害频率", False),
+    "hero_healing_per_min": ("治疗频率", False),
+    "tower_damage": ("建筑伤害", False),
+}
+
+#: 十人概览里只挑这几项分位，避免把 10 个指标 × 10 个玩家铺满提示词。
+BENCHMARK_DIGEST: tuple[tuple[str, str], ...] = (
+    ("gold_per_min", "GPM"),
+    ("xp_per_min", "XPM"),
+    ("last_hits_per_min", "补刀"),
+    ("hero_damage_per_min", "伤害"),
+    ("deaths_per_min", "生存"),
+)
 
 RANK_MEDALS: list[str] = [
     "无段位",
@@ -1338,6 +1376,292 @@ def summarize_multi_kills(player: dict) -> str:
     return "；".join(parts)
 
 
+def benchmark_text(player: dict, *, only: tuple[str, ...] | None = None) -> str:
+    """``benchmarks`` → 「相对**同一个英雄**的玩家，他这项优于多少人」。
+
+    统一口径成百分比：``pct`` 是原始值在该英雄总体里的分位，越高代表原始值越大。
+    ``deaths_per_min`` 原始值越大代表死得越多，因此反向成「生存」，否则模型会把
+    「死得多」读成「排得高 = 打得好」。
+
+    这是全篇唯一的外部参照系。没有它，报告只能拿「GPM 725」这种孤立绝对值硬下
+    判断 —— 而 725 的 GPM 放在辅助身上是优秀、放在 1 号位身上是拉胯。
+
+    Args:
+        only: 只渲染这几个键（十人概览用）；``None`` = 全部。
+    """
+    data = player.get("benchmarks")
+    if not isinstance(data, dict) or not data:
+        return ""
+    parts: list[str] = []
+    for key in only or tuple(BENCHMARK_METRICS):
+        label, lower_is_better = BENCHMARK_METRICS.get(key, (key, False))
+        row = data.get(key)
+        if not isinstance(row, dict):
+            continue
+        pct = row.get("pct")
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+            continue
+        better = 1.0 - float(pct) if lower_is_better else float(pct)
+        better = min(1.0, max(0.0, better))
+        parts.append(f"{label} {better * 100:.0f}%")
+    return " · ".join(parts)
+
+
+def benchmark_digest(player: dict) -> str:
+    """十人概览用的分位摘要（见 :data:`BENCHMARK_DIGEST`）。"""
+    parts: list[str] = []
+    data = player.get("benchmarks")
+    if not isinstance(data, dict) or not data:
+        return ""
+    for key, short in BENCHMARK_DIGEST:
+        row = data.get(key)
+        if not isinstance(row, dict):
+            continue
+        pct = row.get("pct")
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+            continue
+        lower_is_better = BENCHMARK_METRICS.get(key, ("", False))[1]
+        better = 1.0 - float(pct) if lower_is_better else float(pct)
+        parts.append(f"{short} {min(1.0, max(0.0, better)) * 100:.0f}%")
+    return "/".join(parts)
+
+
+def healing_breakdown(player: dict, heroes: dict[int, dict], limit: int = 5) -> str:
+    """``healing`` → 「治疗量给了谁」，并把**自我治疗**单独摘出来。
+
+    口径已用样本交叉验证：``healing`` 的键是**被治疗的英雄**，指向自己英雄的那一项
+    是自我治疗，**其余项之和恰好等于 ``hero_healing``**。样本 ``8995536921`` 的十名
+    玩家逐条吻合 —— 例如 Life Stealer ``hero_healing=999``，而 ``healing`` 里除自己
+    以外的 117+235+45+602 正好是 999；Winter Wyvern 的 1125+274+338 也正好等于
+    它的 ``hero_healing=1737``。
+
+    所以这里必须把「给自己」与「给队友」分开说：把自我治疗算成团队贡献，会把一个
+    只顾自己的选手夸成团队型辅助。
+    """
+    data = player.get("healing")
+    if not isinstance(data, dict) or not data:
+        return ""
+    hero_info = heroes.get(player.get("hero_id")) if isinstance(heroes, dict) else None
+    own_npc = (hero_info or {}).get("name")
+    entries: list[tuple[float, str, str]] = []
+    for npc, value in data.items():
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            continue
+        if num <= 0:
+            continue
+        entries.append((num, str(npc), hname_by_npc(heroes, npc)))
+    if not entries:
+        return ""
+
+    def _infer_self_npc() -> str | None:
+        """用已验证过的等式反推哪一条是自我治疗。
+
+        ``healing`` 的非自我部分之和恰好等于 ``hero_healing``，因此
+        「总和 − hero_healing」就是自我治疗量，再回到明细里找是哪一条。
+        """
+        try:
+            expected = float(player.get("hero_healing"))
+        except (TypeError, ValueError):
+            return None
+        amount = sum(num for num, _, _ in entries) - expected
+        if amount <= 0:
+            return None
+        for num, npc, _label in entries:
+            if abs(num - amount) < 1:
+                return npc
+        return None
+
+    self_npc = str(own_npc) if own_npc else None
+    # 常量表里的 npc 名与 ``healing`` 的键对不上时（合成常量表、常量降级等），
+    # 不能默认「没有自我治疗」—— 那会把自我治疗算成团队贡献，正好是这个字段
+    # 最容易骗人的地方。此时改用反推。
+    if not self_npc or not any(npc == self_npc for _num, npc, _label in entries):
+        self_npc = _infer_self_npc()
+
+    own = 0.0
+    mates: list[tuple[float, str]] = []
+    for num, npc, label in entries:
+        if self_npc and npc == self_npc:
+            own = num
+        else:
+            mates.append((num, label))
+    mates.sort(key=lambda item: -item[0])
+    bits: list[str] = []
+    if own:
+        bits.append(f"自我治疗 {own:,.0f}")
+    if mates:
+        shown = "、".join(f"{label} {num:,.0f}" for num, label in mates[:limit])
+        bits.append(f"给队友合计 {sum(num for num, _ in mates):,.0f}（{shown}）")
+    elif own:
+        bits.append("给队友合计 0（本场没有给队友提供治疗）")
+    return "治疗分布: " + "　".join(bits)
+
+
+def rune_times_text(player: dict, limit: int = 10) -> str:
+    """``runes_log`` → 吃符的**时间点**（故意不给符文类型）。
+
+    ``runes`` / ``runes_log`` 的 ``key`` 是引擎内部的 ``DOTA_RUNE_*`` 枚举。样本
+    ``8995536921`` 里出现过 0/1/2/4/5/6/7/8/9 九种取值，其中只有「5」能用证据钉住
+    语义（8 次里有 6 次落在 0:00 这类 3 分钟倍数上，符合赏金符的刷新节奏），其余
+    取值本仓库证伪不了任何一副候选名字表。
+
+    符文名表一旦猜错，会被报告原样写成「他 8 分钟吃了双倍伤害符」这种不存在的
+    结论 —— 而「他有没有在符点去抢符」这个判断，光看时间点就够用了。
+    """
+    log = player.get("runes_log")
+    if not isinstance(log, list) or not log:
+        return ""
+    times: list[int] = []
+    for row in log:
+        if not isinstance(row, dict):
+            continue
+        stamp = row.get("time")
+        if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+            continue
+        times.append(int(stamp))
+    if not times:
+        return ""
+    times.sort()
+    shown = "、".join(fmt_clock(item) for item in times[:limit])
+    return f"吃符时间点: {shown}（共 {len(times)} 次）"
+
+
+def ward_economy_text(player: dict) -> str:
+    """购买 / 插下 / 排掉：视野工作的收支三条线。
+
+    * ``purchase_ward_observer`` / ``purchase_ward_sentry``：买了几个。样本里与
+      ``obs_placed`` / ``sen_placed`` 逐人吻合（Grimstroke 买 16 真眼插 16 真眼），
+      两者的差值就是「买了没插」。
+    * ``observer_kills`` / ``sentry_kills``：**排掉几个敌方的眼**。用
+      ``obs_left_log`` / ``sen_left_log`` 的 ``attackername`` 独立数了一遍做交叉
+      验证：10 人里 9 人完全相等（剩下 1 人 ``sentry_kills`` 比日志多 1，属于日志
+      缺行），语义可以确认，方向没有歧义。
+
+    原先报告里只有「插了几个」，于是「眼插了但一个都没排掉」和「插满眼还顺手把对面
+    视野清空」两种完全不同的辅助拿到的评语一模一样。
+    """
+    pairs = [
+        ("假眼", "purchase_ward_observer", "obs_placed"),
+        ("真眼", "purchase_ward_sentry", "sen_placed"),
+    ]
+    bits: list[str] = []
+    for label, buy_key, place_key in pairs:
+        placed_n = _as_int(player.get(place_key))
+        bought_n = _as_int(player.get(buy_key))
+        # 两个都是 0/缺失时整条不写：核心位常常一辈子不买眼，冒出
+        # 「假眼 插0 · 真眼 插0」只是噪音，还会把上下文挤掉。
+        if not placed_n and not bought_n:
+            continue
+        if bought_n is not None and placed_n is not None:
+            gap = bought_n - placed_n
+            text = f"{label} 买{bought_n}/插{placed_n}"
+            if gap:
+                text += f"（差{gap}）"
+        elif placed_n is not None:
+            text = f"{label} 插{placed_n}"
+        else:
+            text = f"{label} 买{bought_n}"
+        bits.append(text)
+    dewards: list[str] = []
+    for label, key in (("敌方假眼", "observer_kills"), ("敌方真眼", "sentry_kills")):
+        value = _as_int(player.get(key))
+        if value:
+            dewards.append(f"{label}{value}")
+    if dewards:
+        bits.append("排眼 " + "、".join(dewards))
+    if not bits:
+        return ""
+    return "视野收支: " + " · ".join(bits)
+
+
+def farm_detail_text(player: dict) -> str:
+    """刷钱方式的细节：远古野 / 堆野 / 死灵书单位。
+
+    ``camps_stacked``（堆了几个野点）与 ``creeps_stacked``（堆了多少只野怪）是两个
+    不同口径的字段，分开写；``ancient_kills`` 只统计远古野，是判断「这个核心有没有
+    吃高效野区」的直接证据（样本里 Meepo 19 只、Sniper 20 只，而两个辅助都是 0）。
+    """
+    bits: list[str] = []
+    for label, key, unit in (
+        ("远古野", "ancient_kills", "只"),
+        ("野怪", "neutral_kills", "只"),
+        ("死灵书单位", "necronomicon_kills", "只"),
+        ("肉山", "roshans_killed", "次"),
+    ):
+        value = _as_int(player.get(key))
+        if value:
+            bits.append(f"{label} {value} {unit}")
+    camps = _as_int(player.get("camps_stacked"))
+    creeps = _as_int(player.get("creeps_stacked"))
+    if camps:
+        bits.append(f"堆野点 {camps} 次")
+    if creeps and creeps != camps:
+        bits.append(f"堆野怪 {creeps} 只")
+    return "刷钱细节: " + "、".join(bits) if bits else ""
+
+
+def match_integrity_text(match: dict) -> str:
+    """对局完整性：放弃 / 掉线标记 / 暂停。全部正常时返回空串。
+
+    这些字段平时都是 0，一旦非 0 就足以改变整篇报告的定性（有人挂机/掉线的局，
+    「他为什么被抓这么多次」的答案可能根本不在他的操作里），因此值得单独占一行。
+    """
+    players = [p for p in (match.get("players") or []) if isinstance(p, dict)]
+    abandons = 0
+    leavers = 0
+    for player in players:
+        value = _as_int(player.get("abandons"))
+        if value:
+            abandons += value
+        status = _as_int(player.get("leaver_status"))
+        if status:
+            leavers += 1
+    pauses = match.get("pauses")
+    pause_count = len(pauses) if isinstance(pauses, list) else 0
+    bits: list[str] = []
+    if abandons:
+        bits.append(f"{abandons} 人次放弃比赛")
+    if leavers:
+        bits.append(f"{leavers} 人有掉线/放弃标记")
+    if pause_count:
+        bits.append(f"暂停 {pause_count} 次")
+    return "对局完整性: " + "、".join(bits) if bits else ""
+
+
+def chat_text(match: dict, heroes: dict[int, dict], limit: int = 10) -> list[str]:
+    """对局内**手打**的聊天（``type == "chat"``），最多 ``limit`` 条。
+
+    轮盘消息（``type == "chatwheel"``）的 ``key`` 是数字 id，本仓库没有可信的
+    「轮盘 id → 文案」对照表，猜错会把一条「打得好」渲染成不存在的话，因此这里
+    只渲染真正带文本的手打消息。
+    """
+    chat = match.get("chat")
+    if not isinstance(chat, list) or not chat:
+        return []
+    by_slot = {
+        int(p.get("player_slot")): p
+        for p in (match.get("players") or [])
+        if isinstance(p, dict) and p.get("player_slot") is not None
+    }
+    rows: list[str] = []
+    for entry in chat:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("type") or "") != "chat":
+            continue
+        text = str(entry.get("key") or "").strip()
+        if not text:
+            continue
+        owner = by_slot.get(int(entry.get("player_slot") or 0)) or {}
+        who = hname(heroes, owner.get("hero_id")) if owner else "未知玩家"
+        rows.append(f"{fmt_clock(entry.get('time'))} {who}: {text}")
+        if len(rows) >= limit:
+            break
+    return rows
+
+
 def summarize_item_timeline(
     player: dict, item_index: ItemIndex, min_cost: int = 2000
 ) -> str:
@@ -1483,6 +1807,9 @@ def _player_row(
     neutral = item_index.name(player.get("item_neutral"), default="")
     if neutral:
         inventory.append(f"[中立]{neutral}")
+    neutral2 = item_index.name(player.get("item_neutral2"), default="")
+    if neutral2:
+        inventory.append(f"[中立2]{neutral2}")
     if player.get("aghanims_scepter"):
         inventory.append("[已出神杖]")
     if player.get("aghanims_shard"):
@@ -1521,6 +1848,13 @@ def _player_row(
     pings = player.get("pings")
     if pings is not None:
         extras.append(f"打点 {pings} 次")
+    # 段位与组队：判断「这个发挥算不算达标」需要知道对手/队友的水平层次。
+    rank = player.get("rank_tier")
+    if rank:
+        extras.append(f"段位 {rank_text(rank)}")
+    party = _as_int(player.get("party_size"))
+    if party and party > 1:
+        extras.append(f"组队 {party} 人")
 
     lines = [
         (
@@ -1571,6 +1905,12 @@ def _lane_text(player: dict) -> str:
     lane = player.get("lane")
     parts = []
     position = POSITION_TEXT.get(str(player.get("position") or "").upper())
+    if not position:
+        # OpenDota 的 position_est（1~5）是号位估算，STRATZ 直连时才有的
+        # ``position`` 只是同一个东西的另一种写法，两者取到哪个用哪个。
+        estimate = _as_int(player.get("position_est"))
+        if estimate is not None and 1 <= estimate <= 5:
+            position = POSITION_TEXT[f"POSITION_{estimate}"] + "（数据源估算）"
     if position:
         parts.append(position)
     if role:
@@ -1582,37 +1922,40 @@ def _lane_text(player: dict) -> str:
     return " ".join(parts) or "未识别"
 
 
-def curve_points_text(player: dict, minutes: tuple[int, ...] = (10, 20, 30, 40)) -> str:
+def curve_points_text(
+    player: dict, minutes: tuple[int, ...] = (5, 10, 15, 20, 30, 40)
+) -> str:
     """把逐分钟曲线抽成「第 N 分钟累计值」，方便十人横向对比。
 
     与 :func:`summarize_player_curve` 的分工：这里只取几个关键节点，
     用来横向比谁发育快；那里保留完整走势，用来看单人的曲线形状。
+
+    采样点特意从 10 分钟起步改成 **5 分钟起步**：原来的 ``(10, 20, 30, 40)``
+    对线期整段是盲区，而「对线被压了多少」恰恰要靠第 5 分钟这个点才看得出来
+    （第 10 分钟时优势路双人组早就分开了）。30 分钟往后保留是为了长局。
     """
     bits: list[str] = []
-    gold = player.get("gold_t")
-    if isinstance(gold, list) and gold:
+    series = [
+        ("gold_t", "金钱累计"),
+        ("lh_t", "补刀累计"),
+        ("xp_t", "经验累计"),
+    ]
+    # 反补只在自己确实反补过时才输出，否则十行尾巴上全是「反补累计 0」。
+    denies = player.get("dn_t")
+    if isinstance(denies, list) and denies and any(
+        isinstance(item, (int, float)) and item for item in denies
+    ):
+        series.append(("dn_t", "反补累计"))
+    for key, title in series:
+        values = player.get(key)
+        if not isinstance(values, list) or not values:
+            continue
         points = []
         for minute in minutes:
-            if minute < len(gold):
-                points.append(f"{minute}m {fmt_k(gold[minute])}")
+            if minute < len(values):
+                points.append(f"{minute}m {fmt_k(values[minute])}")
         if points:
-            bits.append("金钱累计 " + " / ".join(points))
-    lh = player.get("lh_t")
-    if isinstance(lh, list) and lh:
-        points = []
-        for minute in minutes:
-            if minute < len(lh):
-                points.append(f"{minute}m {fmt_k(lh[minute])}")
-        if points:
-            bits.append("补刀累计 " + " / ".join(points))
-    xp = player.get("xp_t")
-    if isinstance(xp, list) and xp:
-        points = []
-        for minute in minutes:
-            if minute < len(xp):
-                points.append(f"{minute}m {fmt_k(xp[minute])}")
-        if points:
-            bits.append("经验累计 " + " / ".join(points))
+            bits.append(title + " " + " / ".join(points))
     return "；".join(bits)
 
 
@@ -1738,6 +2081,9 @@ def build_match_data_text(
         )
     _parsed, _parsed_note = parsed_state(match)
     lines.append(f"数据完整度: {_parsed_note}")
+    integrity = match_integrity_text(match)
+    if integrity:
+        lines.append(integrity)
 
     # 阵容
     lines.append("")
@@ -1797,6 +2143,13 @@ def build_match_data_text(
             lines.append("=== 关键事件时间轴 ===")
             lines.extend(events)
 
+    # 对局内手打聊天：能解释「这局队内是不是出了状况」，拿不到就不占篇幅
+    chat_lines = chat_text(match, heroes)
+    if chat_lines:
+        lines.append("")
+        lines.append("=== 对局内聊天（仅手打消息）===")
+        lines.extend(chat_lines)
+
     # 团战：带上英雄/玩家映射，才能说清「哪场团战谁先死、焦点玩家打出了什么」
     fights = summarize_teamfights(
         match.get("teamfights") or [],
@@ -1846,6 +2199,26 @@ def build_match_data_text(
         lines.append("")
         lines.append("=== 发育节奏节点对比（累计值，可横向比发育速度）===")
         lines.extend(comparison)
+
+    # 同英雄分位：把「这个发挥算好还是一般」变成可核对的百分比。
+    # 放在这里而不是塞进「十人数据」行尾，是为了让十行的口径说明只出现一次。
+    digests = []
+    for player in sorted(players, key=lambda p: int(p.get("player_slot") or 0)):
+        digest = benchmark_digest(player)
+        if digest:
+            digests.append(
+                f"{('天辉' if is_radiant(player.get('player_slot')) else '夜魇')} "
+                f"{hname(heroes, player.get('hero_id'))}"
+                f"（{player.get('name') or player.get('account_id')}）: {digest}"
+            )
+    if digests:
+        lines.append("")
+        lines.append(
+            "=== 同英雄分位概览（拿每人与所有玩同一个英雄的玩家比，"
+            "百分比 = 优于多少比例的人，越高越好；"
+            "「生存」由死亡频率反向而来，越高代表死得越少）==="
+        )
+        lines.extend(digests)
 
     # 全员视野：判断「哪边视野做得好、辅助有没有干活」的直接证据
     ward_rows = []
@@ -1940,6 +2313,21 @@ def _int_or_dash(value: Any) -> str:
         return str(int(value))
     except (TypeError, ValueError):
         return "-"
+
+
+def _as_int(value: Any) -> int | None:
+    """能转成 int 就返回，否则返回 ``None``。
+
+    与 :func:`_int_or_dash` 的分工：那个是给「要显示成文本」的场景用的，
+    这个给「要拿去做判断」的场景用 —— ``None`` 与 ``0`` 必须能区分开，
+    否则「数据源没给这个字段」会被当成「确实是 0」。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _pct_or_dash(value: Any, digits: int = 1) -> str:
@@ -2047,6 +2435,22 @@ def _focus_detail_lines(
     这里的原则是**把解析产物榨干**：凡是能影响「这名玩家打得怎么样」判断的
     字段，只要数据源给了，就都翻成可读文本喂进去。整段都是「有则输出、
     无则跳过」，所以未解析的比赛不会出现半截空小节。
+
+    但有几类字段**故意不渲染** —— 本仓库钉不死它们的口径，而猜错会被报告
+    原样写成结论：
+
+    * ``lane_kills``：看着像「对线期击杀」，样本 ``8995536921`` 却两边都对不上
+      —— Ogre Magi 全场只有 4 个人头却记了 ``lane_kills=17``；Meepo 第 10 分钟
+      已经补了 53 刀，``lane_kills`` 却只有 28。既不是人头也不是对线补刀，
+      在没有能证伪的口径之前不写。
+    * ``lane_pos`` / ``obs`` / ``sen`` 坐标网格：用夜魇（基地在右上）与天辉
+      （基地在左下）两组玩家的坐标重心验证过，两边半区分不开，坐标约定拿不到
+      证据，换算成「他 60% 时间在自家野区」这种话就是编的。
+    * ``runes`` / ``runes_log`` 的符文**类型**：见 :func:`rune_times_text`，
+      只输出时间点。
+    * ``permanent_buffs``：``permanent_buff`` 是引擎内部 id，样本里出现过
+      2/12/16/22 四种取值，没有可信对照表；神杖/魔晶/月之碎片几个已知的
+      已经由 ``aghanims_scepter`` 等专用字段渲染过了。
     """
     lines: list[str] = []
     lines.append(
@@ -2085,6 +2489,19 @@ def _focus_detail_lines(
         f"分路: {_lane_text(focus)}　"
         f"补刀效率 {lane_efficiency_text(focus)}"
     )
+    # 操作频率：APM 高通常意味着更主动（也可能只是无效操作），交给模型结合
+    # 参团率与击杀一起判断，这里只给数字。
+    apm = _as_int(focus.get("actions_per_min"))
+    if apm is not None:
+        lines.append(f"操作频率(APM): {apm}")
+
+    # ---- 同英雄分位：全篇唯一的外部参照系 --------------------------
+    bench = benchmark_text(focus)
+    if bench:
+        lines.append(
+            "同英雄分位（拿他与所有玩同一个英雄的玩家比，百分比 = 优于多少比例的人，"
+            "越高越好；「死亡频率」已按「越低越好」反向）: " + bench
+        )
 
     # ---- 经济与经验：钱和经验到底从哪来 ------------------------------
     gold_from = _breakdown_text(focus.get("gold_reasons"), 6, labels=GOLD_REASONS)
@@ -2108,6 +2525,9 @@ def _focus_detail_lines(
             money_bits.append(f"{label} {fmt_num(value)}")
     if money_bits:
         lines.append("　".join(money_bits))
+    farm = farm_detail_text(focus)
+    if farm:
+        lines.append(farm)
 
     # ---- 输出 / 承伤构成：判断「他到底在打谁、被谁打」----------------
     dealt_by_ability = _breakdown_text(
@@ -2141,6 +2561,9 @@ def _focus_detail_lines(
             f"{ability_label(max_hit.get('inflictor'))} → "
             f"{hname_by_npc(heroes, max_hit.get('key'))}）"
         )
+    healing = healing_breakdown(focus, heroes)
+    if healing:
+        lines.append(healing)
 
     # ---- 击杀网络 -------------------------------------------------
     killed = focus.get("killed")
@@ -2177,6 +2600,12 @@ def _focus_detail_lines(
     wards = summarize_wards(focus, heroes)
     if wards:
         lines.append("视野: " + wards)
+    ward_economy = ward_economy_text(focus)
+    if ward_economy:
+        lines.append(ward_economy)
+    runes = rune_times_text(focus)
+    if runes:
+        lines.append(runes)
 
     # ---- 技能与道具 ------------------------------------------------
     build = summarize_ability_build(focus, ability_names)
@@ -3029,6 +3458,23 @@ def match_quality_block(match: dict) -> str:
     average_rank = match.get("average_rank")
     if average_rank:
         rows.append(f"双方平均段位: {rank_text(average_rank)}")
+    # computed_mmr：数据源给部分玩家估的 MMR。段位字段经常整局都缺，这个能补上
+    # 「这局是什么水平的对局」；只有个别玩家有值时按已有的人取平均并说明样本数，
+    # 不能让人以为是全队平均。
+    mmr_sides: list[str] = []
+    for side, members in sides.items():
+        values = [
+            float(value)
+            for member in members
+            if (value := member.get("computed_mmr")) is not None
+        ]
+        if values:
+            mmr_sides.append(
+                f"{side} 约 {sum(values) / len(values):.0f}"
+                f"（{len(values)}/{len(members)} 人有估值）"
+            )
+    if mmr_sides:
+        rows.append("数据源估算 MMR: " + "　".join(mmr_sides))
     human = match.get("human_players")
     if human is not None:
         rows.append(f"真人玩家数: {human}/10")
@@ -3038,4 +3484,7 @@ def match_quality_block(match: dict) -> str:
         rows.append(f"联赛对局: leagueid={league}" + (f" series_id={series}" if series else ""))
     if match.get("pre_game_duration"):
         rows.append(f"赛前准备时长: {fmt_duration(match.get('pre_game_duration'))}")
+    integrity = match_integrity_text(match)
+    if integrity:
+        rows.append(integrity)
     return "\n".join(rows)
