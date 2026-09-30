@@ -606,9 +606,9 @@ class StratzClient:
             if isinstance(core, dict):
                 try:
                     rank_num = int(core.get("rank"))
-                    # STRATZ 的 rank 是 1~80 的「星级*10+段位」，转成 OpenDota 的
+                    # STRATZ 的 rank 是 1~80 的「段位*10+星级」，转成 OpenDota 的
                     # rank_tier（十位=段位、个位=星级）。STRATZ 的 rank 本身就是
-                    # 这个编码（如 42 = 传奇 2 星），可直接用。
+                    # 这个编码（如 42 = 统帅 2 星 = Archon II），可直接用。
                     rank_tier = rank_num
                 except (TypeError, ValueError):
                     rank_tier = None

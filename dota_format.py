@@ -112,16 +112,21 @@ BENCHMARK_DIGEST: tuple[tuple[str, str], ...] = (
     ("deaths_per_min", "生存"),
 )
 
+#: 8 档奖章的中文名（**报告里显示的就是这一套**）。
+#:
+#: 用的是国服官方译名：先锋 / 卫士 / 中军 / 统帅 / 传奇 / 万古流芳 / 超凡入圣 /
+#: 冠绝一世（2026-09-30 用户确认）。早期译名（守卫 / 十字军 / 执政官 / 神圣 /
+#: 不朽）在 :data:`RANK_MEDAL_ALIASES` 里仍认，但**不再出现在渲染结果里**。
 RANK_MEDALS: list[str] = [
     "无段位",
     "先锋 Herald",
-    "守卫 Guardian",
-    "十字军 Crusader",
-    "执政官 Archon",
+    "卫士 Guardian",
+    "中军 Crusader",
+    "统帅 Archon",
     "传奇 Legend",
     "万古流芳 Ancient",
-    "神圣 Divine",
-    "不朽 Immortal",
+    "超凡入圣 Divine",
+    "冠绝一世 Immortal",
 ]
 
 OBJECTIVE_HINTS: dict[str, str] = {
@@ -482,7 +487,7 @@ def mode_text(match: dict) -> str:
 
 
 def rank_text(rank_tier: Any) -> str:
-    """rank_tier 数值 → ``不朽 Immortal`` 之类的段位描述。"""
+    """rank_tier 数值 → ``冠绝一世 Immortal`` 之类的段位描述。"""
     try:
         tier = int(rank_tier)
     except (TypeError, ValueError):
@@ -507,12 +512,17 @@ def rank_text(rank_tier: Any) -> str:
 #:
 #: 所以口径必须由插件下发，并且要写清「同一档的不同名字指同一个东西、都真实存在」，
 #: 否则用户换个叫法问一次，它又答错一次。
+#:
+#: **命名口径（2026-09-30 用户确认）**：主名称用国服官方译名那一套（见
+#: :data:`RANK_MEDALS`），早期译名——守卫 / 十字军 / 执政官 / 神圣 / 不朽——
+#: 降为别名。两套名字都认（用户嘴里可能还是旧叫法），但**报告里渲染出来的、
+#: 模型在正文里看到的**只有主名称那一套。
 RANK_MEDAL_ALIASES: dict[str, tuple[str, ...]] = {
-    "守卫 Guardian": ("卫士",),
-    "十字军 Crusader": ("中军",),
-    "执政官 Archon": ("统帅",),
-    "神圣 Divine": ("超凡入圣",),
-    "不朽 Immortal": ("冠绝一世",),
+    "卫士 Guardian": ("守卫",),
+    "中军 Crusader": ("十字军",),
+    "统帅 Archon": ("执政官",),
+    "超凡入圣 Divine": ("神圣",),
+    "冠绝一世 Immortal": ("不朽",),
 }
 
 
@@ -529,7 +539,7 @@ def rank_guide_text() -> str:
     return (
         "Dota2 天梯段位 = 8 档奖章，每档 1★~5★（最高档没有星，只有区服排名）："
         + " / ".join(parts)
-        + "。写法形如「执政官 2★」= Archon II，本插件报告用的就是这个口径。"
+        + "。写法形如「统帅 2★」= Archon II，本插件报告用的就是这个口径。"
         "**同一档在不同资料里中文叫法不同，它们是同一个段位、都真实存在** ——"
         "用户问「有没有某某段位」时先在表里找，找得到就是有；"
         "不要因为这个名字你没见过就说「没有这回事」。"
