@@ -36,6 +36,19 @@
 
 ## 安装
 
+### 方式一：在插件市场在线安装（推荐）
+
+AstrBot WebUI →「插件管理」→「插件市场」→ 搜索 **Dota2 数据查询助手** → 点安装。
+装完在「插件管理」里重载即可。后续版本更新也能在同一页点更新。
+
+### 方式二：命令行导入
+
+```
+/plugin i https://github.com/mml-hrb/astrbot-plugin-dota2matches
+```
+
+### 方式三：手动放置
+
 1. 把 `astrbot_plugin_dota2` 整个目录放进 AstrBot 的 `data/plugins/` 下；
 2. 在 AstrBot WebUI 的「插件管理」里重载插件（让它出现在插件列表）；
 3. 打开插件配置，按需填写——**全部留空也能正常使用**，常见需要填的只有两项：
