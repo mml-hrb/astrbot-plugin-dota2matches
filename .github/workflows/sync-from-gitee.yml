@@ -1,11 +1,12 @@
 name: 从 Gitee 同步
 
-# Gitee 是本仓库的主仓库（origin），GitHub 侧是只读镜像。
+# Gitee 是本仓库的主仓库，GitHub 侧是只读镜像。
 # 每次 Gitee 有更新，本 workflow 就会把提交（含标签）拉到 GitHub 保持一致。
 #
-# 首次启用：本地提交本文件后，先手动 push 一次到 GitHub
-#   git push github main
-# 否则 workflow 不会存在于 GitHub 上，也就无从触发。
+# 注意：actions/checkout 只配好 `origin` 这一个 remote，且带认证头。
+# 想往 GitHub 自己推，必须用 `origin`（**不要写 `github`**，
+# checkout 不会创建这个 remote，写了必然 "fatal: 'github' does not appear to be a git repository"）。
+# 往 Gitee 拉才需要自己 `git remote add gitee`。
 
 on:
   schedule:
@@ -14,10 +15,10 @@ on:
   workflow_dispatch: # 手动触发，调试用
 
 permissions:
-  contents: write # 推送需要
+  contents: write # 往 origin 推送需要
 
 concurrency:
-  # 同一分支只允许一个同步任务在跑，避免定时与手动触发撞车互相覆盖
+  # 同一时间只允许一个同步任务在跑，避免定时与手动触发撞车互相覆盖
   group: sync-from-gitee
   cancel-in-progress: false
 
@@ -29,47 +30,69 @@ jobs:
       - name: 检出仓库（完整历史）
         uses: actions/checkout@v4
         with:
-          # 必须拉全历史与全部分支/标签，否则下面的 force push 会丢东西
+          # 必须拉全历史，否则下面的 force push 会丢提交
           fetch-depth: 0
           ref: main
 
       - name: 配置 Gitee 远程
-        run: git remote add gitee https://gitee.com/Mml3289469099/astrbot-plugin-dota2matches.git
-
-      - name: 配置 Gitee 访问凭据
-        # Gitee 仓库是公开的，默认不需要任何凭据。
-        # 若将来转私有，在仓库 Secrets 里加一个 GITEE_TOKEN（Gitee 的私人令牌，勾只读权限即可）。
-        # 绝不能在 secret 缺失时硬塞认证头——那会生成一个无效 token 把公开拉取也搞挂。
-        if: ${{ secrets.GITEE_TOKEN != '' }}
         run: |
-          git config http.https://gitee.com/.extraheader "AUTHORIZATION: basic $(printf 'x-access-token:%s' '${{ secrets.GITEE_TOKEN }}' | base64 -w0)"
+          git remote add gitee https://gitee.com/Mml3289469099/astrbot-plugin-dota2matches.git
+          git remote -v
+
+      - name: 配置 Gitee 访问凭据（仅当设置了 GITEE_TOKEN）
+        # Gitee 仓库是公开的，默认不需要凭据，能匿名 fetch。
+        # 若将来转私有，在仓库 Settings → Secrets 里加 GITEE_TOKEN（Gitee 私人令牌，只读权限即可）。
+        #
+        # ⚠️ 这里必须先落到 env、再在 shell 里判断，**不能**写成
+        #    `if: ${{ secrets.GITEE_TOKEN != '' }}`：
+        # step 级 if 的可用上下文只有 github / needs / strategy / matrix / inputs / vars，
+        #    **不含 secrets**。那样写会让整个 workflow 在语法解析阶段就失败，
+        #    表现为每次运行都是 “Invalid workflow file … Unrecognized named-value: 'secrets'"，
+        #    一步都不会执行。
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          if [ -n "$GITEE_TOKEN" ]; then
+            git config http.https://gitee.com/.extraheader \
+              "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITEE_TOKEN" | base64 -w0)"
+            echo "已使用 GITEE_TOKEN 配置 Gitee 凭据"
+          else
+            echo "未设置 GITEE_TOKEN，按匿名方式拉取公开仓库"
+          fi
 
       - name: 拉取 Gitee 提交与标签
         run: |
           git fetch gitee '+refs/heads/*:refs/remotes/gitee/*' --tags --force --prune
+          echo "--- Gitee 分支 ---"
+          git branch -r | grep gitee/ || echo "(无)"
 
       - name: 同步主分支到 GitHub
         run: |
-          # 镜像语义：GitHub 无独立改动，一律以 Gitee 为准。
-          # --force 是有意的——GitHub 侧只读，不接受 Gitee 改写历史的情况。
-          git push github '+refs/remotes/gitee/main:refs/heads/main' --force
+          # 镜像语义：GitHub 侧不接受独立改动，一律以 Gitee 为准，
+          # 所以 --force 是有意的（用于 Gitee 改写历史的场景）。
+          # 用 origin（checkout 自带认证），不要用 github（不存在该 remote）。
+          git push origin '+refs/remotes/gitee/main:refs/heads/main' --force
 
       - name: 同步其他分支与标签
         if: always()
         continue-on-error: true
         run: |
-          # 非主分支同步失败不应让整个任务变红（可能有分支只存在于本地）
-          git push github 'refs/remotes/gitee/*:refs/heads/*' --force
-          git push github --tags --force
+          # 非主分支 / 标签同步失败不应让整个任务变红（可能有分支只存在于本地）
+          git push origin 'refs/remotes/gitee/*:refs/heads/*' --force
+          git push origin --tags --force
 
       - name: 汇总结果
         if: always()
+        env:
+          GITEE_HEAD: ${{ github.sha }}
         run: |
-          echo "### 同步完成" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- 时间：$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Gitee 侧 HEAD：$(git rev-parse --short gitee/main)" >> "$GITHUB_STEP_SUMMARY"
-          echo "- GitHub 侧 HEAD：$(git rev-parse --short HEAD)" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "最近提交：" >> "$GITHUB_STEP_SUMMARY"
-          git log --oneline -10 gitee/main >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### 同步完成"
+            echo
+            echo "- 时间：$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "- Gitee 侧 HEAD：$(git rev-parse --short gitee/main 2>/dev/null || echo '取不到')"
+            echo "- 本次运行的起点：$(git rev-parse --short HEAD)"
+            echo
+            echo "最近提交（Gitee main）："
+            git log --oneline -10 gitee/main 2>/dev/null || echo "(取不到)"
+          } >> "$GITHUB_STEP_SUMMARY"
