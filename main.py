@@ -1343,11 +1343,26 @@ class Dota2Plugin(Star):
 
     @staticmethod
     def _resolve_data_dir() -> Path:
-        """获取插件数据目录（优先使用 AstrBot 规范的 plugin_data 目录）。"""
+        """获取插件数据目录（优先使用 AstrBot 规范的 plugin_data 目录）。
+
+        正常路径是 ``AstrBot/data/plugin_data/astrbot_plugin_dota2/``。取不到时
+        回退到插件目录下的 ``data/``（本地开发、把插件直接放进 plugins/ 跑时
+        会走到这里），该目录已被 .gitignore 排除，不会进版本库。
+
+        回退不是静默的：``exc_info=True`` 把完整调用栈打进日志，否则这里
+        只会留一句「回退到插件目录」，看到的人无从判断是路径权限、插件目录
+        只读，还是 AstrBot 版本差异导致的 API 缺失。**排查失败原因请看这条
+        warning 的堆栈**，修好环境后应重新加载插件让目录回到规范位置。
+        """
         try:
             return Path(StarTools.get_data_dir(PLUGIN_NAME))
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[dota2] 无法获取标准数据目录，回退到插件目录: {e}")
+            logger.warning(
+                f"[dota2] 无法获取标准数据目录（{type(e).__name__}: {e}），"
+                f"回退到插件目录 data/。绑定关系等本机状态将存在插件目录下——"
+                f"若 AstrBot 重装或清理插件目录会一并丢失，长期使用建议排查上方堆栈。",
+                exc_info=True,
+            )
             fallback = Path(__file__).resolve().parent / "data"
             fallback.mkdir(parents=True, exist_ok=True)
             return fallback

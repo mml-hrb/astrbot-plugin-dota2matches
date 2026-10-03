@@ -41,13 +41,12 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
-from dota_format import hname, summarize_hero_history
+from astrbot.api import logger
 
-logger = logging.getLogger("astrbot")
+from dota_format import hname, summarize_hero_history
 
 __all__ = [
     "GAME_MODE_TURBO",
