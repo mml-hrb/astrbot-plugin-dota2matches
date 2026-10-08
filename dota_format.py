@@ -1913,8 +1913,10 @@ def _player_row(
             f"Lv{player.get('level', '-')} | {kda} KDA{fmt_float(player.get('_kda', 0))} "
             f"| 净经济{net} GPM{player.get('gold_per_min', '-')}/XPM{player.get('xp_per_min', '-')} "
             f"| 补刀{player.get('last_hits', '-')}/{player.get('denies', '-')} "
-            f"| 英雄伤害{fmt_num(player.get('hero_damage', 0))} 塔伤{fmt_num(player.get('tower_damage', 0))} "
-            f"治疗{fmt_num(player.get('hero_healing', 0))} | 参团率{tf_text} "
+            # 伤害三项同样**不能用 0 兜底**：未解析时字段缺失，写成 0 会让
+            # 模型以为「他真的零伤害、零建筑输出」。缺失 → `-`。
+            f"| 英雄伤害{fmt_num(player.get('hero_damage'))} 塔伤{fmt_num(player.get('tower_damage'))} "
+            f"治疗{fmt_num(player.get('hero_healing'))} | 参团率{tf_text} "
             f"| 控制{_num_or_dash(player.get('stuns'), 1, suffix='s')} "
             f"假眼{_int_or_dash(player.get('obs_placed'))}/真眼{_int_or_dash(player.get('sen_placed'))} "
             f"| 出装: {', '.join(inventory) or '-'}"
@@ -2486,6 +2488,10 @@ def _focus_detail_lines(
     字段，只要数据源给了，就都翻成可读文本喂进去。整段都是「有则输出、
     无则跳过」，所以未解析的比赛不会出现半截空小节。
 
+    ⚠️ **「没给」绝不能渲染成「0」**。实测踩过：伤害三件套用 ``or 0`` 兜底，
+    未解析的对局就变成「建筑伤害 0」，模型照着写出「零推进贡献」这种负面评价。
+    因此：缺失一律 ``-``，真 0 才写 ``0``；一整行全是 ``-`` 的行干脆不出。
+
     但有几类字段**故意不渲染** —— 本仓库钉不死它们的口径，而猜错会被报告
     原样写成结论：
 
@@ -2519,22 +2525,40 @@ def _focus_detail_lines(
         f"净经济 {fmt_num(focus.get('net_worth') or focus.get('total_gold') or 0)} "
         f"补刀 {focus.get('last_hits')} 反补 {focus.get('denies')}"
     )
-    lines.append(
-        f"英雄伤害 {fmt_num(focus.get('hero_damage') or 0)} "
-        f"建筑伤害 {fmt_num(focus.get('tower_damage') or 0)} "
-        f"治疗 {fmt_num(focus.get('hero_healing') or 0)}"
-    )
-    lines.append(
-        f"参团率 {_pct_or_dash(focus.get('teamfight_participation'))} "
-        f"控制时长 {_num_or_dash(focus.get('stuns'), 1, suffix='s')} "
-        f"击杀建筑 {focus.get('towers_killed', '-')} 击杀肉山 {focus.get('roshans_killed', '-')}"
-    )
-    lines.append(
-        f"假眼 {_int_or_dash(focus.get('obs_placed'))} 真眼 {_int_or_dash(focus.get('sen_placed'))} "
-        f"堆野 {_int_or_dash(focus.get('camps_stacked'))} "
-        f"吃符 {_int_or_dash(focus.get('rune_pickups'))} "
-        f"信使击杀 {focus.get('courier_kills', '-')}"
-    )
+    # 伤害三件套：**「没给」必须与「确实是 0」分开**。
+    # 未解析的对局里这三个字段数据源根本不返回（实测 9033548881：OpenDota 已解析，
+    # 而 STRATZ 通道未解析，字段缺失），早期实现用 `or 0` 兜底，于是渲染出
+    # 「建筑伤害 0」—— 模型把假 0 当真，写出「零推进贡献 / 没能对建筑造成伤害」
+    # 这类负面评价，挤掉了真正的原因。现在缺失一律是 `-`，真 0 才写 0；
+    # 三个都缺失时整行不输出（不给「没数据」留任何被点评的把手）。
+    hero_damage = fmt_num(focus.get("hero_damage"))
+    tower_damage = fmt_num(focus.get("tower_damage"))
+    healing = fmt_num(focus.get("hero_healing"))
+    if "-" != hero_damage or "-" != tower_damage or "-" != healing:
+        lines.append(
+            f"英雄伤害 {hero_damage} 建筑伤害 {tower_damage} 治疗 {healing}"
+        )
+    # 下面两行同理：未解析时它们会退化成「参团率 - 控制时长 - 击杀建筑 - 击杀肉山 -」
+    # 与一整行 `-`。整行都没有真数据时不出这一行 —— 否则模型会对着 `-` 写
+    # 「他本场基本没做视野 / 抢符堆野都没做」，那是把「没数据」当成「没做」。
+    tf_part = _pct_or_dash(focus.get("teamfight_participation"))
+    stun_part = _num_or_dash(focus.get("stuns"), 1, suffix="s")
+    tower_kills = _int_or_dash(focus.get("towers_killed"))
+    roshan_kills = _int_or_dash(focus.get("roshans_killed"))
+    if any(v != "-" for v in (tf_part, stun_part, tower_kills, roshan_kills)):
+        lines.append(
+            f"参团率 {tf_part} 控制时长 {stun_part} "
+            f"击杀建筑 {tower_kills} 击杀肉山 {roshan_kills}"
+        )
+    ward_fields = [
+        ("假眼", _int_or_dash(focus.get("obs_placed"))),
+        ("真眼", _int_or_dash(focus.get("sen_placed"))),
+        ("堆野", _int_or_dash(focus.get("camps_stacked"))),
+        ("吃符", _int_or_dash(focus.get("rune_pickups"))),
+        ("信使击杀", _int_or_dash(focus.get("courier_kills"))),
+    ]
+    if any(value != "-" for _label, value in ward_fields):
+        lines.append(" ".join(f"{label} {value}" for label, value in ward_fields))
     lines.append(
         f"分路: {_lane_text(focus)}　"
         f"补刀效率 {lane_efficiency_text(focus)}"
