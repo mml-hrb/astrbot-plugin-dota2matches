@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -235,8 +236,8 @@ def build_tool_specs(*, include_write: bool = True) -> list[dict]:
             "查询某位玩家最近的 Dota2 对局：逐场明细（时间 / 英雄 / 胜负 / KDA / "
             "位置 / 模式）加汇总统计（胜率、场均 KDA、GPM、位置分布、组队情况）。"
             "问「他最近打得怎么样」「谁最菜」时用。只查一个人，多个人要分别调用。"
-            "用户**明确说了时间范围**（「这三天」「最近一周」「这两天」）时必须填 days，"
-            "否则你会把好几天前的局当成这段时间的成绩。",
+            "用户**明确说了时间范围**（「这三天」「最近一周」「昨天」）时必须填 "
+            "days 或 day_offset，否则你会把好几天前的局当成这段时间的成绩。",
             {
                 "player": _PLAYER_PROP,
                 "count": {
@@ -246,9 +247,20 @@ def build_tool_specs(*, include_write: bool = True) -> list[dict]:
                 "days": {
                     "type": "integer",
                     "description": (
-                        "只看**最近几天**的对局（含今天）。用户说了时间范围才填："
-                        "「这三天 / 最近三天」填 3，「最近一周」填 7，「这两天」填 2；"
-                        "用户没提时间就别填（此时按最近 N 场统计）。"
+                        "只看**最近几天**的对局（**含今天**）。用户说了「一段范围」才填："
+                        "「这三天 / 最近三天」填 3，「最近一周」填 7，「这两天」填 2。"
+                        "**「昨天」不要填这里** —— days=1 指的是「今天」；"
+                        "说「昨天 / 前天 / 大前天 / N 天前某一天」请用 day_offset。"
+                        "用户没提时间就两个都别填（此时按最近 N 场统计）。"
+                    ),
+                },
+                "day_offset": {
+                    "type": "integer",
+                    "description": (
+                        "指定**某一天**：0=今天、1=**昨天**、2=前天、3=大前天（N 天前）。"
+                        "那一整天按**凌晨 4 点**起算（熬夜打到凌晨的局算前一天）。"
+                        "用户说「昨天」就填 1、「前天」填 2。**「昨天」必须用它**，"
+                        "不能用 days（days=1 是今天，会把昨天整天漏掉）。"
                     ),
                 },
             },
@@ -274,9 +286,19 @@ def build_tool_specs(*, include_write: bool = True) -> list[dict]:
                 "days": {
                     "type": "integer",
                     "description": (
-                        "只看**最近几天**的对局（含今天）。用户说了时间范围才填："
-                        "「这三天 / 最近三天 / 这三天」填 3，「最近一周」填 7，"
-                        "「昨天」填 1；用户没提时间就别填（此时按最近 N 场统计）。"
+                        "只看**最近几天**的对局（**含今天**）。用户说了「一段范围」才填："
+                        "「这三天 / 最近三天」填 3，「最近一周」填 7，「这两天」填 2。"
+                        "**「昨天」不要填这里** —— days=1 指的是「今天」，会把昨天整天"
+                        "漏掉；说「昨天 / 前天 / 大前天」请用 day_offset。"
+                        "用户没提时间就两个都别填（此时按最近 N 场统计）。"
+                    ),
+                },
+                "day_offset": {
+                    "type": "integer",
+                    "description": (
+                        "指定**某一天**：0=今天、1=**昨天**、2=前天、3=大前天（N 天前），"
+                        "按**凌晨 4 点**起算的那一整个游戏日。用户说「昨天谁打得好」"
+                        "就填 1。**「昨天」必须用它**不能用 days。"
                     ),
                 },
                 "count": {
@@ -524,6 +546,75 @@ def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
     return text[:limit].rstrip() + "\n…（内容过长，已截断）"
 
 
+def _resolve_tool_window(
+    args: dict, now: float | None
+) -> "dota_chat.TimeWindow | None":
+    """工具参数 → 时间窗口。**``day_offset`` 优先于 ``days``。**
+
+    * ``day_offset``（0/1/2/3）= 「今天 / 昨天 / 前天 / 大前天」那一**整个游戏日**；
+    * ``days``（N）= 「最近 N 天（**含今天**）」。
+
+    两者都能表达「最近 N 天」，但**只有 ``day_offset`` 能表达「昨天」**——
+    ``days=1`` 是今天。2026-10-08 的真事：模型想表达「昨天」填了 ``days=1``，
+    窗口落到今天、查出 0 场，回了「昨天没查到你有开打的记录」（实际打了 10 场）。
+    """
+    raw_offset = args.get("day_offset")
+    if raw_offset is not None and str(raw_offset).strip() != "":
+        try:
+            value = int(raw_offset)
+        except (TypeError, ValueError):
+            value = None
+        if value is not None and 0 <= value <= 30:
+            window = dota_chat.day_offset_window(value, now)
+            if window is not None:
+                return window
+    days = _clamp_int(args.get("days"), default=0, low=0, high=30)
+    return dota_chat.recent_days_window(days, now) if days else None
+
+
+def _window_blank_note(
+    name: str,
+    window: "dota_chat.TimeWindow",
+    matches: list[dict],
+    now: float | None,
+) -> str:
+    """窗口内一场都没有时的回话。
+
+    除了「这段时间没记录」，还必须**告诉模型最近一场是什么时候**，并**明令它
+    不要替用户猜原因** —— 否则它会自己编一个解释（2026-10-08 真事：回了
+    「昨天没查到你有开打的记录。**是不是熬夜打到凌晨过了四点？**那时候系统就
+    划到今天算啦」，纯属脑补，用户看到的是一句假话）。
+    """
+    lines = [
+        f"{name} 在{window.describe()}内没有对局记录"
+        "（这份数据是对的，就是**这段时间**他没打）。"
+    ]
+    newest = None
+    for row in matches:
+        try:
+            ts = int(row.get("start_time") or 0)
+        except (TypeError, ValueError):
+            continue
+        if ts and (newest is None or ts > newest):
+            newest = ts
+    if newest:
+        current = float(now) if now is not None else time.time()
+        hours = max(0, int((current - newest) // 3600))
+        stamp = time.strftime("%m-%d %H:%M", time.localtime(newest))
+        lines.append(
+            f"（手上另有最近 {len(matches)} 场其它时段的记录，未计入本次统计；"
+            f"最近一场是 {stamp}，约 {hours} 小时前）"
+        )
+    else:
+        lines.append("（手上也没有它其它时段的记录。）")
+    lines.append(
+        "**如实说这段时间没有记录就行，不要替用户猜原因** —— 别猜「是不是熬夜"
+        "打到凌晨过了四点」「是不是没登录」这类话，也不要把口径改成「你最近没打」"
+        "（他问的只是那一个时间段）；可以顺手提一句最近一场是什么时候。"
+    )
+    return "\n".join(lines)
+
+
 def parse_arguments(raw: Any) -> dict:
     """把模型给的参数解析成字典（容错：非法 JSON 一律当空参数）。"""
     if isinstance(raw, dict):
@@ -617,9 +708,9 @@ async def _tool_list_players(args: dict, ctx: ToolContext) -> str:
 async def _tool_query_matches(args: dict, ctx: ToolContext) -> str:
     account_id, name = await _person(args, ctx)
     count = _clamp_int(args.get("count"), default=10, low=1, high=MAX_MATCHES_PER_CALL)
-    # days 缺省 0 = 不限时间（按最近 N 场统计）。
-    days = _clamp_int(args.get("days"), default=0, low=0, high=30)
-    window = dota_chat.recent_days_window(days, ctx.now or None) if days else None
+    # day_offset（「昨天」这类**单日**）优先，其次 days（「最近 N 天」，含今天）；
+    # 都没给 = 不限时间（按最近 N 场统计）。
+    window = _resolve_tool_window(args, ctx.now or None)
     if window is not None:
         # 有时间范围就放宽取数：默认 10 场常常只覆盖一两天，
         # 说「这三天」时手上可能根本没取全，会得出「他只打了 2 场」这种假否定。
@@ -634,10 +725,7 @@ async def _tool_query_matches(args: dict, ctx: ToolContext) -> str:
     if window is not None:
         scoped = dota_chat.scope_matches(matches, window)
         if not scoped:
-            return (
-                f"{name} 在{window.describe()}内没有对局记录"
-                f"（手上另有最近 {len(matches)} 场其它时段的记录，未计入本次统计）。"
-            )
+            return _window_blank_note(name, window, matches, ctx.now or None)
         scope_note = (
             f"（统计口径：{window.describe()}——手上最近 {len(matches)} 场里"
             f"有 {len(scoped)} 场落在范围内，其余 {len(matches) - len(scoped)} 场不计）"
@@ -723,10 +811,10 @@ async def _tool_compare_players(args: dict, ctx: ToolContext) -> str:
     一旦不一致，比出来的高下就站不住。这里一次取完，口径天然一致。
     """
     count = _clamp_int(args.get("count"), default=10, low=1, high=MAX_MATCHES_PER_CALL)
-    days = _clamp_int(args.get("days"), default=0, low=0, high=30)
-    window = dota_chat.recent_days_window(days, ctx.now or None) if days else None
+    # 同 query_matches：day_offset（「昨天」）优先，其次 days（「最近 N 天」）。
+    window = _resolve_tool_window(args, ctx.now or None)
     if window is not None:
-        # 同 query_matches：默认 10 场往往只覆盖一两天，说「这三天」时
+        # 默认 10 场往往只覆盖一两天，说「这三天」时
         # 手上可能压根没取全，会得出「他就打了 2 场」这种假否定。
         count = max(count, min(dota_chat.WINDOW_FETCH_LIMIT, MAX_MATCHES_PER_CALL))
 
@@ -800,7 +888,12 @@ async def _tool_compare_players(args: dict, ctx: ToolContext) -> str:
             f"{s.name}（{s.error}）" if s.error else f"{s.name}（{period}内 0 场）"
             for s in snapshots
         )
-        return f"{period}内这 {len(snapshots)} 个人都没有可用的对局记录：{detail}。"
+        return (
+            f"{period}内这 {len(snapshots)} 个人都没有可用的对局记录：{detail}。\n"
+            "**如实说这段时间没有记录就行，不要替用户猜原因** —— 别猜「是不是熬夜"
+            "打到凌晨过了四点」「是不是没登录」，也不要把口径改成「最近没人打」"
+            "（他问的只是那一个时间段）。"
+        )
 
     head = (
         f"=== {len(snapshots)} 人横向对比（口径：{window.describe()}）==="
@@ -1301,12 +1394,25 @@ TOOL_GUIDE = """=== 你可以调用工具查数据、也可以调用工具改设
    并行发起的多个调用会一起执行）。
 3. 工具返回的就是插件的真实数据。**只讲工具给过的内容**，不要补充记忆里的
    战绩、段位、数字；工具报错或明确说没取到，就如实说这块没拿到。
+   **没拿到就说没拿到，不要替用户猜原因** —— 别猜「是不是没登录」「是不是熬夜
+   打到凌晨过了四点」这类话，也不要把口径偷偷改成「你最近没打」（他问的可能
+   只是某一个时间段）。
 4. **不要重复调用**同一个工具同一组参数；信息够了就停止调用，直接回答。
 5. **多人横向对比（「谁最惨 / 谁最强 / 昨天谁打得好」「我们昨晚开黑怎么样」）
    一律用 `compare_players` 一次调完**，不要逐个调 `query_matches`。
    它把这些玩家放在**同一个时间范围**里一次取完，直接给你每人的摘要、
    分项排名与「同场局」；逐个查六个人既慢（用户要干等好几分钟），
    各次口径还可能不一致，比出来的高下站不住。
+   **时间范围怎么填（很容易搞错，填错整段结论就作废）：**
+   - 「**昨天 / 前天 / 大前天**」这种**单独某一天**填 `day_offset`
+     （今天=0、昨天=**1**、前天=2）。**不要填 `days`** —— `days=1` 指的是
+     「今天」，会把昨天一整天的局全漏掉，害你答出「昨天没查到记录」这种假话。
+   - 「这三天 / 最近一周 / 这两天」这种**一段范围**才填 `days`（**含今天**）。
+   - 一天的分界是**凌晨 4 点**：熬夜到凌晨 1 点打的局算**前一天**。
+   - 「上周 / 本周 / 上个月」这类**插件没有精确参数**的范围，用最接近的天数
+     （上周≈ 7 天），但**必须在回答里说清你实际统计的是哪一段**
+     （「我按最近 7 天给你算的」），**不要假装刚好就是那一周**。
+   - 没说时间就两个都不填（此时按「最近 N 场」统计）。
 6. 工具回「本次不可用 / 已经连续失败」时就**别再调它了**，换别的数据或直接作答 ——
    那说明数据源整体有问题，重试不会有新结果。
 7. 「谁跟谁一起开黑」是**关系型**结论，单人视角的 `query_matches` 答不了：

@@ -467,6 +467,30 @@ def recent_days_window(days: int, now: float | None = None) -> TimeWindow | None
     return TimeWindow(f"最近 {days} 天", start, today + 86400)
 
 
+def day_offset_window(offset: int, now: float | None = None) -> TimeWindow | None:
+    """「N 天前的那一整个游戏日」窗口（``0``=今天 / ``1``=昨天 / ``2``=前天）。
+
+    这是**工具层表达「昨天 / 前天 / 大前天」的唯一入口**，与
+    :func:`detect_time_window` 里的同名分支共用 :func:`_day_window` 一份算式 ——
+    指令路径与工具路径必须算出同一个窗口，否则同一句话两条路给出不同的数字。
+
+    **为什么不能拿 ``days`` 顶替**：``days`` 的语义是「最近 N 天（**含今天**）」，
+    ``days=1`` 就是**今天**、根本表达不了「昨天」；``days=2`` 又会把今天也算进去。
+
+    2026-10-08 的真事：用户问「我昨天的战绩」，模型照参数描述里那句「『昨天』
+    填 1」填了 ``days=1``，窗口落在**今天**（04:00 起），查到 0 场，于是回了
+    「昨天没查到你有开打的记录」—— 而那天实际打了 10 场（14:55~22:42）。
+    数据源没问题，是工具参数表达不了「昨天」。
+    """
+    try:
+        value = int(offset)
+    except (TypeError, ValueError):
+        return None
+    if value < 0 or value > 30:
+        return None
+    return _day_window(value, rel_day_label_key(value), now)
+
+
 def scope_matches(
     matches: Iterable[dict], window: TimeWindow | None
 ) -> list[dict]:
