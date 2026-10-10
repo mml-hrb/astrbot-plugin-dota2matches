@@ -5,7 +5,7 @@ display_name: Dota2 数据查询助手 # 用于展示的名字（需要 AstrBot 
 # desc 历史上曾被逐代追加到 4091 字，每次热重载都刷一屏。变更记录进 README。
 desc: 基于 STRATZ + OpenDota 双数据源的 Dota2 战绩查询与 AI 分析助手：查战绩与英雄池、看版本强势英雄（轮椅）、单场深度复盘与近期打法分析，比赛结束后自动推送赛后短评。自然语言直接说人话（一句话里要好几件事会自己连着查），改绑定 / 监听 / 定时设置会先发一条确认，等你回「确认」再动手。
 short_desc: 绑定 Dota2 账号即可查战绩、看版本强势英雄（轮椅）、做 AI 单场深度复盘，比赛结束还能自动推送赛后短评。直接说人话就能用，一句话里要好几件事它自己连着查。
-version: v2.7.7 # 插件版本号
+version: v2.7.8 # 插件版本号
 author: 马铭亮 # 作者
 repo: https://github.com/mml-hrb/astrbot-plugin-dota2matches # 插件仓库地址
 astrbot_version: ">=4.5.0"

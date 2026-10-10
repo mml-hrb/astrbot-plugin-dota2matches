@@ -36,7 +36,15 @@ WebUI 的「未来任务」页面里，可以停用、改时间、删除、立�
    ``cron_manager.start()`` 之前，所以本模块的 :meth:`CronBridge.adopt`
    在插件启动时把既有任务「接管」一遍：读出行 → 删行 → 用
    ``add_basic_job`` 原样重建（时间 / 名称 / 负载都照抄），handler 就位。
-   重建后 job_id 会变，这是唯一的副作用 —— 对用户不可见（列表按名称显示）。
+
+   **重建后 job_id 会变，而且它对用户是可见的**（2026-10-10 实测踩到，
+   此前这里误写成「对用户不可见」）。WebUI「未来任务」页上的**立即执行 /
+   删除 / 改时间**全都按 job_id 走（``POST /cron/jobs/{job_id}/run`` →
+   ``db.get_cron_job(job_id)``），页面若还停在重载**之前**拉的那份列表上，
+   点下去就是平台的 ``Job not found``。插件保不住原 id ——
+   ``db.create_cron_job`` 其实收 ``job_id=``，但公开的 ``add_basic_job``
+   没有把它透出来。所以：**每次插件重载 / 重启后，让用户刷新一下 WebUI
+   页面**；想手动触发，优先用插件自己的命令（实时读库，id 永远是对的）。
 
    之所以不直接把 handler 塞进 ``_basic_handlers``：那是私有属性，跨版本
    随时可能改名或改语义。``list_jobs`` / ``delete_job`` / ``add_basic_job``
