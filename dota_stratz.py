@@ -866,6 +866,221 @@ class StratzClient:
         out.sort(key=lambda r: int(r.get("games") or 0), reverse=True)
         return out
 
+    #: 英雄打法数据允许的段位白名单。这几个值会被**直接拼进 GraphQL 查询**
+    #: （枚举字面量不能走变量），所以必须是受控常量而不是调用方传什么用什么。
+    PLAYSTYLE_BRACKETS: tuple[str, ...] = (
+        "DIVINE_IMMORTAL",
+        "LEGEND_ANCIENT",
+        "CRUSADER_ARCHON",
+        "HERALD_GUARDIAN",
+        "ALL",
+    )
+
+    async def get_hero_playstyle(
+        self, hero_id: int, *, bracket: str = "DIVINE_IMMORTAL"
+    ) -> dict:
+        """英雄当前版本的**高分段**打法数据（位置分布 / 出门装 / 鞋子）。
+
+        这几项在 OpenDota 侧**没有等价端点**（``/heroStats`` 没有位置维度、
+        也没有出门装统计），所以本方法只走 STRATZ，组合数据源里没有
+        STRATZ 时由上层如实降级。
+
+        一次查齐三块：它们永远一起用，分三次查只会多打两次网络。
+
+        对线（``laneOutcome``）**故意不在这里查**，见
+        :meth:`get_hero_lane_outcome` 的说明。
+
+        Returns:
+            ``{"bracket", "stats", "starting", "boots"}``，各键都是
+            list（拿不到就是空 list，**不抛**——上层按「这块没有」渲染）。
+        """
+        key = str(bracket or "").strip().upper()
+        if key not in self.PLAYSTYLE_BRACKETS:
+            key = "DIVINE_IMMORTAL"
+        data = await self._gql(
+            """
+            query HeroPlaystyle($heroId: Short!) {
+              heroStats {
+                stats(heroIds: [$heroId], bracketBasicIds: [%s], groupByPosition: true) {
+                  position
+                  matchCount
+                  winCount
+                  cs
+                  level
+                  heroDamage
+                  towerDamage
+                  kills
+                  deaths
+                  assists
+                }
+                itemStartingPurchase(heroId: $heroId, bracketBasicIds: [%s]) {
+                  itemId
+                  instance
+                  wasGiven
+                  matchCount
+                  winCount
+                }
+                itemBootPurchase(heroId: $heroId, bracketBasicIds: [%s]) {
+                  itemId
+                  instance
+                  matchCount
+                  winCount
+                  time
+                }
+              }
+            }
+            """
+            % (key, key, key),
+            {"heroId": int(hero_id)},
+        )
+        block = data.get("heroStats") or {}
+
+        def _rows(name: str) -> list[dict]:
+            rows = block.get(name)
+            return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+        return {
+            "bracket": key,
+            "stats": _rows("stats"),
+            "starting": _rows("itemStartingPurchase"),
+            "boots": _rows("itemBootPurchase"),
+        }
+
+    #: 位置过滤查询（``laneOutcome`` / ``itemFullPurchase``）能接受的
+    #: ``MatchPlayerPositionType``。这些值会被**直接拼进 GraphQL 查询**
+    #: （枚举字面量不能走变量），所以必须是受控白名单。
+    POSITION_IDS: tuple[str, ...] = (
+        "POSITION_1",
+        "POSITION_2",
+        "POSITION_3",
+        "POSITION_4",
+        "POSITION_5",
+    )
+
+    async def get_hero_lane_outcome(
+        self,
+        hero_id: int,
+        *,
+        position: str = "",
+        bracket: str = "DIVINE_IMMORTAL",
+    ) -> list[dict]:
+        """英雄在**某个位置**上的高分段对线结果。
+
+        为什么单独一个方法、还要传 ``position``
+        ----------------------------------------
+        ``laneOutcome`` 返回的是**按对位拆开**的行 —— 实测敌法师在一号位
+        会回 125 行（每行一个 ``heroId2`` 对手，另加 ``week`` 维度），
+        直接求和会得到一个与场次口径**对不上**的数（实测是 ``stats`` 场次的
+        1.5~3 倍，且各位置倍数不一致，说明它的计数单位是「对位」而不是「场」）。
+        所以上层**只拿它算比例**，不折算场次。
+
+        更要命的是：这个接口返回的 ``position`` 字段**不可信** —— 实测斧王
+        （94% 都在三号位）回的行全部标成 ``POSITION_1``。因此**不能**靠读返回
+        行的 ``position`` 来筛位置，必须在请求参数里用 ``positionIds`` 限定。
+        这一个参数经实测是准的（斧王 ``POSITION_3`` 回 34291、``POSITION_1``
+        只回 129），所以本方法是「先由上层算出主位置，再按位置问一次」。
+
+        Args:
+            position: 主位置枚举（``POSITION_1``~``POSITION_5``）。传空或不认识
+                的值时**不加位置过滤**，拿回全部位置的混合数据。
+
+        Returns:
+            行列表（拿不到就是空 list，**不抛**）。
+        """
+        key = str(bracket or "").strip().upper()
+        if key not in self.PLAYSTYLE_BRACKETS:
+            key = "DIVINE_IMMORTAL"
+        pos = str(position or "").strip().upper()
+        pos_filter = ", positionIds: [%s]" % pos if pos in self.POSITION_IDS else ""
+        data = await self._gql(
+            """
+            query HeroLane($heroId: Short!) {
+              heroStats {
+                laneOutcome(heroId: $heroId, isWith: false, bracketBasicIds: [%s]%s) {
+                  week
+                  position
+                  matchCount
+                  winCount
+                  lossCount
+                  drawCount
+                  stompWinCount
+                  stompLossCount
+                }
+              }
+            }
+            """
+            % (key, pos_filter),
+            {"heroId": int(hero_id)},
+        )
+        rows = ((data.get("heroStats") or {}).get("laneOutcome"))
+        return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+    #: ``itemFullPurchase`` 的返回行数上限（防呆）。实测一个英雄一个位置
+    #: 68~133 行 —— 每件装备按购买分钟拆行；这个上限只防极端情况。
+    MAX_ITEM_PURCHASE_ROWS = 600
+
+    async def get_hero_item_purchase(
+        self,
+        hero_id: int,
+        *,
+        position: str = "",
+        bracket: str = "DIVINE_IMMORTAL",
+    ) -> list[dict]:
+        """英雄在**某个位置**上、高分段的**完整装备购买**记录。
+
+        这个字段的计数口径（实测，上层务必照着用）
+        ------------------------------------------
+        每一行是 **(英雄, 位置, 比赛分钟 ``time``, 装备 ``itemId``)**：
+
+        * ``matchCount`` = 「在**该分钟**买到这件装备」的数量，
+        * ``winCount``   = 其中赢下的数量，
+        * 同一件装备会**按购买分钟拆成多行**（实测斧王刃甲 15 行，``time`` 9~23）。
+
+        于是各行的 ``matchCount`` 相加**大于** ``stats`` 里的同位置场次
+        （斧王三号位：刃甲合计 15528 vs 场次 11871）—— 说明它与 ``stats``
+        **不是同一个样本池**。因此上层**只用它排先后、算加权胜率**，
+        **不折算百分比、不报绝对场次**，否则会被拿去和场次相除得出 >100%。
+
+        位置同样只能靠参数筛：返回行的 ``position`` **不可信**（实测斧王
+        94% 在三号位，回的行却全标 ``POSITION_1``），与
+        :meth:`get_hero_lane_outcome` 一个毛病。
+
+        它能提供的**新**信息是两条：**典型成型时间**（按 ``matchCount``
+        加权的 ``time`` 均值，单位是分钟）与**该装备的对局胜率**。
+
+        Args:
+            position: 主位置枚举（``POSITION_1``~``POSITION_5``）。传空或
+                认不出的值时**不加位置过滤**，拿回混合位置的原始行。
+
+        Returns:
+            行列表（拿不到就是空 list，**不抛**）。
+        """
+        key = str(bracket or "").strip().upper()
+        if key not in self.PLAYSTYLE_BRACKETS:
+            key = "DIVINE_IMMORTAL"
+        pos = str(position or "").strip().upper()
+        pos_filter = ", positionIds: [%s]" % pos if pos in self.POSITION_IDS else ""
+        data = await self._gql(
+            """
+            query HeroItemPurchase($heroId: Short!) {
+              heroStats {
+                itemFullPurchase(heroId: $heroId, bracketBasicIds: [%s]%s) {
+                  itemId
+                  instance
+                  time
+                  matchCount
+                  winCount
+                }
+              }
+            }
+            """
+            % (key, pos_filter),
+            {"heroId": int(hero_id)},
+        )
+        rows = (data.get("heroStats") or {}).get("itemFullPurchase")
+        out = [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+        return out[: self.MAX_ITEM_PURCHASE_ROWS]
+
     async def get_player_totals(self, account_id: int, field: str = "kills") -> dict:
         """STRATZ 没有等价的 totals 接口，返回空 dict（业务层已按缺省处理）。"""
         return {}

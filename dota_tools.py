@@ -48,7 +48,7 @@ try:  # 插件目录被作为包加载时的相对导入
         pick_heroes_for_player,
         summarize_matches,
     )
-    from . import dota_chat, dota_pool
+    from . import dota_chat, dota_hero_playstyle, dota_pool
 except ImportError:  # 兜底：以普通模块方式加载时，把插件目录加入 sys.path
     import os
     import sys
@@ -66,6 +66,7 @@ except ImportError:  # 兜底：以普通模块方式加载时，把插件目录
         summarize_matches,
     )
     import dota_chat  # type: ignore[no-redef]
+    import dota_hero_playstyle  # type: ignore[no-redef]
     import dota_pool  # type: ignore[no-redef]
 
 #: 单个工具返回给模型的文本上限。超出的部分截掉并标注 —— 只留最前面
@@ -144,6 +145,10 @@ class ToolContext:
     #: ``await fetch_matches(account_id, limit)``：近期对局，**带缓存**
     #: （与闲聊兜底共用同一份缓存，避免同一个账号被拉两遍）
     fetch_matches: Callable[[int, int], Awaitable[list[dict]]]
+    #: ``await items()``：道具常量表（``dname`` 已中文化），带缓存。
+    #: 为 ``None``（离线单测里的简化 context）时，工具退回 ``api.get_items()``，
+    #: 至少能拿到名字，不会把出装整段渲染成 ``-``。
+    items: Callable[[], Awaitable[dict]] | None = None
     #: ``await ask_confirm(action)``：把**待确认动作**登记到插件侧，返回
     #: **给用户看的确认文案**。``action`` 有两种形状::
     #:
@@ -216,6 +221,14 @@ _PLAYER_PROP = {
 _POSITION_PROP = {
     "type": "string",
     "description": "位置筛选：核心 / 中单 / 三号位 / 辅助 / 一号位 / 四号位 等，留空表示不筛。",
+}
+
+_HERO_PROP = {
+    "type": "string",
+    "description": (
+        "英雄名（**中文名**，如「敌法师」「水晶室女」「影魔」）或英雄 ID，一次一个。"
+        "用户说的名字认不出时不要猜，照用户原话填进来即可，工具会判它认不认得。"
+    ),
 }
 
 
@@ -344,6 +357,21 @@ def build_tool_specs(*, include_write: bool = True) -> list[dict]:
             "问「给他推荐几个英雄上分」「他这版本该玩什么」时用。",
             {"player": _PLAYER_PROP, "position": _POSITION_PROP},
             [],
+        ),
+        _spec(
+            "query_hero_playstyle",
+            "查**某个英雄当前版本怎么玩**（和具体玩家无关）：高分段（超凡入圣及以上）"
+            "的流行位置与该位置场均表现、对线优劣、出门装与鞋子、**出装热度与典型成型时间**；"
+            "全分段的出装路线（开局 / 前期 / 中期 / 后期）；以及最近 7 天职业赛的出场与被 ban 情况。"
+            "问「XX 现在怎么出装」「XX 打几号位」「XX 这个英雄怎么玩 / 强不强 / 打法」"
+            "「XX 是不是必出某件装备」时用。一次只查一个英雄。"
+            "**三条边界**：① 技能加点顺序**给不了**（公开数据源没有这项聚合统计），"
+            "问加点就如实说给不了，可以基于出装与定位给思路，**不要编具体加点顺序**；"
+            "② **没有「出装率 / 依赖度」这种数据** —— 出装那块只有「热度排序 + 该装备的对局胜率」，"
+            "**没有「不出这件装备」的对照**，所以只能说「常见 / 主流」，**不能说「必须出 / 依赖 / 非出不可」**；"
+            "③ 高分段出装与全分段出装路线是**两个不同口径的样本**，别把两边的数字放一起比。",
+            {"hero": _HERO_PROP},
+            ["hero"],
         ),
         # ---------------- 只读：定时任务 ----------------
         _spec(
@@ -502,6 +530,7 @@ TOOL_READ_NAMES: tuple[str, ...] = (
     "query_profile",
     "query_meta",
     "recommend_heroes",
+    "query_hero_playstyle",
     "query_schedules",
 )
 
@@ -1053,6 +1082,119 @@ async def _tool_recommend_heroes(args: dict, ctx: ToolContext) -> str:
     return "\n".join(lines)
 
 
+async def _tool_query_hero_playstyle(args: dict, ctx: ToolContext) -> str:
+    """英雄当前版本打法：高分段（STRATZ）+ 职业局 / 全分段出装（OpenDota）。
+
+    两块数据源分工明确、各自可能缺席，所以是「分别取、缺哪块说哪块」，
+    而不是「一起失败就整段不给」：
+    ``get_hero_playstyle``（固定走 STRATZ）拿位置 / 出门装 / 鞋子；
+    ``get_hero_item_popularity`` 与 ``get_hero_stats``（走 OpenDota）拿出装路线
+    与职业赛数据。
+
+    对线（``laneOutcome``）要**问两次**：主位置得先从 ``stats`` 里算出来，
+    才能拿它去限定 ``positionIds`` —— 那个接口返回行里的 ``position`` 字段
+    不可信（实测斧王 94% 三号位，行却全标成 ``POSITION_1``），只能靠请求参数
+    筛。算不出主位置时干脆不问（问了也是混合位置的糊涂数据）。
+    """
+    heroes = await _guarded(ctx.heroes(), ctx)
+    if not heroes:
+        return "没有拿到英雄常量表（数据源暂时不可用），查不了英雄打法，稍后再试。"
+    resolved = dota_hero_playstyle.resolve_hero(heroes, args.get("hero"))
+    if resolved is None:
+        raw = str(args.get("hero") or "").strip() or "（没给名字）"
+        return (
+            f"认不出英雄「{raw}」。请让用户说中文英雄名（如「敌法师」）或英雄 ID；"
+            "拿不准的名字不要猜，问清楚再查。"
+        )
+    hero_id, hero_name = resolved
+
+    notes: list[str] = []
+    bracket = dota_hero_playstyle.BRACKET_HIGH
+
+    # ① 高分段：位置 / 出门装 / 鞋子 —— 只在 STRATZ 侧存在
+    play = await _guarded(ctx.api.get_hero_playstyle(hero_id, bracket=bracket), ctx)
+    play = play if isinstance(play, dict) else {}
+    if not play.get("stats"):
+        notes.append("高分段这一块没取到：STRATZ 未配置 Key 或暂时不可用。")
+
+    # ①' 对线：必须带上主位置去问（见上面的说明）
+    lane: list[dict] = []
+    position = dota_hero_playstyle.main_position(play.get("stats"))
+    if position:
+        lane_rows = await _guarded(
+            ctx.api.get_hero_lane_outcome(hero_id, position=position, bracket=bracket),
+            ctx,
+        )
+        if isinstance(lane_rows, list):
+            lane = lane_rows
+    elif play.get("stats"):
+        notes.append("位置样本太少，判不出主位置，对线这一块没有取。")
+
+    # ①'' 高分段完整出装（``itemFullPurchase``）—— 同样必须带上主位置去问。
+    # 它的计数**不能折算百分比**（与 stats 场次不是一个样本池），
+    # 只用来排先后、算典型成型时间与对局胜率。口径见 dota_hero_playstyle 模块。
+    high_items: list[dict] = []
+    if position:
+        hi_rows = await _guarded(
+            ctx.api.get_hero_item_purchase(hero_id, position=position, bracket=bracket),
+            ctx,
+        )
+        if isinstance(hi_rows, list):
+            high_items = hi_rows
+        if play.get("stats") and not high_items:
+            notes.append("高分段出装这一块没取到（STRATZ 暂时不可用）。")
+
+    # ② 全分段出装路线（OpenDota）
+    item_pop = await _guarded(ctx.api.get_hero_item_popularity(hero_id), ctx)
+    item_pop = item_pop if isinstance(item_pop, dict) else {}
+    if not item_pop:
+        notes.append("全分段出装路线没取到（OpenDota 暂时不可用）。")
+
+    # ③ 职业局：OpenDota /heroStats 里该英雄的 pro_* 字段（最近 7 天职业赛）
+    pro: dict = {}
+    stats_rows = await _guarded(ctx.api.get_hero_stats(), ctx)
+    if not stats_rows:
+        notes.append("职业赛数据没取到（OpenDota 暂时不可用）。")
+    for row in stats_rows or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            row_id = int(row.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if row_id == hero_id:
+            pro = {
+                "pro_pick": row.get("pro_pick"),
+                "pro_win": row.get("pro_win"),
+                "pro_ban": row.get("pro_ban"),
+            }
+            break
+
+    # 道具中文名：优先用插件注入的**已中文化**常量表，没有才退回数据源原始表
+    items: dict = {}
+    if ctx.items is not None:
+        raw_items = await _guarded(ctx.items(), ctx)
+        if isinstance(raw_items, dict):
+            items = raw_items
+    if not items:
+        raw_items = await _guarded(ctx.api.get_items(), ctx)
+        if isinstance(raw_items, dict):
+            items = raw_items
+
+    return dota_hero_playstyle.format_hero_playstyle(
+        hero_name=hero_name,
+        stats=play.get("stats"),
+        starting=play.get("starting"),
+        boots=play.get("boots"),
+        lane=lane,
+        high_items=high_items,
+        item_pop=item_pop,
+        pro=pro,
+        items=items,
+        notes=notes,
+    )
+
+
 async def _tool_query_schedules(args: dict, ctx: ToolContext) -> str:
     if ctx.schedules_text is None:
         return "当前环境不支持查看定时任务，请让用户用 `/d2 定时 列表`。"
@@ -1302,6 +1444,7 @@ _DISPATCH: dict[str, Callable[[dict, ToolContext], Awaitable[str]]] = {
     "query_profile": _tool_query_profile,
     "query_meta": _tool_query_meta,
     "recommend_heroes": _tool_recommend_heroes,
+    "query_hero_playstyle": _tool_query_hero_playstyle,
     "query_schedules": _tool_query_schedules,
     "query_match_detail": _tool_query_match_detail,
     "request_match_parse": _tool_request_match_parse,
@@ -1428,6 +1571,29 @@ TOOL_GUIDE = """=== 你可以调用工具查数据、也可以调用工具改设
    **覆盖了哪个版本、共多少场、其中加速模式多少场**。这群人多数对局是加速局，
    所以「加速占比很高」是常态，别当成异常；但也别把加速局的胜率直接说成
    天梯强度 —— 提到胜率时把口径一起说清楚。
+
+**英雄当前版本打法（`query_hero_playstyle`）**：它给的是「这个英雄现在怎么玩」，
+**跟具体玩家无关** —— 高分段（超凡入圣及以上）的流行位置与该位置场均表现、
+对线结果（**只给比例**）、出门装与鞋子、**主位置出装热度与典型成型时间**；
+全分段出装路线（开局 / 前期 / 中期 / 后期）；以及最近 7 天职业赛的出场与被 ban 情况。
+几条纪律：
+- 它**给不了技能加点顺序**（公开数据源没有这项聚合统计）。用户问「这个英雄怎么加点 /
+  什么技能先升」时，如实说这块查不到，可以结合出装与定位给打法思路，
+  **不要编出一套加点顺序**。
+- **它给不了「某件装备的出场率 / 依赖度」**。出装那块只有「热度排序 + 该装备的对局胜率」：
+  **没有「不出这件装备」的对照**，也**没有能当分母的场次**（高分段出装的样本池与场次
+  不是同一个口径）。所以问「XX 是不是必出 YY / 依赖 YY」时，只能答「YY 是常见的主流件 /
+  排第几」；**不许**说「必须出」「依赖」「非出不可」，也**不许**拿那个胜率反推因果
+  （胜率偏高可能只是顺风局才有钱出它）。
+- 位置分布里**样本不足 30 场**的位置会被单独标出来、不计入结论。别拿那种小样本
+  （例如「4 号位 24 场」）当作这个英雄的常见打法。
+- 段位 / 窗口口径**三者不同**：位置、对线、出门装与鞋子、主位置出装都是**高分段**；
+  「出装路线」那四行是**全分段**；职业局是**最近 7 天职业赛**。别混着说成同一个样本。
+- 对线那两行**只有百分比、没有场次**：数据源是按「对位」计的，同一局遇到两个对手
+  会各记一次，折算不出场次。**不要**给它补一个「对线 N 场」，也不要拿这个比例去
+  和上面的位置场次做除法。
+- 出门装 / 鞋子 / 出装路线里的数字都是**购买次数**（消耗品一局能买多个），
+  不是「多少局这么出」，**不要**当成出场率。
 
 【二、后台任务类】只发起，**不等待结果**
 9. `query_match_detail`（单场复盘）与 `request_match_parse`（催解析）都是**异步**的：

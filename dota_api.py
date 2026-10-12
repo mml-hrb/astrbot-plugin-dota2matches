@@ -620,6 +620,29 @@ class OpenDotaClient:
         return data if isinstance(data, dict) else {}
 
     # ------------------------------------------------------------------
+    # 英雄出装（「当前版本打法」用）
+    # ------------------------------------------------------------------
+    async def get_hero_item_popularity(self, hero_id: int) -> dict:
+        """某英雄各阶段的**热门出装**（OpenDota ``GET /heroes/{id}/itemPopularity``）。
+
+        返回四个阶段的字典，值是 ``{item_id: 出现次数}``：
+
+        * ``start_game_items``（开局） / ``early_game_items``（前期）
+        * ``mid_game_items``（中期） / ``late_game_items``（后期）
+
+        取不到（404 / 该英雄没有统计数据）时返回空 dict，由上层如实少给一块。
+
+        .. note::
+           这是**全分段口径** —— OpenDota 这个端点不接受段位过滤。展示时
+           必须如实标注，不要把它说成「高分段出装」（高分段那部分由 STRATZ
+           的 ``itemStartingPurchase`` / ``itemBootPurchase`` 提供）。
+        """
+        data = await self._request(
+            f"/heroes/{int(hero_id)}/itemPopularity", allow_404=True
+        )
+        return data if isinstance(data, dict) else {}
+
+    # ------------------------------------------------------------------
     # 英雄版本胜率（「轮椅」榜单的数据源）
     # ------------------------------------------------------------------
     async def get_hero_stats(self, force: bool = False) -> list[dict]:
@@ -1040,6 +1063,109 @@ class FallbackDataSource:
             return await method(*args, **kwargs)
         except OpenDotaError:
             return {}
+
+    async def get_hero_item_popularity(self, *args: Any, **kwargs: Any) -> dict:
+        """某英雄的四阶段出装路线（开局 / 前期 / 中期 / 后期）：**固定走 OpenDota**。
+
+        和 :meth:`get_hero_stats` / :meth:`get_latest_patch` 同一类：这个能力
+        **只归属 OpenDota**（``/heroes/{id}/itemPopularity``，STRATZ 没有等价端点），
+        所以不能进 :data:`_FALLBACK_METHODS` 那张「主备双源都该实现」的白名单 ——
+        当初误放进去，被 ``tests/fallback_check.py`` 的「STRATZ 客户端实现了
+        全部白名单方法」当场抓住。
+
+        拿不到返回空 dict（只影响出装路线那一块，上层会如实说明），不抛错、
+        也不妨碍高分段的「出门装 / 鞋子」——两者是不同数据源的不同口径。
+        """
+        method = getattr(self._opendota_side(), "get_hero_item_popularity", None)
+        if method is None:
+            logger.warning("[dota2] 全分段出装路线：当前数据源组合里没有 OpenDota，这一块将不可用")
+            return {}
+        try:
+            return await method(*args, **kwargs)
+        except OpenDotaError as e:
+            logger.warning(f"[dota2] 全分段出装路线：OpenDota 查询失败，这一块将不可用：{e}")
+            return {}
+
+    def _stratz_side(self) -> Any:
+        """找出数据源组合里的 STRATZ 客户端；没有则返回 ``None``。
+
+        与 :meth:`_opendota_side` 配对：都按**类型**定位，不看 primary /
+        secondary —— 哪个端在哪个位置取决于 ``data_source_priority``。
+        """
+        for source in (self.primary, self.secondary):
+            if str(getattr(source, "SOURCE_KIND", "")).strip().lower() == "stratz":
+                return source
+        return None
+
+    async def get_hero_playstyle(self, *args: Any, **kwargs: Any) -> dict:
+        """英雄高分段打法数据（位置 / 对线 / 出门装 / 鞋子）：**固定走 STRATZ**。
+
+        这几项在 OpenDota 侧没有等价端点（``/heroStats`` 无位置维度，也没有
+        出门装与对线统计），所以不做「主源优先」。
+
+        与 :meth:`get_hero_stats` 的失败策略**故意不同**：那边拿不到就抛错
+        （整份榜单都靠它，没有就什么都不剩）；这里返回**空 dict** 并记一条
+        warning —— 组合里没有 STRATZ / 没配 Key / 临时挂了时，「职业局」与
+        「全分段出装」这两块仍然可用，不该被一起拖没。少了哪一块由上层在
+        输出里如实交代（见 :func:`dota_hero_playstyle.format_hero_playstyle`
+        的 ``notes``）。
+        """
+        source = self._stratz_side()
+        method = getattr(source, "get_hero_playstyle", None)
+        if method is None:
+            logger.warning(
+                "[dota2] 英雄打法：当前数据源组合里没有 STRATZ，"
+                "高分段（位置 / 对线 / 出门装）这一块将不可用"
+            )
+            return {}
+        try:
+            return await method(*args, **kwargs)
+        except OpenDotaError as e:
+            logger.warning(f"[dota2] 英雄打法：STRATZ 查询失败，高分段那块将不可用：{e}")
+            return {}
+
+    async def get_hero_lane_outcome(self, *args: Any, **kwargs: Any) -> list:
+        """英雄某个位置的高分段对线结果：**固定走 STRATZ**。
+
+        与 :meth:`get_hero_playstyle` 同一套路数（OpenDota 无等价端点、
+        失败时返回空 list 并记 warning、不拖没其他块）。为什么要单独一个方法
+        而不是并进上面那个：它必须带上 ``position`` 参数（``laneOutcome``
+        返回行里的 ``position`` 字段不可信，只能靠请求参数限定），而主位置
+        要先从 ``stats`` 里算出来 —— 两次查询有先后依赖，没法并成一次请求。
+        口径说明见 :func:`dota_hero_playstyle.format_hero_playstyle`。
+        """
+        source = self._stratz_side()
+        method = getattr(source, "get_hero_lane_outcome", None)
+        if method is None:
+            logger.warning("[dota2] 英雄对线：当前数据源组合里没有 STRATZ，对线这一块将不可用")
+            return []
+        try:
+            rows = await method(*args, **kwargs)
+        except OpenDotaError as e:
+            logger.warning(f"[dota2] 英雄对线：STRATZ 查询失败，对线那块将不可用：{e}")
+            return []
+        return rows if isinstance(rows, list) else []
+
+    async def get_hero_item_purchase(self, *args: Any, **kwargs: Any) -> list:
+        """英雄某个位置的**高分段完整装备购买**记录：**固定走 STRATZ**。
+
+        与 :meth:`get_hero_lane_outcome` 同一套路数（OpenDota 无等价端点、
+        失败时返回空 list 并记 warning、不拖没其他块），也必须带上 ``position``
+        参数。**它的计数不能折算场次或百分比** —— 原因写在
+        :meth:`dota_stratz.StratzClient.get_hero_item_purchase` 的说明里，
+        上层只拿它排先后、算加权胜率与典型成型时间。
+        """
+        source = self._stratz_side()
+        method = getattr(source, "get_hero_item_purchase", None)
+        if method is None:
+            logger.warning("[dota2] 高分段出装：当前数据源组合里没有 STRATZ，这一块将不可用")
+            return []
+        try:
+            rows = await method(*args, **kwargs)
+        except OpenDotaError as e:
+            logger.warning(f"[dota2] 高分段出装：STRATZ 查询失败，这一块将不可用：{e}")
+            return []
+        return rows if isinstance(rows, list) else []
 
     async def close(self) -> None:
         """关闭两端数据源。"""

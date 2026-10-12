@@ -427,11 +427,11 @@ v2.4.0 起用户提问这条走**工具**而不是预取）：
 
 ##### 工具清单（`dota_tools`）
 
-13 个工具，分三类，边界写在 `TOOL_READ_NAMES` / `TOOL_ASYNC_NAMES` / `TOOL_WRITE_NAMES`：
+14 个工具，分三类，边界写在 `TOOL_READ_NAMES` / `TOOL_ASYNC_NAMES` / `TOOL_WRITE_NAMES`：
 
 | 类别 | 工具 | 行为 |
 |---|---|---|
-| 查询 | `list_players` / `query_matches` / `compare_players` / `query_hero_pool` / `query_profile` / `query_meta` / `recommend_heroes` / `query_schedules` | 直接执行，真实数据回填给模型 |
+| 查询 | `list_players` / `query_matches` / `compare_players` / `query_hero_pool` / `query_profile` / `query_meta` / `recommend_heroes` / `query_hero_playstyle` / `query_schedules` | 直接执行，真实数据回填给模型 |
 | 后台任务 | `query_match_detail`（单场复盘） / `request_match_parse`（催解析） | **只发起**，立刻回执；正文稍后由后台任务发回会话 |
 | 写操作 | `manage_binding` / `manage_watch` / `manage_schedule` | **只登记待确认**，绝不直接执行 |
 
@@ -440,6 +440,62 @@ v2.4.0 起用户提问这条走**工具**而不是预取）：
 全靠它撑着 —— 一次并发取多人、共用同一个 `days` 窗口口径，渲染成
 「每人摘要与明细 / 横向对比分项排名 / 同场局」三块。人数上限 `MAX_COMPARE_PLAYERS=8`、
 默认取 `nlu_chat_max_players` 人；单人提问用 `query_matches`，不要用它。
+
+`query_hero_playstyle`（英雄当前版本打法）回答「**这个英雄现在怎么玩**」，
+**与具体玩家无关** —— 和 `query_hero_pool`（某个人会玩什么）、
+`recommend_heroes`（结合某个人挑英雄）是三件事，别混。它跨**两个数据源**拼图：
+
+* **高分段**（`DIVINE_IMMORTAL` = 超凡入圣 + 冠绝一世）的流行位置分布与主位置
+  场均表现、对线结果、出门装与鞋子、**主位置完整出装** —— 只有 STRATZ `heroStats`
+  （`stats(groupByPosition: true)` / `itemStartingPurchase` / `itemBootPurchase` /
+  `laneOutcome` / `itemFullPurchase`）提供。OpenDota 的 `/heroStats` **没有位置维度**，
+  它那套 `1_pick`~`7_pick` 分档本项目已判定不可用（与真实水平对不上，见
+  `dota_format.hero_meta_rows`）。
+* **职业局**与**全分段出装路线** —— 只有 OpenDota 提供（`/heroStats` 的
+  `pro_pick` / `pro_win` / `pro_ban`；`/heroes/{id}/itemPopularity` 的四阶段）。
+
+聚合与渲染都在 `dota_hero_playstyle.py`（`resolve_hero` / `main_position` /
+`_aggregate_item_purchase` / `format_hero_playstyle`），工具层
+`_tool_query_hero_playstyle` 只负责取数、拼装与缺口说明。
+`FallbackDataSource.get_hero_playstyle` / `get_hero_lane_outcome` /
+`get_hero_item_purchase` 都是**固定走 STRATZ** 的（与 `get_hero_stats` /
+`get_latest_patch` / `request_parse` 同理），拿不到时分别返回 `{}` / `[]` 并
+`logger.warning`，**不抛异常** —— 这样全分段出装与职业局那两块还能照常给。
+位置相关的三个查询（对线、出装）都必须带上 `main_position()` 算出来的主位置，
+且**三次请求有先后依赖**，不能并行。
+
+关于 STRATZ `heroStats` 的七个**实测坑**（都不是文档里能看到的，别照直觉改）：
+
+| 坑 | 现象 | 处理 |
+|---|---|---|
+| `stats` 只服务**最近一周** | 显式传 `week: 2961` 回空；不传回 `week: 2962` | 文案写「最近一周样本 N 场」，不假装是更长的窗口 |
+| `laneOutcome` 的 `position` 字段**不可信** | 斧王 94% 局在三号位，回的行却全标 `POSITION_1` | 位置**只能用请求参数 `positionIds` 限定**（那个参数实测是准的：斧王 `POSITION_3` → 34291、`POSITION_1` → 129）。所以是「先由 `main_position()` 算出主位置，再问一次」，**两次请求**，不能塞进一次 |
+| `laneOutcome` 的计数单位是**对位**不是场 | 按 `heroId2` 拆行（敌法师一号位回 125 行）；求和是 `stats` 场次的 1.5~3 倍，各位置倍数还不一致（3.15x / 3.10x / 1.52x） | **只报比例**（占优 / 打平 / 落后），单位无关、倍数约掉；**不折算场次** |
+| `itemFullPurchase` 与 `stats` **不是一个样本池** | 每行是 `(装备, 比赛分钟 time)`，同一件装备按分钟拆多行（斧王刃甲 15 行、`time` 9~23）；各行 `matchCount` 相加是 15528，而该位置场次只有 11871 —— **比值 1.31** | **只排先后**（按 `matchCount` 求和）、算**加权成型时间**（`time` 以 `matchCount` 加权）与**该件对局胜率**；**不折算百分比、不报绝对场次**（报出去会被拿去和场次相除） |
+| `itemFullPurchase` 的 `position` 字段同样**不可信** | 斧王三号位 68 行，`position` 全标 `POSITION_1`；`positionIds=[POSITION_1]` 回 **0 行** | 同 `laneOutcome`：位置只能靠**请求参数**限定 |
+| `minTime` / `maxTime` 切的是 `time`（分钟） | `maxTime:12` 刃甲 4 行（`time` 9/10/11/12）、`minTime:12` 12 行，**4+12−1 = 15** 正好等于不切时的行数 | 证实 `time` 是**整数分钟**、每个 `(装备, 分钟)` 只有一行 —— 本插件不需要这两个参数，但据此确认了 `time` 语义 |
+| 出门装 / 出装路线的数字是**购买次数**不是场次 | 出门装「铁树枝干」在同一位置回**两行**（消耗品一局能买多个），三号位各行合计 86070 ≫ 该位置 11871 场 | 文案一律写「**次**」，不写「场」 |
+
+四条口径纪律（回归 `tests/hero_playstyle_check.py` 逐条钉着）：
+
+1. **不给技能加点**。公开数据源里没有「加点顺序」的聚合统计：OpenDota 无对应端点；
+   STRATZ `talent` 只给「天赋节点被选中场次」，`abilityMinLevel` / `abilityMaxLevel`
+   经实测语义未明（返回的 `level` 与技能等级、英雄等级都对不上）。**语义未明的数据
+   宁可不给**，工具说明与 `TOOL_GUIDE` 都如实写着「给不了」，并**明确禁止模型编一套加点**。
+   真要加点顺序，走单场复盘的 `ability_upgrades_arr`。
+2. **小样本不作结论**。位置分布里低于 `MIN_POSITION_SAMPLE=30` 场的位置只在括号里
+   标注，不输出成结论行 —— 否则「4 号位 24 场 62% 胜率」会被当成常见打法。
+   高分段出装同样有门槛 `MIN_ITEM_PURCHASE=500`（实测「阿哈利姆神杖 260 场、
+   胜率 63.8%」进榜会误导）。
+3. **指标口径不串**。「高分段」指超凡入圣及以上；「出装路线」是**全分段**口径，
+   只有出门装、鞋子与高分段落出装才是高分段口径；「对线」是**比例**、不是场次 ——
+   三者在文案里分别标注，别混着说。
+4. **不给「出装率 / 依赖度」**。出装那块只有「热度排序 + 该装备的对局胜率」：
+   **没有「不出这件装备」的对照**，也**没有能当分母的场次**（高分段出装的样本池与
+   `stats` 场次不同口径）。所以只允许说「常见 / 主流 / 排第几」，**禁止**说「必须出 /
+   依赖 / 非出不可」，也**禁止**拿那个胜率反推因果（胜率偏高可能只是顺风局才有钱出它）。
+   工具说明与 `TOOL_GUIDE` 双向写着这条禁令，回归里也钉着（高分段出装小节内不许出现
+   「出装率 / 依赖 / 必须出 / 非出不可」、不许出现「N 场」）。
 
 
 ##### 三类边界的实现
@@ -1276,7 +1332,7 @@ v2.5.0 之前，建任务时就把人话解析成 5 个动作常量之一（`ACT
 
 | 事 | 做法 | 为什么 |
 |---|---|---|
-| **写操作要摘掉** | `build_tool_specs(include_write=False)`：13 个工具 → 10 个（`SCHEDULE_TOOL_NAMES` = 只读 + 慢任务） | 到点那一刻群里**没有人回「确认」**。留着写操作，模型会把「已登记待确认」当成办完了报给群里 —— 用户收到一句假话 |
+| **写操作要摘掉** | `build_tool_specs(include_write=False)`：14 个工具 → 11 个（`SCHEDULE_TOOL_NAMES` = 只读 + 慢任务） | 到点那一刻群里**没有人回「确认」**。留着写操作，模型会把「已登记待确认」当成办完了报给群里 —— 用户收到一句假话 |
 | **没有 `event`** | `_nlu_chat_tool_ctx(event=None, umo=…, uid=…, allow_write=False)`；`_nlu_chat_agent` / `_run_tool_loop` 同样参数化 | 到点是平台调度器叫醒的，手里没有 `AstrMessageEvent`。`_nlu_trigger_async` 本来就没用 event；`_nlu_resolve_person` 只在「查我」那一支用（定时上下文改为取本会话唯一绑定，取不到就说清「这里没有提问者」） |
 | **相对时间词要重新解释** | 回放时把原话包一层说明：「原话里的时间（例如『两小时后』）**指的就是现在**，已经是过去时」 | 不说明的话，模型会把「两小时后重新查看一下这场」理解成「从现在起再过两小时」，答非所问 |
 
@@ -1425,7 +1481,7 @@ B 群的任务既不直观也很危险。其他会话还有任务时明确提示
 （比赛 ID 压过认人、「这场」靠会话最近比赛消歧、指不出来就不猜、
 没解析好也要发消息、失败原因原样转给模型）。
 `tests/schedule_replay_check.py`（39 项）钉 v2.5.0 的**原句回放**：任意一句话都能定时、
-到点把原话交给模型（并说明时间词已过期）、定时通道摘掉写操作（13 → 10 个工具）、
+到点把原话交给模型（并说明时间词已过期）、定时通道摘掉写操作（14 → 11 个工具）、
 指代由建任务时的解析结果兜住、有专用渲染链路的动作优先（版本榜不调模型）、
 老任务（负载里没有 `question`）仍走旧路径、工具通道不可用时回落单轮仍然出声、
 确认文案 / 回执 / 任务说明都显示原话、无 `event` 时也能构造工具环境。
@@ -1784,7 +1840,7 @@ astrbot_plugin_dota2/
 ├── dota_parse.py        # 解析状态判断 + 「催解析并等待」轮询
 ├── dota_nlu.py          # 唤醒词剥离 / 会话名单精确匹配（**规则意图识别已整体退场**：历史实现保留，无生产引用，禁止接回）
 ├── dota_chat.py         # 上下文层：事实底表（当前时间 / 名单 / 本会话比赛）+ 定时播报的预取取数 + 同场局与对比渲染
-├── dota_tools.py        # 工具层：13 个工具（查询 / 后台任务 / 写操作）的 schema + 执行器（依赖注入，可离线测）
+├── dota_tools.py        # 工具层：14 个工具（查询 / 后台任务 / 写操作）的 schema + 执行器（依赖注入，可离线测）
 ├── dota_schedule.py     # 定时任务的口径层：中文时间 → cron、任务动作、确认/列表文案（纯逻辑）
 ├── dota_cron.py         # AstrBot「未来任务」桥接：只建 basic 任务，启动时接管既有任务
 ├── dota_store.py        # 绑定 / 监听 / 计数型定时任务的落盘读写
@@ -1831,12 +1887,13 @@ python tests/llm_channel_check.py    # 专用模型 API Key：地址归一 / 返
 python tests/fallback_check.py       # 主/后备数据源：降级触发、不降级情形、插件组装、按 SOURCE_KIND 定位 OpenDota
 python tests/hero_meta_check.py      # 版本强势英雄（轮椅）：自适应门槛、位置互斥判定、三段榜去重、趋势留白、榜内推荐
 python tests/hero_pool_check.py      # 英雄池口径：当前版本过滤、样本不足向前并入、加速模式不被静默丢弃、无版本维度时降级标注
+python tests/hero_playstyle_check.py # 英雄当前版本打法（跨源拼接）：英雄名解析（中文/npc/ID/歧义不猜）、主位置判定（过门槛优先、都不过则退回场次最多）、高分段位置分布与主位置场均、**对线只给比例不给场次**（数据源按「对位」计数）、对线查询必须带算出来的主位置、**高分段出装**（同一装备跨购买分钟求和、按采购量排序、`time` 缺失不冒充 0 分钟、低于 500 不进榜、只排先后不折算百分比、小节内禁「出装率/依赖/必须出」与绝对场次）、出门装/鞋子写「次」不写「场」、全分段出装路线与高分段分别标注口径、职业局出场与 ban、**不给加点顺序**（渲染与工具说明双向禁止）、小样本位置不作结论、缺高分段时出装与职业局照常给、缺失数值渲染成 `-`、认不出英雄时不打扰数据源（140 项）
 python tests/win_result_check.py     # 单场胜负口径：只有一处判定（穷举 243 种字段组合两处必须同值）、逐场明细用带主语的纯文字（无 ✅❌）、判不出来不计入胜率、提示词禁止反推胜负
 python tests/stratz_identity_check.py # STRATZ 归一化的阵营 / 胜负 / 昵称与 OpenDota 口径一致
 python tests/zh_names_check.py       # 中文本地化与焦点玩家昵称：只改显示名（npc_dota_hero_* 的 name 必须原样）、昵称优先于数字 ID、查名顺序静态表→磁盘缓存→联网补译（命中就不发请求）、补译落盘只问一次
 python tests/schedule_check.py       # 定时任务：时间→cron、拒绝纯提醒、意图优先级、控制词解析（别名/编号/整批/改时间）、CronBridge 建/列/停/删/改/接管、计数窗口、到点执行、一次性自删
 python tests/schedule_delta_check.py # 定时任务补丁（v2.4.3）：相对时间（两小时后/半小时后/三天后/过一会儿）与三种 cron 选法（含跨年）、「两」必须在字符集里、「两小时」不许读成 02:00、复查某一场（ID 压过认人 / 「这场」消歧 / 指不出来就不猜 / 没解析好也要发消息 / 失败原因转给模型）
-python tests/schedule_replay_check.py # 定时任务原句回放（v2.5.0）：任意说法都能定时、到点把原话交给模型、定时通道摘掉写操作（13→10 个工具）、指代由建任务时的结果冻结、版本榜仍走专用渲染、老任务（无 question）仍走旧路径、工具通道挂了回落单轮、无 event 时也能构造工具环境
+python tests/schedule_replay_check.py # 定时任务原句回放（v2.5.0）：任意说法都能定时、到点把原话交给模型、定时通道摘掉写操作（14→11 个工具）、指代由建任务时的结果冻结、版本榜仍走专用渲染、老任务（无 question）仍走旧路径、工具通道挂了回落单轮、无 event 时也能构造工具环境
 python tests/stratz_client_live.py   # STRATZ 客户端真实 API 验证（需在文件内填 Key）
 python tests/od_data_probe.py        # 真实拉取指定比赛的 od_data，探查解析状态
 ```
@@ -1869,6 +1926,21 @@ python tests/od_data_probe.py        # 真实拉取指定比赛的 od_data，探
   **4091 字**，每次加载与热重载都刷一屏。`desc` 的口径固定为「一两句话：
   是什么 + 能做什么 + 怎么用」（现在约 150 字）；**变更记录一律进 README**。
   以后要发布到插件市场、需要一份详细描述时另写一份，不要就地膨胀 `desc`。
+- **每次发版同步更新 `CHANGELOG.md`（放插件目录根部，随 zip 分发）。**
+  AstrBot 插件页里那个「查看更新日志」、以及插件更新完成后自动弹出的窗口，读的就是
+  它 —— 后端 `PluginService.get_plugin_changelog()` 会在插件目录里依次找
+  `CHANGELOG.md` / `changelog.md` / `CHANGELOG` / `changelog`，读到什么就渲染什么。
+  口径：**版本倒序、最新在最上面**，小节标题与 `metadata.yaml` 的 `version` 对齐，
+  写「用户能感知到什么变了」，不写内部重构流水账。漏更新不会报错，只会让用户点开
+  看到上一版的内容。
+- ⚠️ **插件市场详情页的「更新日志」是另一条路，与 `CHANGELOG.md` 无关。**
+  前端 `PluginDetailPage.vue` 在市场标签页下**只在市场索引提供了 `changelog_url`
+  字段时**才渲染该区块，然后去远程拉那个 URL；README 区块同理（看 `readme_url`）。
+  而官方索引（`api.soulter.top/astrbot/plugins` → `cloud.astrbot.app/api/v1/market/plugins.json`）
+  截至 2026-10-12 实测 **2468 条里 0 条带 `changelog_url` / `readme_url`**，与
+  AstrBot 仓库 PR #8967 的描述（「实际所有市场插件 0/1246 均未提供该字段」）一致
+  ⇒ 市场页对**所有**插件都不显示更新日志，往仓库里加文件也解决不了，属上游缺口。
+  等云端补出该字段、或 AstrBot 合入「由后端按 repo 取 README/CHANGELOG」的 PR 后才会出现。
 - 历史已补全：`v1.2.0`（首个提交）到 `v2.4.0` 共 22 个 tag，覆盖全部提交里出现过的
   版本号。中间有跳号（`v1.7.1 → v1.9.1`、`v2.0.2 → v2.2.1`），那些版本号在
   仓库建立之前或没有对应提交，补不了也不该编。

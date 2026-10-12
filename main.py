@@ -74,6 +74,7 @@ try:  # 插件目录被作为包加载时的相对导入
     from .dota_store import DotaStore
     from . import dota_chat
     from . import dota_cron
+    from . import dota_hero_playstyle
     from . import dota_history
     from . import dota_nlu
     from . import dota_parse
@@ -134,6 +135,7 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
 
     import dota_chat  # type: ignore[no-redef]
     import dota_cron  # type: ignore[no-redef]
+    import dota_hero_playstyle  # type: ignore[no-redef]
     import dota_history  # type: ignore[no-redef]
     import dota_nlu  # type: ignore[no-redef]
     import dota_parse  # type: ignore[no-redef]
@@ -351,6 +353,12 @@ HELP_TEXT = """🎮 Dota2 数据查询助手（数据来源：STRATZ / OpenDota 
 　　　　　等满仍未解析就自动改用现有数据出一份基础数据版报告）
 　　　　（加 skip 可跳过等待，立刻用现有数据出报告）
 /d2 催解析 <比赛ID>　　　　　 只催 OpenDota 解析这局，不等结果
+
+　「这个英雄现在怎么玩」不用记指令，直接说人话：
+　　`dota2助手 敌法师这版本怎么玩`　→ 高分段位置分布与场均、对线优劣、
+　　　　　　　　　　　　　　　　　　 出门装 / 鞋子、全分段出装路线、
+　　　　　　　　　　　　　　　　　　 最近 7 天职业赛出场与被 ban
+　　（技能加点顺序查不到：公开数据源没有这项聚合统计，插件不会编。）
 
 【监听】
 /d2 监听 [目标]　　　　　　　 比赛结束后自动推送一条简短点评到本会话
@@ -2193,6 +2201,7 @@ class Dota2Plugin(Star):
             api=self.api,
             cfg=self.cfg,
             heroes=self._heroes,
+            items=self._items,
             resolve_player=lambda raw: self._nlu_resolve_person(umo, event, raw),
             session_players=lambda: self._nlu_session_players(umo),
             fetch_matches=self._fetch_chat_matches,
