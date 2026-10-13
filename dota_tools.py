@@ -19,7 +19,8 @@
 * **慢工具**（:data:`TOOL_ASYNC_NAMES`）不阻塞对话。单场复盘可能触发催解析
   并等上十分钟，同步等会把整轮问答卡死；因此它们只**发起**后台任务并立刻
   回执，正文稍后由后台任务直接发回会话。
-* **每个工具的输出都截断**（:data:`MAX_OUTPUT_CHARS`）。模型不需要全文，
+* **每个工具的输出都截断**（:data:`MAX_OUTPUT_CHARS`，少数天然长的工具在
+  :data:`_OUTPUT_LIMITS` 里单独放宽）。模型不需要全文，
   上下文里塞两万字只会稀释重点、还把成本抬上去。
 
 本模块不依赖 AstrBot，也不直接依赖插件主体：所有外部能力都通过
@@ -48,7 +49,7 @@ try:  # 插件目录被作为包加载时的相对导入
         pick_heroes_for_player,
         summarize_matches,
     )
-    from . import dota_chat, dota_hero_playstyle, dota_pool
+    from . import dota_chat, dota_esports, dota_hero_playstyle, dota_pool
 except ImportError:  # 兜底：以普通模块方式加载时，把插件目录加入 sys.path
     import os
     import sys
@@ -66,12 +67,31 @@ except ImportError:  # 兜底：以普通模块方式加载时，把插件目录
         summarize_matches,
     )
     import dota_chat  # type: ignore[no-redef]
+    import dota_esports  # type: ignore[no-redef]
     import dota_hero_playstyle  # type: ignore[no-redef]
     import dota_pool  # type: ignore[no-redef]
 
 #: 单个工具返回给模型的文本上限。超出的部分截掉并标注 —— 只留最前面
 #: 最有信息量的部分，比塞满上下文更有用。
 MAX_OUTPUT_CHARS = 2000
+
+#: 少数工具天然就长，单独放宽上限。
+#:
+#: 赛事类一次要给「参赛队伍 + 名次 + 积分榜 + 赛程」四块，2000 字会把后面几块
+#: 整块截掉 —— 而后面那几块（名次、积分榜、出线）恰恰是用户要判断的东西。
+#: **不要顺手把 MAX_OUTPUT_CHARS 一起抬高**：那是拿所有工具的上下文成本换的，
+#: 而绝大多数工具的输出远用不到 2000。渲染顺序也配合做了调整（见
+#: :func:`dota_esports.format_tournament`：参赛队伍放最后）。
+_OUTPUT_LIMITS: dict[str, int] = {
+    "query_tournament": 2600,
+    "query_esports_team": 2400,
+    "query_transfers": 2200,
+}
+
+
+def _output_limit(name: str) -> int:
+    """这个工具的返回文本上限。未单独配置的走 :data:`MAX_OUTPUT_CHARS`。"""
+    return _OUTPUT_LIMITS.get(str(name or "").strip(), MAX_OUTPUT_CHARS)
 
 #: 单个工具的执行超时（秒）。工具内部可能串行调多个数据源接口
 #: （英雄表 + 玩家资料 + 英雄池），给得比单接口宽一些。
@@ -173,6 +193,10 @@ class ToolContext:
     #: ``await schedules_text()``：本会话定时任务列表的**渲染文本**。
     #: 渲染留在插件主体（工具层不重复实现一套排版，否则两处会漂移）。
     schedules_text: Callable[[], Awaitable[str]] | None = None
+    #: 赛事数据源客户端（:class:`dota_esports.LiquipediaClient`）。
+    #: 职业赛事 / 战队 / 转会那三个工具要用；为 ``None``（离线单测、或
+    #: 用户在配置里关掉了赛事数据源）时，它们回一句「这块没开」而不是报错。
+    esports: Any = None
     #: 当前时间戳
     now: float = 0.0
     #: 单工具超时
@@ -228,6 +252,23 @@ _HERO_PROP = {
     "description": (
         "英雄名（**中文名**，如「敌法师」「水晶室女」「影魔」）或英雄 ID，一次一个。"
         "用户说的名字认不出时不要猜，照用户原话填进来即可，工具会判它认不认得。"
+    ),
+}
+
+_TOURNAMENT_PROP = {
+    "type": "string",
+    "description": (
+        "赛事名，照用户原话填（中文 / 缩写 / 英文都行，如「TI 2026」「利雅得大师赛」"
+        "「梦幻联赛」「The International 2025」）。**不要自己翻译或补全**成你以为的英文名，"
+        "工具内部有对照表。用户没提具体赛事（只问「最近有什么职业比赛」）时留空。"
+    ),
+}
+
+_TEAM_PROP = {
+    "type": "string",
+    "description": (
+        "战队名，照用户原话填（中文昵称 / 英文名 / 缩写都行，如「雪碧」「Team Spirit」"
+        "「液体」）。**不要自己补全**成你以为的正式名。"
     ),
 }
 
@@ -372,6 +413,57 @@ def build_tool_specs(*, include_write: bool = True) -> list[dict]:
             "③ 高分段出装与全分段出装路线是**两个不同口径的样本**，别把两边的数字放一起比。",
             {"hero": _HERO_PROP},
             ["hero"],
+        ),
+        # ---------------- 只读：职业赛事 / 战队 / 转会 ----------------
+        _spec(
+            "query_tournament",
+            "查**职业赛事**信息：赛事状态（未开始 / 进行中 / 已结束）与日期、级别、主办、"
+            "线下线上、奖池、参赛队伍（含各队阵容）、名次与奖金分配、小组积分榜与出线形势、"
+            "赛程对阵。问「TI 什么时候打」「XX 赛事谁参加了」「最后谁夺冠 / 前三名是谁」"
+            "「积分榜怎么样」「XX 队出线形势」「接下来有哪些比赛」时用。"
+            "**不填赛事名**时会返回近期职业比赛一览（最近结束的职业对局），"
+            "适合回答「最近有什么职业比赛」。\n"
+            "**四条边界**：① 数据来自社区维护的 Dota2 赛事 wiki（Liquipedia），"
+            "**不是官方**，且**限流很紧**（同一时间只能查一个赛事）；查不到就如实说没取到，"
+            "**不要用记忆里的赛果替它作答**；② **不要编比分 / 不要编名次** —— "
+            "工具没给的名次与比分一律说没有；「名次与奖金分配」那一块是**按名次区间划分的"
+            "奖金档位，不指名战队**，别把某一档说成「某队拿了第几」；"
+            "③ 「某队能否出线」只能基于**积分榜上该队的位置"
+            "与赛事定义的晋级区**来判断，问的是**形势**而不是保证，别下结论式断言；"
+            "④ 未开赛的赛事常常还没有排期，此时如实说「对阵尚未排出」。",
+            {"query": _TOURNAMENT_PROP},
+            [],
+        ),
+        _spec(
+            "query_esports_team",
+            "查**战队 / 选手**信息：赛区（地区）、成立时间、教练、当前阵容、"
+            "近期职业战绩（对手、比分、胜负）与职业总胜负。"
+            "问「XX 队什么阵容」「XX 队在哪个赛区」「XX 队最近战绩怎么样」"
+            "「XX 这个选手在哪个队」时用。一次查一支队。\n"
+            "**三条边界**：① 阵容以「**现役**」为准（工具已经过滤掉离队的老成员），"
+            "别把历史成员说成现役；② 战绩是**该队**的胜负 —— 工具写「胜 / 负」就是"
+            "**这支队伍**的胜负，不要按比分自己反推；③ 拿不到的字段一律说没有，"
+            "**不要猜转会、不要猜身价**。",
+            {"team": _TEAM_PROP},
+            ["team"],
+        ),
+        _spec(
+            "query_transfers",
+            "查**选手转会 / 人员变动**动态：谁从哪支队转到了哪支队、什么时候。"
+            "问「最近有什么转会」「XX 去哪了」「谁离队了」「阵容有什么变动」时用。"
+            "可以带一个选手名做筛选。\n"
+            "**两条边界**：① 数据源是社区维护的赛事 wiki，更新可能有延迟，"
+            "**不要把它当成官方公告**；② 列表里没有的人就是**没取到**，"
+            "**不要说成「他没有转会」**。",
+            {
+                "player": {
+                    "type": "string",
+                    "description": (
+                        "可选：只看某位选手的转会记录（选手 ID / 昵称）。留空表示看最近的转会列表。"
+                    ),
+                }
+            },
+            [],
         ),
         # ---------------- 只读：定时任务 ----------------
         _spec(
@@ -531,6 +623,9 @@ TOOL_READ_NAMES: tuple[str, ...] = (
     "query_meta",
     "recommend_heroes",
     "query_hero_playstyle",
+    "query_tournament",
+    "query_esports_team",
+    "query_transfers",
     "query_schedules",
 )
 
@@ -1195,6 +1290,238 @@ async def _tool_query_hero_playstyle(args: dict, ctx: ToolContext) -> str:
     )
 
 
+# ---------------------------------------------------- 职业赛事 / 战队 / 转会
+
+
+#: 赛事数据源没接上时的统一答复。**要模型如实说没取到**，不能拿记忆里的赛果顶上。
+_ESPORTS_OFF = (
+    "赛事数据源没有启用（插件配置里关掉了，或当前环境没有它）。"
+    "如实告诉用户「职业赛事这块暂时查不了」，**不要用你记忆里的赛果替他作答**。"
+)
+
+
+async def _esports_guard(coro: Awaitable[Any], ctx: ToolContext) -> tuple[Any, str]:
+    """给赛事数据源调用套上超时与降级，返回 ``(结果, 说明)``。
+
+    说明非空即「这块没取到」，文字直接可读、可以原样转述给用户。限流单独
+    区分出来：它**不是**「没有这条数据」，而模型最容易在这里犯错 ——
+    把「查不到」讲成「不存在」。所以这里点名要求不许拿记忆补。
+
+    限流这条还多一层纪律（2026-10-13 加）：**不许给时间承诺**。避让时长是插件
+    自己估的止损，站点那侧的解封要人工过校验，写「稍后再试」就是替我们许一个
+    兑现不了的承诺（原来那句「请如实说明稍后再试」就是这个毛病）。
+    """
+    try:
+        return await _guarded(coro, ctx, factor=2.0), ""
+    except dota_esports.EsportsRateLimited as e:
+        # 注意**别把它括在括号里**：e 自己的文案里就可能带括号（HTTP 429 那种），
+        # 套一层就变成嵌套括号。（`DEFAULT_UA` 上就栽过同一坑。）
+        return None, (
+            f"赛事数据源被限流：{e}。这不是「没有这条数据」，而是**这一块现在取不到**；"
+            "如实说明取不到即可，**不要**给用户任何「等多久就能查到」的时间承诺"
+            "（那个分钟数只是插件自己估的止损，不是数据源恢复时间），"
+            "也不要改用你记忆里的赛果作答。"
+        )
+    except dota_esports.EsportsError as e:
+        return None, f"赛事数据源暂时不可用：{e}。这块没取到，请如实说明。"
+    except asyncio.TimeoutError:
+        return None, "赛事数据源响应超时，这块没取到。"
+    except Exception as e:  # noqa: BLE001 —— 赛事源挂掉不该打断整轮问答
+        return None, f"赛事数据源读取失败（{type(e).__name__}），这块没取到。"
+
+
+async def _safe_data(coro: Awaitable[Any], ctx: ToolContext) -> tuple[Any, str]:
+    """跑一次**插件自有数据源**（OpenDota / STRATZ）的调用，返回 ``(结果, 说明)``。
+
+    ``ctx.api`` 正常时永不抛（门面把异常都转成了空结果），但工具层不该
+    赌这一点：一旦这里抛出去，整轮问答只剩一句「执行失败」，连另一条
+    数据源（赛事 wiki）已经拿到的内容也一起丢了。所以这里兜住并记一句
+    说明，让另一条链路照常输出。
+    """
+    try:
+        return await _guarded(coro, ctx), ""
+    except asyncio.TimeoutError:
+        return None, "数据源响应超时，这块没取到。"
+    except Exception as e:  # noqa: BLE001
+        return None, f"数据源读取失败（{type(e).__name__}），这块没取到。"
+
+
+async def _tool_query_tournament(args: dict, ctx: ToolContext) -> str:
+    """赛事信息：不填赛事名时退回「近期职业比赛一览」。"""
+    query = str(args.get("query") or "").strip()
+
+    # ① 没给赛事名 —— 用 OpenDota 的近期职业比赛顶上（这块不依赖 Liquipedia）
+    if not query:
+        rows, note = await _safe_data(ctx.api.get_pro_matches(limit=40), ctx)
+        if note and ctx.esports is None:
+            return _ESPORTS_OFF
+        rendered = dota_esports.format_pro_matches(
+            dota_esports.od_pro_match_rows(rows if isinstance(rows, list) else [], limit=12)
+        )
+        if not rows:
+            rendered += f"\n> {note or '近期职业比赛没取到。'}"
+        rendered += (
+            "\n> 这是最近结束的职业对局。想知道某个赛事的赛程 / 名次 / 积分榜，"
+            "说赛事名即可（如「TI 2026」）。"
+        )
+        return rendered
+
+    # ② 指定赛事
+    if ctx.esports is None:
+        return _ESPORTS_OFF
+    data, note = await _esports_guard(
+        dota_esports.collect_tournament(ctx.esports, query), ctx
+    )
+    data = data if isinstance(data, dict) else {}
+    notes: list[str] = list(data.get("notes") or [])
+    if note:
+        notes.append(note)
+    if not data.get("page"):
+        head = f"没查到赛事「{query}」的页面。"
+        return "\n".join([head] + [f"> {n}" for n in notes])
+
+    return dota_esports.format_tournament(
+        query=query,
+        page=str(data.get("page") or ""),
+        info=data.get("info") or {},
+        teams=data.get("teams") or [],
+        slots=data.get("slots") or [],
+        tables=data.get("tables") or [],
+        swiss=data.get("swiss") or {},
+        matches=data.get("matches") or [],
+        notes=notes,
+    )
+
+
+async def _tool_query_esports_team(args: dict, ctx: ToolContext) -> str:
+    """战队/选手：OpenDota 给队 ID 与战绩，Liquipedia 给赛区与阵容。"""
+    query = str(args.get("team") or "").strip()
+    if not query:
+        return "需要给出战队名（中文昵称、英文名或缩写都行）。"
+
+    notes: list[str] = []
+    info: dict = {}
+    roster_rows: list[dict] = []
+    inactive_rows: list[dict] = []
+    page = ""
+
+    # ① OpenDota：名字 → 队 ID → 评分 / 总胜负 / 现役阵容 / 近期战绩
+    #
+    # OpenDota 的队伍索引只有**英文名与英文简称**，所以中文昵称（「雪碧」「液体」）
+    # 必须先用别名表换成英文名再去匹配 —— 真机第一次验收就是漏了这一步，
+    # 结果问「雪碧」时整块 OpenDota 数据（评分 / 阵容 / 战绩）全丢。
+    od: dict = {}
+    recent: list[dict] = []
+
+    async def _load_od(team_row: dict) -> tuple[dict, list[dict], list[dict]]:
+        """按队 ID 取评分 / 总胜负 + 现役阵容 + 近期战绩。"""
+        team_id = team_row.get("team_id")
+        detail, _ = await _safe_data(ctx.api.get_team(team_id), ctx)
+        detail = detail if isinstance(detail, dict) and detail else dict(team_row)
+        players, _ = await _safe_data(ctx.api.get_team_players(team_id), ctx)
+        rows = dota_esports.od_roster(players if isinstance(players, list) else [])
+        matches, _ = await _safe_data(ctx.api.get_team_matches(team_id, limit=20), ctx)
+        recent_rows = dota_esports.od_recent_rows(
+            matches if isinstance(matches, list) else [], int(team_id), limit=10
+        )
+        return detail, rows, recent_rows
+
+    index, index_note = await _safe_data(ctx.api.get_teams_index(), ctx)
+    index = index if isinstance(index, list) else []
+    alias = dota_esports.team_alias(query)
+    row = dota_esports.match_od_team(index, query)
+    if row is None and alias != query:
+        row = dota_esports.match_od_team(index, alias)
+    if row is None:
+        # 兜底：`/teams` 索引**恰好只有评分最高的 1000 支**（实测最低 1084 分），
+        # 二线队根本不进去 —— 问 Nemiga Gaming 时整块 OpenDota 数据全丢，
+        # 而它在最近职业比赛里明明有记录。`/proMatches` 的行里带队名与队 ID，
+        # 正好补上这个映射（只认完整队名的精确匹配，不放宽成猜）。
+        prov, _ = await _safe_data(ctx.api.get_pro_matches(limit=100), ctx)
+        row = dota_esports.find_team_in_pro_matches(
+            prov if isinstance(prov, list) else [], query, alias
+        )
+    if row:
+        od, roster_rows, recent = await _load_od(row)
+    else:
+        notes.append(
+            index_note
+            or (
+                f"OpenDota 的队伍索引里没匹配到「{query}」"
+                "（索引只覆盖评分最高的 1000 支队，最近职业比赛里也没找到这个队名），"
+                "所以没有评分与近期战绩。"
+            )
+        )
+
+    # ② Liquipedia：赛区 / 教练 / 阵容（社区数据，可能滞后）
+    if ctx.esports is not None:
+        data, note = await _esports_guard(
+            dota_esports.collect_team_page(ctx.esports, query), ctx
+        )
+        if isinstance(data, dict) and data:
+            page = str(data.get("page") or "")
+            info = data.get("info") or {}
+            lp_roster = data.get("roster") or []
+            if lp_roster:
+                roster_rows = lp_roster
+            inactive_rows = data.get("inactive") or []
+            notes.extend(data.get("notes") or [])
+        if note:
+            notes.append(note)
+    else:
+        notes.append("赛事数据源没启用，赛区 / 教练 / 阵容这块没有取。")
+
+    if not info and not od:
+        return "\n".join(
+            [f"没查到战队「{query}」的信息。"] + [f"> {n}" for n in notes]
+        )
+
+    # 近期参加过哪些赛事（去重后给模型一个「在册赛事」的视角）
+    leagues: list[str] = []
+    for m in recent:
+        name = str(m.get("league") or "").strip()
+        if name and name not in leagues:
+            leagues.append(name)
+
+    return dota_esports.format_team(
+        query=query,
+        page=page,
+        info=info,
+        roster=roster_rows,
+        inactive=inactive_rows,
+        od=od,
+        recent=recent,
+        leagues=leagues,
+        notes=notes,
+    )
+
+
+async def _tool_query_transfers(args: dict, ctx: ToolContext) -> str:
+    """转会动态：只有渲染页一条路，被限流时如实说明。"""
+    if ctx.esports is None:
+        return _ESPORTS_OFF
+    player = str(args.get("player") or "").strip()
+    rows, note = await _esports_guard(
+        dota_esports.collect_transfers(ctx.esports, limit=80), ctx
+    )
+    rows = rows if isinstance(rows, list) else []
+    if note and not rows:
+        return note + "转会数据只有「渲染页」这条路，被限流时绕不开。"
+
+    filtered = dota_esports.filter_transfers(rows, player) if player else rows
+    if player and not filtered:
+        return (
+            f"最近的转会记录里没有「{player}」。**这不等于他没转会** —— "
+            "只说明这份社区维护的列表里这段时间没有他的记录，请如实这么说。"
+        )
+    # 有筛选词时就渲染筛选后的列表 —— 渲染全量再标一句「筛选」会让模型
+    # 把别人的转会记到这个人头上。
+    text = dota_esports.format_transfers(filtered, query=player, limit=20)
+    if note:
+        text += f"\n> {note}"
+    return text
+
+
 async def _tool_query_schedules(args: dict, ctx: ToolContext) -> str:
     if ctx.schedules_text is None:
         return "当前环境不支持查看定时任务，请让用户用 `/d2 定时 列表`。"
@@ -1445,6 +1772,9 @@ _DISPATCH: dict[str, Callable[[dict, ToolContext], Awaitable[str]]] = {
     "query_meta": _tool_query_meta,
     "recommend_heroes": _tool_recommend_heroes,
     "query_hero_playstyle": _tool_query_hero_playstyle,
+    "query_tournament": _tool_query_tournament,
+    "query_esports_team": _tool_query_esports_team,
+    "query_transfers": _tool_query_transfers,
     "query_schedules": _tool_query_schedules,
     "query_match_detail": _tool_query_match_detail,
     "request_match_parse": _tool_request_match_parse,
@@ -1508,7 +1838,7 @@ async def run_tool(name: str, arguments: Any, ctx: ToolContext) -> str:
         # 成功即清零：失败计数说的是「连续」，一次成功就说明工具本身没坏
         ctx.failures.pop(name, None)
     elapsed = asyncio.get_running_loop().time() - started
-    out = _truncate(text)
+    out = _truncate(text, _output_limit(name))
     ctx.trace.append(f"{name}({_brief_args(args)}) {elapsed:.1f}s {len(out)}字")
     return out
 
@@ -1594,6 +1924,38 @@ TOOL_GUIDE = """=== 你可以调用工具查数据、也可以调用工具改设
   和上面的位置场次做除法。
 - 出门装 / 鞋子 / 出装路线里的数字都是**购买次数**（消耗品一局能买多个），
   不是「多少局这么出」，**不要**当成出场率。
+
+**职业赛事 / 战队 / 转会（`query_tournament` / `query_esports_team` / `query_transfers`）**：
+这三块的数据来自**社区维护的 Dota2 赛事 wiki（Liquipedia）**，不是官方、且**限流很紧**
+（同一时刻只能查一个赛事），另有 OpenDota 提供队伍评分与近期职业战绩。几条纪律：
+- **查不到就说查不到，一个字都不要脑补。**这是本组工具最容易犯的错：赛事数据源被限流
+  或临时不可用时，工具会明确写「限流 / 没取到」，此时**必须**如实转述，
+  **绝对不能**用你记忆里的赛果、冠军、比分、名次来填 —— 你记忆里的（比如某届 TI 谁夺冠）
+  很可能已经过时或根本记错，说出来就是假消息。
+- **不要给「没取到」编原因。**只有**工具自己写出来的原因**（例如它明说「限流」）才可以
+  转述；工具只写了「没取到 / 没匹配到 / 这一项拿不到」这类事实时，**只照说这一句**，
+  不许自己补「因为限流了」「因为数据源挂了」「因为它没报名」这类解释。
+  实机上真出过这件事：工具明明抓到了完整页面、只是那一块没解析出来，
+  模型却对用户说「数据源那边限流了」，用户当真了。**工具没给的原因，就是没有原因。**
+- **工具说「限流」时，不许给时间承诺。**只说「这一块现在取不到」，
+  **不要**说「过一会儿再试」「等几分钟就能查到」「稍后再查」这类话 ——
+  工具写出的那个分钟数是**插件自己估的止损时间**，**不等于**数据源恢复时间
+  （站点那侧要人工在浏览器过一次校验才可能解封）。凡是要把「多久以后就会好」
+  讲给用户的，一律不讲；用户追问「要等多久」，就答「说不好，得那边解封才行」。
+- **不要编比分、不要编名次、不要编转会。**工具没给出的具体数字一律说「没取到」。
+  名单里没有某个选手，只能说「这份列表里没有他的记录」，**不要说成「他没转会」**。
+- 赛事名/队名**照用户原话填**，不要自己翻译或补全（内部有中文对照表与搜索）。
+  用户只问「最近有什么职业比赛」而没提具体赛事时，`query_tournament` **留空 query**。
+- 「**某队能否出线**」问的是**形势**：只能基于积分榜上该队的位置与赛事定义的晋级区
+  来说明（在晋级区 / 在淘汰区 / 边缘），**不要**下断言式的保证，也不要把
+  「晋级区」讲成「已经出线」。
+- 名次那块的百分比是**奖金分配比例**（不是夺冠概率），而且**只有档位、不指名战队** ——
+  **不要**把「第 1 名约 42.5%」讲成「某队拿了第一」，逐队名次要以赛事实际给出的名单为准，
+  没有名单就如实说没取到。带「积分」字样的那一列是**排名积分**，不是奖金。
+  「已结束」的赛事才谈最终名次。
+- 阵容以**现役**为准：拿到的名单只列现役成员，别把历史成员（或你记忆里的旧阵容）
+  说成现在这支队的人。
+- 一次只查一个赛事 / 一支队；要问几支队就分几次调。
 
 【二、后台任务类】只发起，**不等待结果**
 9. `query_match_detail`（单场复盘）与 `request_match_parse`（催解析）都是**异步**的：

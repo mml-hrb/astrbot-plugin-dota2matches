@@ -35,6 +35,12 @@ HERO_STATS_CACHE_TTL = 3 * 3600
 #: 补丁表（``/constants/patch``）缓存有效期（秒）。补丁几个月才动一次。
 PATCH_CACHE_TTL = 12 * 3600
 
+#: 战队索引（``/teams``）缓存有效期（秒）。
+#:
+#: 这个端点返回**评分最高的 1000 支队伍**（实测约 250KB），用来把「队伍名」
+#: 解析成 ``team_id``。体量不大但也不该每次查询都拉，24 小时足够。
+TEAMS_INDEX_CACHE_TTL = 24 * 3600
+
 #: recentMatches 接口的硬上限（OpenDota 固定最多只返回最近 20 场）
 RECENT_MATCHES_LIMIT = 20
 
@@ -163,6 +169,9 @@ class OpenDotaClient:
         #: None 表示还没拉过；空 list 表示拉过但失败。
         self._patches_cache: list[dict] | None = None
         self._patches_cache_at = 0.0
+        #: 战队索引（``/teams``，评分前 1000）。同上：None 未拉过、空 list 拉过但失败。
+        self._teams_index_cache: list[dict] | None = None
+        self._teams_index_at = 0.0
 
     # ------------------------------------------------------------------
     # 底层请求
@@ -643,6 +652,79 @@ class OpenDotaClient:
         return data if isinstance(data, dict) else {}
 
     # ------------------------------------------------------------------
+    # 职业赛事（队伍 / 赛事 / 职业比赛）
+    # ------------------------------------------------------------------
+    async def get_pro_matches(self, limit: int = 100) -> list[dict]:
+        """最近结束的职业比赛（``GET /proMatches``）。
+
+        每行含 ``match_id`` / ``leagueid`` / ``league_name`` /
+        ``radiant_name`` / ``dire_name`` / 比分 / ``start_time``。
+        这是 OpenDota **唯一**的「职业比赛」列表端点，固定返回最近约 100 场，
+        没有分页参数 ⇒ 想按赛事看全部对局得靠 ``/leagues/{id}/matches``。
+
+        .. note::
+           对手队伍为 ``null`` 的行是**真实情况**（该队伍没在 OpenDota 登记 ID），
+           调用方要如实渲染，不要补成「未知」以外的猜测。
+        """
+        data = await self._request("/proMatches")
+        rows = [row for row in (data or []) if isinstance(row, dict)]
+        if limit and int(limit) > 0:
+            return rows[: int(limit)]
+        return rows
+
+    async def get_leagues(self) -> list[dict]:
+        """全部赛事名单（``GET /leagues``）。
+
+        实测约 1MB / 数千条，每行是 ``{leagueid, name, tier}``。**调用方必须自己缓存**，
+        本客户端不做缓存（体量大、且不同调用方要的切片不一样）。
+        """
+        data = await self._request("/leagues", timeout=max(30, self.timeout))
+        return [row for row in (data or []) if isinstance(row, dict)]
+
+    async def get_team(self, team_id: int) -> dict:
+        """某战队的评分与总胜负（``GET /teams/{id}``）。取不到返回空 dict。"""
+        data = await self._request(f"/teams/{int(team_id)}", allow_404=True)
+        return data if isinstance(data, dict) else {}
+
+    async def get_team_players(self, team_id: int) -> list[dict]:
+        """某战队的选手名单（``GET /teams/{id}/players``）。
+
+        关键字段是 ``is_current_team_member`` —— 它区分「现在在队」与
+        「曾经在队」，是判断阵容变动最可靠的现成口径。
+        """
+        data = await self._request(f"/teams/{int(team_id)}/players", allow_404=True)
+        return [row for row in (data or []) if isinstance(row, dict)]
+
+    async def get_team_matches(self, team_id: int, limit: int = 20) -> list[dict]:
+        """某战队最近的比赛（``GET /teams/{id}/matches``），**按时间倒序**。"""
+        data = await self._request(f"/teams/{int(team_id)}/matches", allow_404=True)
+        rows = [row for row in (data or []) if isinstance(row, dict)]
+        rows.sort(key=lambda row: row.get("start_time") or 0, reverse=True)
+        if limit and int(limit) > 0:
+            return rows[: int(limit)]
+        return rows
+
+    async def get_teams_index(self, force: bool = False) -> list[dict]:
+        """队伍索引（``GET /teams``），用于「队伍名 → team_id」。
+
+        返回**评分最高的 1000 支**队伍（实测约 250KB），带 24 小时缓存。
+        查不到的队伍（例如只在预选赛出现的小队）不在这份索引里 —— 此时
+        调用方要如实说「按名字没匹配到战队」，不要猜一个 ID 去查别人。
+        """
+        now = time.time()
+        if (
+            not force
+            and self._teams_index_cache is not None
+            and now - self._teams_index_at < TEAMS_INDEX_CACHE_TTL
+        ):
+            return self._teams_index_cache
+        data = await self._request("/teams", timeout=max(30, self.timeout))
+        rows = [row for row in (data or []) if isinstance(row, dict)]
+        self._teams_index_cache = rows
+        self._teams_index_at = now
+        return rows
+
+    # ------------------------------------------------------------------
     # 英雄版本胜率（「轮椅」榜单的数据源）
     # ------------------------------------------------------------------
     async def get_hero_stats(self, force: bool = False) -> list[dict]:
@@ -1085,6 +1167,59 @@ class FallbackDataSource:
         except OpenDotaError as e:
             logger.warning(f"[dota2] 全分段出装路线：OpenDota 查询失败，这一块将不可用：{e}")
             return {}
+
+    async def _from_opendota(
+        self, method_name: str, empty: Any, *args: Any, what: str, **kwargs: Any
+    ) -> Any:
+        """把「只归属 OpenDota」的接口固定转发过去，失败时返回 ``empty`` 并 warning。
+
+        这类接口（职业比赛 / 赛事 / 战队）**没有 STRATZ 等价物**，所以不能
+        按「主源优先」走 —— 主源是 STRATZ 时它会拿到一句「没这个方法」，
+        然后把「能力不存在」误报成「没有数据」。与 :meth:`get_hero_stats`
+        （抛错）的区别在于：那几个是**核心能力**，缺了要如实告知用户；
+        这几个是**增强能力**，缺了只少一块，不该把整轮问答打断。
+        """
+        method = getattr(self._opendota_side(), method_name, None)
+        if method is None:
+            logger.warning(f"[dota2] {what}：当前数据源组合里没有 OpenDota，这一块将不可用")
+            return empty
+        try:
+            return await method(*args, **kwargs)
+        except OpenDotaError as e:
+            logger.warning(f"[dota2] {what}：OpenDota 查询失败，这一块将不可用：{e}")
+            return empty
+
+    async def get_pro_matches(self, *args: Any, **kwargs: Any) -> list[dict]:
+        """近期职业比赛：**固定走 OpenDota**（STRATZ 无等价端点）。"""
+        return await self._from_opendota(
+            "get_pro_matches", [], what="近期职业比赛", *args, **kwargs
+        )
+
+    async def get_leagues(self, *args: Any, **kwargs: Any) -> list[dict]:
+        """赛事名单：**固定走 OpenDota**。"""
+        return await self._from_opendota("get_leagues", [], what="赛事名单", *args, **kwargs)
+
+    async def get_team(self, *args: Any, **kwargs: Any) -> dict:
+        """战队概览：**固定走 OpenDota**。"""
+        return await self._from_opendota("get_team", {}, what="战队概览", *args, **kwargs)
+
+    async def get_team_players(self, *args: Any, **kwargs: Any) -> list[dict]:
+        """战队阵容：**固定走 OpenDota**。"""
+        return await self._from_opendota(
+            "get_team_players", [], what="战队阵容", *args, **kwargs
+        )
+
+    async def get_team_matches(self, *args: Any, **kwargs: Any) -> list[dict]:
+        """战队近期比赛：**固定走 OpenDota**。"""
+        return await self._from_opendota(
+            "get_team_matches", [], what="战队近期比赛", *args, **kwargs
+        )
+
+    async def get_teams_index(self, *args: Any, **kwargs: Any) -> list[dict]:
+        """队伍索引（名字 → ID）：**固定走 OpenDota**。"""
+        return await self._from_opendota(
+            "get_teams_index", [], what="队伍索引", *args, **kwargs
+        )
 
     def _stratz_side(self) -> Any:
         """找出数据源组合里的 STRATZ 客户端；没有则返回 ``None``。

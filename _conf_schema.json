@@ -35,6 +35,32 @@
     "default": "",
     "hint": "例如 http://127.0.0.1:7890 。国内服务器访问 api.opendota.com 不稳定时建议配置。留空表示不使用代理。"
   },
+  "esports_enabled": {
+    "description": "启用职业赛事数据源",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，闲聊里可以问赛事（赛程 / 参赛队伍 / 名次 / 积分榜 / 出线形势）、战队（赛区 / 阵容 / 近期战绩）与选手转会。数据来自社区维护的 Dota2 赛事 wiki（Liquipedia，CC BY-SA 3.0）与 OpenDota。关闭后这三种提问会如实回复「这块查不了」，其余功能不受影响。"
+  },
+  "esports_contact": {
+    "description": "赛事数据源联系方式",
+    "type": "string",
+    "default": "",
+    "hint": "会写进请求的 User-Agent。Liquipedia 的条款要求调用方声明身份，留空则使用插件作者的联系方式。建议填你自己的邮箱或站点。"
+  },
+  "liquipedia_api_key": {
+    "description": "Liquipedia API Key（可选）",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "可选。匿名调用限制很严（普通接口 1 次/2 秒、渲染接口 1 次/30 秒），申请 Key 后配额会放宽。申请地址：https://liquipedia.net/commons/Help:API 。留空也能用，插件会自行限速并做长缓存。",
+    "obvious_hint": true
+  },
+  "esports_cache_ttl_minutes": {
+    "description": "赛事页面缓存时长（分钟）",
+    "type": "int",
+    "default": 30,
+    "hint": "赛事页 / 战队页的磁盘缓存有效期。调大可以显著减少请求（限流很紧），代价是赛程与积分榜更新得更慢。"
+  },
   "request_timeout": {
     "description": "API 请求超时（秒）",
     "type": "int",

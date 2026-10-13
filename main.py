@@ -74,6 +74,7 @@ try:  # 插件目录被作为包加载时的相对导入
     from .dota_store import DotaStore
     from . import dota_chat
     from . import dota_cron
+    from . import dota_esports
     from . import dota_hero_playstyle
     from . import dota_history
     from . import dota_nlu
@@ -135,6 +136,7 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
 
     import dota_chat  # type: ignore[no-redef]
     import dota_cron  # type: ignore[no-redef]
+    import dota_esports  # type: ignore[no-redef]
     import dota_hero_playstyle  # type: ignore[no-redef]
     import dota_history  # type: ignore[no-redef]
     import dota_nlu  # type: ignore[no-redef]
@@ -623,6 +625,12 @@ class Dota2Plugin(Star):
             enabled=bool(self.cfg("zh_names", True)),
             learn=bool(self.cfg("zh_learn_missing", True)),
         ).load()
+        #: 职业赛事数据源（Liquipedia wiki）。
+        #:
+        #: 它是**懒连接**的：构造时不发请求，第一次真正查询才建 httpx 客户端，
+        #: 所以「关了开关」「没配联系方式」都不会拖慢插件启动。页面缓存落在
+        #: ``data/esports_cache/``，限流窗口也记在那里（热重载不忘）。
+        self.esports = self._build_esports()
         #: 等待解析 / 等待推送的比赛：``{match_id: pending_item}``
         #:
         #: 键就是 ``match_id``：**一局比赛只分析一次**。同一局里可能有多位被
@@ -1415,6 +1423,30 @@ class Dota2Plugin(Star):
             except Exception:  # noqa: BLE001
                 pass
         return "STRATZ" if self._data_source_choice() == "stratz" else "OpenDota"
+
+    def _build_esports(self):
+        """构造职业赛事数据源（Liquipedia）。关掉开关时返回 ``None``。
+
+        返回 ``None`` 不是「坏了」——工具层会据此回一句「这块没启用」，
+        而不是抛异常。联系方式与 Key 都来自配置：联系方式会进 User-Agent
+        （Liquipedia 的条款要求，缺了直接 403），Key 是可选的（有 Key 配额更宽）。
+        """
+        if not bool(self.cfg("esports_enabled", True)):
+            logger.info("[dota2] 职业赛事数据源已在配置中关闭（esports_enabled=false）")
+            return None
+        ttl_minutes = self.cfg("esports_cache_ttl_minutes", 30)
+        try:
+            ttl = max(5.0, float(ttl_minutes or 30)) * 60.0
+        except (TypeError, ValueError):
+            ttl = 1800.0
+        return dota_esports.LiquipediaClient(
+            contact=str(self.cfg("esports_contact", "") or ""),
+            api_key=str(self.cfg("liquipedia_api_key", "") or ""),
+            timeout=self.cfg("request_timeout", 30),
+            proxy=self.cfg("http_proxy", ""),
+            cache_dir=self.data_dir / "esports_cache",
+            cache_ttl=ttl,
+        )
 
     def _build_data_source(self):
         """按配置组装数据源。
@@ -2214,6 +2246,7 @@ class Dota2Plugin(Star):
                 umo, uid, event, kind, params
             ),
             schedules_text=lambda: self._schedule_list_text(umo),
+            esports=getattr(self, "esports", None),
             now=time.time(),
             timeout=timeout,
         )
@@ -6841,4 +6874,7 @@ class Dota2Plugin(Star):
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         await self.api.close()
+        esports = getattr(self, "esports", None)
+        if esports is not None:
+            await esports.close()
         logger.info("[dota2] 插件已卸载，监听任务与等待解析任务已停止")
