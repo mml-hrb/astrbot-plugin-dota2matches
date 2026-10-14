@@ -26,6 +26,14 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools
 
+try:  # 引用（「回复」）组件的类：路径随 AstrBot 版本变过，取不到就退回按类名判
+    from astrbot.core.message.components import Reply as _QuotedReply
+except Exception:  # noqa: BLE001
+    try:
+        from astrbot.api.message.components import Reply as _QuotedReply  # type: ignore
+    except Exception:  # noqa: BLE001
+        _QuotedReply = None  # type: ignore[assignment]
+
 try:  # 插件目录被作为包加载时的相对导入
     from .dota_analyzer import (
         LLMRequestError,
@@ -289,6 +297,100 @@ NLU_SKIP_PREFIXES = ("/", "／", "!", "！", "#", "。", "~", "～")
 #: 对话（尤其群里），因此默认要求消息里出现这个词才认。
 NLU_DEFAULT_KEYWORD = "dota2助手"
 
+#: 引用（「回复」）正文进入提示词前的长度上限。简报自己就有几百字，
+#: 再长也没有增量信息，白白占提示词的 token。
+QUOTE_TEXT_MAX_CHARS = 900
+
+#: 本插件自己发出去的消息里的**固定标记** —— 用来判断「用户引用的这条消息
+#: 是不是插件发的」。
+#:
+#: 为什么不只看 ``sender_id``：**QQ 官方适配器构造引用段时只填内容、不填
+#: 发送者**（``Reply(id=…, chain=…, message_str=…)``，``sender_id`` 留默认
+#: ``0``），于是「回复机器人的消息」在框架层根本认不出来 ——
+#: ``waking_check`` 那句 ``Reply.sender_id == self_id`` 在 QQ 官方链路上恒为假。
+#: 内容特征是**所有链路都成立**的那一个。NapCat（aiocqhttp）链路两者都有，
+#: ``sender_id`` 判据仍然保留（见 :func:`_extract_quote`）。
+_PLUGIN_OUTPUT_MARKERS = (
+    "🏁 比赛回顾",             # 监听推送的简报标题
+    "数据来源：Liquipedia",     # 赛事 / 战队 / 转会查询的署名
+    "数据来源：STRATZ",         # 数据源自检
+    "数据来源：OpenDota",       # 催解析等回执
+    "🎮 Dota2 数据查询助手",    # 帮助文本抬头
+    "正在拉取比赛",             # 单场复盘的受理回执
+)
+
+
+def _looks_like_plugin_output(text: str) -> bool:
+    """引用的正文看起来是不是本插件自己发出去的。"""
+    body = str(text or "")
+    return bool(body) and any(mark in body for mark in _PLUGIN_OUTPUT_MARKERS)
+
+
+def _message_chain(event: AstrMessageEvent) -> list[Any]:
+    """取本条消息的消息链（段列表）；取不到返回空列表。"""
+    message_obj = getattr(event, "message_obj", None)
+    chain = getattr(message_obj, "message", None) if message_obj is not None else None
+    if chain:
+        try:
+            return list(chain)
+        except TypeError:
+            return []
+    try:
+        return list(event.get_messages() or [])
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _is_quote_component(component: Any) -> bool:
+    """这一段是不是「引用（回复）」段。"""
+    if _QuotedReply is not None and isinstance(component, _QuotedReply):
+        return True
+    # 版本兜底：类路径取不到时按类名认（AstrBot 这个组件的类名一直是 Reply）
+    return component.__class__.__name__ == "Reply"
+
+
+def _extract_quote(event: AstrMessageEvent) -> tuple[str, bool]:
+    """取本条消息**引用**的那条消息的正文。
+
+    返回 ``(引用正文, 是否冲着本插件来的)``；没有引用时 ``("", False)``。
+
+    .. important::
+
+       为什么必须自己取：各平台适配器构造 ``event.message_str`` 时
+       **只放用户自己打的那段正文**，被引用内容只进消息链的 ``Reply`` 段。
+       插件一直只读 ``message_str``，于是「引用 bot 的简报 + 一句『分析这盘』」
+       到模型手里只剩「分析这盘」—— 比赛 ID 与焦点玩家全在被引用那段里。
+       用户看到的现象就是「bot 像看不见引用内容一样」。
+
+       另外**框架那句「回复机器人即视为唤醒」也不可靠**：它比的是
+       ``Reply.sender_id``，而 QQ 官方适配器压根不填这个字段（见
+       :data:`_PLUGIN_OUTPUT_MARKERS` 的说明）。所以「是不是冲着插件来的」
+       得由插件自己判，判据有三条，命中任一即可：
+
+       1. 适配器给了被引用消息的发送者，且**就是机器人自己**（NapCat 链路）；
+       2. 引用正文里含 :data:`_PLUGIN_OUTPUT_MARKERS` 里的插件固定标记；
+       3. 引用正文里含一个**Dota 比赛 ID**（>= 50 亿的长数字）——
+          带比赛编号的引用几乎只可能来自插件的简报，或用户自己贴的 ID。
+
+       实现刻意是**同步、零网络**的：只用适配器已经塞进 ``Reply`` 段的
+       ``message_str``，不回源拉历史消息（那是一次额外请求，还可能因权限拿不到）。
+       AstrBot 官方的 ``extract_quoted_message_text`` 是 async 且缺正文时会回源，
+       这里不用它。
+    """
+    for component in reversed(_message_chain(event)):
+        if not _is_quote_component(component):
+            continue
+        text = str(getattr(component, "message_str", "") or "").strip()
+        sender = str(getattr(component, "sender_id", "") or "").strip()
+        self_id = str(event.get_self_id() or "").strip()
+        for_bot = bool(
+            (sender and self_id and sender == self_id)
+            or _looks_like_plugin_output(text)
+            or (dota_nlu.extract_match_id(text) is not None)
+        )
+        return text[:QUOTE_TEXT_MAX_CHARS], for_bot
+    return "", False
+
 
 class NluGate(NamedTuple):
     """唤醒词闸门的判定结果。
@@ -296,17 +398,24 @@ class NluGate(NamedTuple):
     自然语言入口需要区分两种情况：
 
     * 「放行」—— 这条消息不该由插件处理，原样交给别的插件与默认大模型；
-    * 「因为命中唤醒词才放行」—— 用户已经**明确点名**了插件，只是没说清
-      要什么。此时不该把消息扔回默认大模型（它看不到插件里的监听列表、
-      绑定关系、战绩数据），而应该由插件带着数据自己回答，
-      这就是「闲聊兜底」的触发条件。
+    * 「明确点名了插件」—— 用户写了唤醒词、或**引用了本插件发过的消息**
+      （QQ「回复」功能），只是没说清要什么。此时不该把消息扔回默认大模型
+      （它看不到插件里的监听列表、绑定关系、战绩数据），而应该由插件带着
+      数据自己回答，这就是「闲聊兜底」的触发条件。
 
-    所以闸门除了返回剥离唤醒词后的正文，还要把 ``keyword_matched``
-    一起带出来。
+    所以闸门除了返回剥离唤醒词后的正文，还要把点名信号一起带出来，
+    并且分成两个字段：``keyword_matched`` 记「是不是写了唤醒词」，
+    ``addressed`` 记「是不是明确点名」（两者取或）。分开是因为**来源不同的
+    那句话在别处还有用**（例如日志要如实区分「他是叫了名字，还是只是一条
+    回复」），但决定「要不要接管」时只看 ``addressed``。
     """
 
     text: str
     keyword_matched: bool
+    #: 用户是不是**明确点名**了本插件：写了唤醒词，或引用了本插件发过的消息。
+    #: （引用为什么算点名、怎么判，见 :func:`_extract_quote` 与
+    #: :meth:`_nlu_should_handle`。）
+    addressed: bool = False
 
 
 #: 配置中未填写系统提示词时的兜底内容。
@@ -1912,6 +2021,46 @@ class Dota2Plugin(Star):
         """本会话最近提到过的比赛（由新到旧）。"""
         return list(self._nlu_recent_matches.get(str(umo or "")) or [])[:limit]
 
+    def _nlu_note_quoted_match(self, umo: str, quoted_text: str) -> int | None:
+        """把「用户引用的那条消息」里的比赛记进会话语境。
+
+        为什么值钱：引用是用户**此刻明确指着**的那一场，而
+        :meth:`_nlu_remember_match` 记进去之后，「没给 ID 就回落最近一场」
+        的所有出口（单场复盘的焦点回落、催解析、定时任务的「这场」、工具里
+        的会话比赛）都会读到它，且因为它被提到最前而优先。
+
+        只认比赛 ID，**刻意不猜玩家**：一份简报里通常同时出现十个人的昵称，
+        拿它去匹配本会话名单只会一次性得到一堆「焦点」。玩家名交给模型从
+        引用原文里读 —— 那份原文已经作为上下文块给它了（见
+        ``dota_chat.ChatContext.quoted``）。
+        """
+        match_id = dota_nlu.extract_match_id(quoted_text)
+        if not match_id:
+            return None
+        self._nlu_remember_match(
+            umo, match_id, desc="（用户引用的消息）", log=False
+        )
+        return match_id
+
+    def _nlu_effective_question(self, text: str, quoted_text: str) -> str:
+        """送进【用户的问题】的那句话。
+
+        用户**只引用、一个字没打**时，正文是空的。这时候给他一个明确的默认
+        意图，而不是把空问题丢给模型 —— 对着一份战报按「回复」，他要的多半
+        就是「讲讲这盘」。措辞刻意留了退路（「拿不准就问一句」），免得把
+        「引用一下只是想感慨」也硬做成一份报告。
+        """
+        body = str(text or "").strip()
+        if body:
+            return body
+        if quoted_text:
+            return (
+                "（用户没有打字，只引用了上面那条消息 —— 意思是「就这个」。"
+                "若引用的是本插件的战报 / 简报，多半想让你讲讲这把；"
+                "拿不准就直接问他一句。）"
+            )
+        return ""
+
     def _nlu_head_text(self, text: str) -> str:
         """剥离唤醒词后的正文；没写唤醒词时**原样返回**。
 
@@ -1921,54 +2070,148 @@ class Dota2Plugin(Star):
         _matched, rest = dota_nlu.strip_wake_keyword(text, self._nlu_keyword())
         return rest
 
-    def _nlu_should_handle(self, event: AstrMessageEvent, text: str) -> NluGate | None:
+    def _quote_single_player(
+        self, event: AstrMessageEvent, quoted_text: str
+    ) -> str:
+        """引用正文里**恰好**对上本会话一个人的名字；对不上或有歧义就不给。
+
+        为什么要「恰好一个」：一份简报里通常同时出现十个人的昵称，其中可能
+        有好几个都是本会话绑定 / 监听的人。这时猜谁都是错的 —— 用户真要指定
+        会自己说。（与 :func:`dota_nlu.match_session_name` 的「同长度多候选
+        就放弃」是同一个原则，只是这里用的是更严的「名单全名原样出现」。）
+        """
+        try:
+            names = self._nlu_known_names(str(event.unified_msg_origin))
+        except Exception:  # noqa: BLE001
+            return ""
+        body = str(quoted_text or "").lower()
+        hits = sorted(
+            {
+                str(name).strip()
+                for name in names
+                if len(str(name).strip()) >= 2
+                and str(name).strip().lower() in body
+            },
+            key=len,
+            reverse=True,
+        )
+        return hits[0] if len(hits) == 1 else ""
+
+    def _args_with_quote(
+        self,
+        event: AstrMessageEvent,
+        args: Any,
+        *,
+        mode: str = "player",
+        with_player: bool = True,
+    ) -> str:
+        """指令参数为空时，用本条消息**引用**的内容补上。
+
+        .. important::
+
+           这是不得不打的一道补丁：框架在 ``WakingCheckStage`` 里就把指令
+           参数从 ``event.message_str`` 切好、存进 event extra 了
+           （``CommandFilter.filter``），而那个字段**不含被引用内容**
+           （见 :func:`_extract_quote`）—— 插件没有任何办法让引用进 args。
+           于是「引用一份简报 + 打 `/d2 单场`」时 args 是空的，用户要的那场
+           明明就在引用正文里，却传不进来。
+
+           用户自己写了参数就以他写的为准：**只在 args 为空时补**。
+
+        Args:
+            args: 用户自己写的参数。
+            mode: 从引用里抽什么 —— ``"match"`` 先抽比赛 ID（排在第一位，
+                与 ``/d2 单场 <ID> [焦点]`` 的用法一致），``"player"``
+                只抽玩家名。
+            with_player: 是否允许把玩家名补进来（催解析只认比赛 ID，
+                多带一个名字反而会被当成格式错误）。
+        """
+        body = str(args or "").strip()
+        if body:
+            return body
+        quoted_text, _for_bot = _extract_quote(event)
+        if not quoted_text:
+            return ""
+        parts: list[str] = []
+        if mode == "match":
+            match_id = dota_nlu.extract_match_id(quoted_text)
+            if match_id:
+                parts.append(str(match_id))
+        if with_player:
+            name = self._quote_single_player(event, quoted_text)
+            if name:
+                parts.append(name)
+        return " ".join(parts)
+
+    def _nlu_should_handle(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        *,
+        quoted_for_bot: bool = False,
+    ) -> NluGate | None:
         """判断这条消息要不要交给自然语言入口处理。
 
-        返回 :class:`NluGate`（含**真正送去解析的文本**与「是否命中唤醒词」），
-        返回 ``None`` 表示不处理。
+        返回 :class:`NluGate`（含**真正送去解析的文本**、是否命中唤醒词、
+        是否属于「明确点名」），返回 ``None`` 表示不处理。
 
         自然语言入口是 ``EventMessageType.ALL`` 上的全局监听，不设闸门就会
         抢答别的插件（以及群里其他人的闲聊）的对话。闸门依次是：
 
         1. 总开关 ``nlu_enabled``；
         2. 指令类消息（``/`` 开头等）让给命令 handler；
-        3. 唤醒词：默认要求消息里出现「dota2助手」，命中即剥掉再解析；
-        4. 群聊里没写唤醒词时，仍要求 @ 机器人（``nlu_group_require_at``）。
+        3. **点名** —— 出现唤醒词（默认「dota2助手」），**或者引用了本插件
+           自己发过的消息**（QQ「回复」功能）。命中唤醒词即剥掉再解析；
+        4. 群聊里没点名时，仍要求 @ 机器人（``nlu_group_require_at``）。
 
-        第 3 与第 4 步的关系：**唤醒词本身就是一次明确点名**，命中它就等于
-        已经 @ 过机器人，因此不再重复要求 @，避免「又写唤醒词又 @」的双重
-        门槛。反过来，只有 @ 而没写唤醒词的消息会被第 3 步挡掉。
+        第 3 与第 4 步的关系：**两种点名都是「用户把话说给插件听」**，命中
+        任一个就不再重复要求 @，避免双重门槛。反过来，只有 @ 而没点名的
+        消息会被第 3 步挡掉。
 
-        注意返回值里的 ``keyword_matched``：只有它为真时，调用方才允许
-        走「闲聊兜底」（没识别出指令时由插件带数据回答）。关掉唤醒词
-        限制（``nlu_require_keyword=false``）时它恒为假，插件就不会去
+        引用为什么算点名：用户对着一份简报按「回复」再说话，本身就是把话
+        说给插件听，而且那份简报里的比赛 ID / 焦点玩家正是他要用的东西。
+        框架层那句「回复机器人即视为唤醒」只认 ``Reply.sender_id``，而
+        **QQ 官方适配器不填这个字段**，所以只能由插件自己认
+        （判据见 :func:`_extract_quote`，由调用方算好传进来）。
+
+        Args:
+            quoted_for_bot: 本条消息是否引用了本插件发过的消息
+                （由 :func:`_extract_quote` 判定）。
+
+        注意返回值里的 ``addressed``：只有它为真时，调用方才允许走
+        「闲聊兜底」（由插件带数据回答）。关掉唤醒词限制
+        （``nlu_require_keyword=false``）且没引用时它恒为假，插件就不会去
         抢答任何一条闲聊 —— 这是**故意的**安全一侧。
         """
         if not self.cfg("nlu_enabled", True):
             return None
         text = (text or "").strip()
-        if not text:
+        # 「只引用、一个字没说」也要放行：用户对着一份简报按了「回复」，
+        # 意思就是「就这条」。以前这里直接返回 None，这类消息会被整个丢掉。
+        if not text and not quoted_for_bot:
             return None
         # 指令类消息交给命令 handler，这里不截胡
         if text.startswith(NLU_SKIP_PREFIXES):
             return None
 
-        # ---- 唤醒词闸门 ----
+        # ---- 点名闸门（唤醒词 / 引用本插件的消息） ----
         keyword_matched = False
         effective = text
         if self.cfg("nlu_require_keyword", True):
             keyword_matched, effective = dota_nlu.strip_wake_keyword(
                 text, self._nlu_keyword()
             )
-            if not keyword_matched:
+            if not keyword_matched and not quoted_for_bot:
                 return None
-            if not effective:
+            if not effective and not quoted_for_bot:
                 # 只发了个唤醒词、没说要求什么：不猜，留给默认大模型
                 return None
             # 剥掉唤醒词后如果露出的是别的插件/本插件的指令（「dota2助手 /help」），
             # 同样不截胡 —— 那条消息该由对应的命令 handler 处理。
             if effective.startswith(dota_nlu.NLU_STRIP_CMD_PREFIXES):
                 return None
+
+        addressed = keyword_matched or quoted_for_bot
 
         # 群聊 / 私聊判断：用消息类型与 umo 双重判断，兼容各适配器。
         # get_message_type 在少数自定义 Event 上可能不存在，因此做了容错。
@@ -1978,7 +2221,7 @@ class Dota2Plugin(Star):
         except Exception:  # noqa: BLE001
             message_type = ""
         is_group = "GROUP_MESSAGE" in message_type or "GroupMessage" in umo
-        if is_group and self.cfg("nlu_group_require_at", True) and not keyword_matched:
+        if is_group and self.cfg("nlu_group_require_at", True) and not addressed:
             # 群里必须 @ 机器人（或使用唤醒前缀，此时 message_str 里已带前缀）。
             # 这条限制能挡掉绝大多数「群里别人随口一说就被插件抢答」的情况。
             try:
@@ -1986,7 +2229,11 @@ class Dota2Plugin(Star):
                     return None
             except AttributeError:
                 return None
-        return NluGate(text=effective, keyword_matched=keyword_matched)
+        return NluGate(
+            text=effective,
+            keyword_matched=keyword_matched,
+            addressed=addressed,
+        )
 
     def _nlu_session_players(self, umo: str) -> list[dict]:
         """本会话里「有名字的人」：已绑定 + 已监听，按 account_id 去重。
@@ -2366,7 +2613,10 @@ class Dota2Plugin(Star):
             coro = self._nlu_async_parse(umo, match_id)
             note = "已开始检查并申请解析"
         else:
-            coro = self._nlu_async_match_detail(umo, uid, match_id)
+            # 用户点名的焦点玩家（可为空）：由**插件**用本局十人名单去消歧解析
+            # （名字 → account_id 是插件的事），工具只负责把它原样转达过来。
+            focus = str(params.get("focus") or "").strip()
+            coro = self._nlu_async_match_detail(umo, uid, match_id, focus)
             note = "已开始复盘"
         task = loop.create_task(coro)
         # 记进任务表，避免模型重复调同一个工具时重复起任务（它会重复申请解析）。
@@ -2430,7 +2680,7 @@ class Dota2Plugin(Star):
             )
 
     async def _nlu_async_match_detail(
-        self, umo: str, uid: str, match_id: int
+        self, umo: str, uid: str, match_id: int, focus: str = ""
     ) -> None:
         """后台任务：单场复盘（``query_match_detail`` 的落地）。
 
@@ -2455,24 +2705,70 @@ class Dota2Plugin(Star):
             await self._send_to_session(umo, f"❌ 拉取比赛 {match_id} 的数据失败：{e}")
             return
 
-        # 焦点玩家：本会话提问者绑定的那个人若在本局里，就自动聚焦。
-        # 与指令路径同一套判据（指令路径用的是 _effective_binding(event)，
-        # 这里没有 event，直接按 uid 取绑定 —— 语义一致）。
+        # 焦点玩家，两级：
+        #   ① 用户**点名**了谁（`focus`，来自工具参数）→ 用本局十人名单消歧解析，
+        #      与 `/d2 单场 <id> <焦点>` 共用同一个 :meth:`_resolve_account`；
+        #   ② 没点名（或点名的人一个都没解析出来）才回落「提问者自己绑定的那个人
+        #      若在本局里就自动聚焦」。
+        # ① 必须排在 ② 前面：「用户点名」在语义上永远压过「自动聚焦」。
         focus_ids: list[int] = []
         focus_names: dict[int, str] = {}
-        binding = None
-        try:
-            binding = self.store.get_binding(umo, uid)
-        except Exception:  # noqa: BLE001
+        players_in_match = [
+            player
+            for player in (match.get("players") or [])
+            if isinstance(player, dict)
+        ]
+        if focus:
+            failed: list[str] = []
+            for query in (q.strip() for q in FOCUS_SPLIT_RE.split(focus)):
+                if not query:
+                    continue
+                try:
+                    account_id, name = await self._resolve_account(
+                        query, in_match_players=players_in_match, umo=umo
+                    )
+                except OpenDotaError as e:  # 含 TargetNotFoundError（它的子类）
+                    failed.append(f"{query}（{e}）")
+                    continue
+                account_id = int(account_id or 0)
+                if account_id and account_id not in focus_ids:
+                    focus_ids.append(account_id)
+                    focus_names[account_id] = name
+            if failed:
+                # 注意别把这段写成 `await self._send_to_session(umo, (… ,))` ——
+                # 括号里那个尾随逗号会让它变成一个 **tuple**，发出去的就不是文本了
+                # （回归用例 [3e] 当场抓到过这个写法）。
+                note = (
+                    "⚠️ 以下焦点没能解析出来，已跳过：" + "、".join(failed)
+                    if focus_ids
+                    else (
+                        "❌ 你点名的焦点玩家没能解析出来：\n"
+                        + "\n".join(f"· {item}" for item in failed)
+                        + "\n建议直接用 32 位账号 ID 或 64 位 SteamID 再试一次。\n"
+                        "（这次就不出复盘了，免得写出一份不是你想要的。）"
+                    )
+                )
+                await self._send_to_session(umo, note)
+            if not focus_ids:
+                # 用户点了名却一个都没认出来 ⇒ **不发**一份按默认对象写的报告，
+                # 否则他会以为「要点的那个人」已经写进去了。
+                return
+
+        if not focus_ids:
             binding = None
-        if binding:
-            candidate = int(binding.get("account_id") or 0)
-            if candidate and any(
-                isinstance(player, dict) and player.get("account_id") == candidate
-                for player in match.get("players") or []
-            ):
-                focus_ids.append(candidate)
-                focus_names[candidate] = str(binding.get("personaname") or "")
+            try:
+                binding = self.store.get_binding(umo, uid)
+            except Exception:  # noqa: BLE001
+                binding = None
+            if binding:
+                candidate = int(binding.get("account_id") or 0)
+                if candidate and any(
+                    isinstance(player, dict)
+                    and player.get("account_id") == candidate
+                    for player in players_in_match
+                ):
+                    focus_ids.append(candidate)
+                    focus_names[candidate] = str(binding.get("personaname") or "")
 
         state = dota_parse.parse_state(match)
 
@@ -2764,7 +3060,7 @@ class Dota2Plugin(Star):
         return (answer or None), "; ".join(tool_ctx.trace), list(tool_ctx.pending_prompts)
 
     async def _nlu_agent_reply(
-        self, event: AstrMessageEvent, question: str
+        self, event: AstrMessageEvent, question: str, *, quoted: str = ""
     ) -> tuple[str | None, list[str]]:
         """自然语言入口的**唯一**路径：带着全套工具，让模型自己决定干什么。
 
@@ -2823,6 +3119,7 @@ class Dota2Plugin(Star):
                 binding,
                 local_only=True,
                 include_history=not tools_on,
+                quoted=quoted,
             )
         except Exception as e:  # noqa: BLE001 - 兜底失败也要放行，不能吞消息
             logger.error(f"[dota2] 闲聊兜底收集数据失败: {e}", exc_info=True)
@@ -2872,6 +3169,7 @@ class Dota2Plugin(Star):
         *,
         local_only: bool = False,
         include_history: bool = True,
+        quoted: str = "",
     ) -> dota_chat.ChatContext:
         """收集一次「带插件数据的回答」所需的会话语境。
 
@@ -2908,6 +3206,9 @@ class Dota2Plugin(Star):
             history=(
                 self._nlu_chat_lines(umo)[:-1] if include_history else []
             ),
+            # 本条消息**引用**的那条消息的正文（QQ「回复」）。适配器构造
+            # message_str 时不带它，所以只能由入口单独取出来给到上下文。
+            quoted=quoted,
             self_binding=binding,
             focus_accounts=focus,
             recent_limit=int(
@@ -2984,6 +3285,10 @@ class Dota2Plugin(Star):
            会直接 ``break``），表现为「正常对话和其他插件全都没反应」。
         """
         text = dota_nlu.normalize(getattr(event, "message_str", "") or "")
+        # 本条消息引用的那条消息（QQ「回复」功能）。**必须单独取一次**：
+        # 各适配器构造 ``message_str`` 时只放用户自己打的正文，被引用内容
+        # 只进消息链的 ``Reply`` 段（见 :func:`_extract_quote`）。
+        quoted_text, quoted_for_bot = _extract_quote(event)
         umo = event.unified_msg_origin
         uid = str(event.get_sender_id())
 
@@ -3040,11 +3345,23 @@ class Dota2Plugin(Star):
                 return
 
         # ---------- 2. 该不该处理这条消息 ----------
-        # 返回的是剥离唤醒词后的正文（没通过闸门时为 None）
-        gate = self._nlu_should_handle(event, text)
+        # 返回的是剥离唤醒词后的正文（没通过闸门时为 None）。
+        # `quoted_for_bot`：本条消息引用了本插件发过的消息 —— 那本身就是一次
+        # 明确点名（见 _extract_quote / _nlu_should_handle）。
+        gate = self._nlu_should_handle(
+            event, text, quoted_for_bot=quoted_for_bot
+        )
         if gate is None:
             return
         effective = gate.text
+
+        # 引用里提到的比赛记进会话语境。**这一步对所有功能都生效**：
+        # 复盘 / 催解析 / 定时任务 / 各个工具里「这一盘」的回落，读的都是
+        # 这份会话比赛表；而引用里的 ID 是用户**此刻明确指向**的那一场，
+        # 比「会话里最近碰巧发生的那场」权威得多（上一轮实机事故正是后者
+        # 把前者顶掉，答成了另外一盘）。
+        if quoted_text:
+            self._nlu_note_quoted_match(umo, quoted_text)
 
         # ---------- 3. 交给大模型（唯一路径）----------
         # 把插件的全部能力（查数据 / 改设置 / 发起后台复盘）作为工具交给
@@ -3065,11 +3382,15 @@ class Dota2Plugin(Star):
         # 唤醒词 / @ 闸门（决定要不要理会这条消息）、确认 / 取消词
         # （协议回复）、以及 `/d2` 指令前缀。
         #
-        # 要求 `keyword_matched`：唤醒词是**用户明确点名**插件的信号。
-        # 没有它（即 `nlu_require_keyword=false` 且只 @ 了机器人）时不能
-        # 走这条路 —— 那等于让插件接管所有 @ 消息，抢答风险太大。
-        if gate.keyword_matched and self.cfg("nlu_chat_fallback", True):
-            reply, pending_prompts = await self._nlu_agent_reply(event, effective)
+        # 要求 `addressed`：**明确点名**插件的信号 —— 写了唤醒词，或者
+        # 引用了插件自己的发言。没有它（即 `nlu_require_keyword=false`
+        # 且只 @ 了机器人）时不能走这条路 —— 那等于让插件接管所有 @ 消息，
+        # 抢答风险太大。
+        if gate.addressed and self.cfg("nlu_chat_fallback", True):
+            reply, pending_prompts = await self._nlu_agent_reply(
+                event, self._nlu_effective_question(effective, quoted_text),
+                quoted=quoted_text,
+            )
             if reply or pending_prompts:
                 if reply:
                     # **记进会话历史**（这是「接不上话」的头号原因）：以前
@@ -3267,7 +3588,7 @@ class Dota2Plugin(Star):
     @take_over_event
     async def d2_info(self, event: AstrMessageEvent, args: GreedyStr):
         """查看玩家资料：/d2 资料 [昵称|账号ID]"""
-        target = str(args).strip()
+        target = self._args_with_quote(event, args)
         if target:
             try:
                 account_id, name = await self._resolve_account(target)
@@ -3308,7 +3629,7 @@ class Dota2Plugin(Star):
         并且**包含加速模式** —— 群里多数人的对局是加速局，不计入的话
         这个人的英雄池看起来几乎是空的。
         """
-        target = str(args).strip()
+        target = self._args_with_quote(event, args)
         if target:
             try:
                 account_id, name = await self._resolve_account(target)
@@ -3348,6 +3669,7 @@ class Dota2Plugin(Star):
         不带玩家时只出客观榜单；写了昵称（或「我」）才追加个人适配推荐，
         因为它要额外拉英雄池与近期对局、还要过一次模型。
         """
+        args = self._args_with_quote(event, args)
         tokens = [token for token in re.split(r"\s+", str(args).strip()) if token]
         position = ""
         if tokens:
@@ -3515,7 +3837,9 @@ class Dota2Plugin(Star):
     @take_over_event
     async def d2_matches(self, event: AstrMessageEvent, args: GreedyStr):
         """查看最近战绩：/d2 战绩 [场次] [昵称|账号ID]"""
-        count, target = self._split_count_target(str(args))
+        count, target = self._split_count_target(
+            self._args_with_quote(event, args)
+        )
 
         if target:
             try:
@@ -3575,7 +3899,9 @@ class Dota2Plugin(Star):
     @take_over_event
     async def d2_analyze(self, event: AstrMessageEvent, args: GreedyStr):
         """AI 分析近期表现与打法风格：/d2 分析 [场次] [昵称|账号ID]"""
-        count, target = self._split_count_target(str(args))
+        count, target = self._split_count_target(
+            self._args_with_quote(event, args)
+        )
 
         if target:
             try:
@@ -3661,6 +3987,7 @@ class Dota2Plugin(Star):
         最多等 10 分钟。等满仍未解析时**不会只回一句放弃**：只要手上还有这
         场比赛的基础数据，就自动降级出一份「未解析版」复盘。
         """
+        args = self._args_with_quote(event, args, mode="match")
         tokens = [token for token in re.split(r"\s+", str(args).strip()) if token]
         if not tokens or not re.fullmatch(r"\d{6,20}", tokens[0]):
             yield event.plain_result(
@@ -3845,6 +4172,9 @@ class Dota2Plugin(Star):
     @take_over_event
     async def d2_askparse(self, event: AstrMessageEvent, args: GreedyStr):
         """只向 OpenDota 提交解析申请，不等待结果：/d2 催解析 <比赛ID>"""
+        # 催解析只认比赛 ID：引用的简报里若还带出人名，多一个 token 会被
+        # 下面的格式校验挡掉，所以不带玩家。
+        args = self._args_with_quote(event, args, mode="match", with_player=False)
         tokens = [token for token in re.split(r"\s+", str(args).strip()) if token]
         if not tokens or not re.fullmatch(r"\d{6,20}", tokens[0]):
             yield event.plain_result(

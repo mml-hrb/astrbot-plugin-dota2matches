@@ -1614,10 +1614,64 @@ _STAGE_HINTS: tuple[str, ...] = (
     "final",
 )
 
+#: 标题里**不改变指向**的修饰词。
+#:
+#: 实测：``DreamLeague Season 30`` 在 wiki 上的页面就叫 ``DreamLeague/30`` ——
+#: 差的正是这个 ``Season``。这是**同一条赛事的两种写法**，不是两个赛事，
+#: 所以比对时把它剔掉；而 ``International`` / ``World`` / ``Cup`` 这类
+#: 决定指向的词一个都不能剔。
+_TITLE_STOPWORDS: frozenset[str] = frozenset(
+    {"the", "season", "series", "presented", "by", "edition", "of"}
+)
+
 
 def _norm(text: str) -> str:
-    """归一化：去空格 / 下划线 / 点 / 连字符，转小写，便于比对。"""
-    return re.sub(r"[\s_.\-·・]+", "", (text or "").strip().lower())
+    """归一化：去空格 / 下划线 / 点 / 连字符 / **斜杠**，转小写，便于比对。
+
+    ⚠️ **斜杠必须一起归一化**（2026-10-14 修，真机事故）。Liquipedia 的赛事页
+    用的是「基干/年份」这种层级写法（``The International/2026``、
+    ``DreamLeague/30``、``Esports World Cup/2026``），而别名表和用户输入用空格
+    （``The International 2026``）。少了斜杠这一项，**基干一旦带上年份，前缀匹配
+    就永远对不上** —— 斜杠正好卡在年份前面，``theinternational2026`` 与
+    ``theinternational/2026`` 互不匹配。
+
+    真机现场：群里问「TI 2026」，搜索**已经返回了** ``The International/2026``
+    （这条在站点返回里排第一），却因为这一步被判成「没找到」，
+    用户看到的是「没在 Liquipedia 上找到赛事」。
+    """
+    return re.sub(r"[\s_.\-·・/\\]+", "", (text or "").strip().lower())
+
+
+def _title_tokens(text: str) -> frozenset[str]:
+    """把标题切成「实义词」集合，用来兜住 wiki 与口语之间的写法差。
+
+    切词只按「非字母数字」切，**不从中间拆词** —— ``DreamLeague`` 是一个词元，
+    不会拆成 ``dream`` + ``league``（拆了就满盘误命中）。单字母词元直接丢掉
+    （标题里的 ``1`` / ``a`` 基本都是噪声），再剔掉
+    :data:`_TITLE_STOPWORDS` 那批不改变指向的修饰词。
+    """
+    words = re.findall(r"[a-z0-9\u4e00-\u9fff]+", (text or "").lower())
+    return frozenset(w for w in words if len(w) > 1 and w not in _TITLE_STOPWORDS)
+
+
+def _tokens_by_subset(cands: list[str], base: str) -> list[str]:
+    """兜底匹配：**基干的实义词全部出现在候选标题里**才算命中。
+
+    只在 :func:`pick_page_title` 的前两级（前缀 / 包含）都没命中时才启用，
+    它比那两级宽松，所以必须有更严的门槛：
+
+    * 要求基干至少有 **2 个**实义词 —— 单词元基干（``TI`` 这种）一放宽就满屏
+      误命中，宁可让它走「没找到」；
+    * 要求的是**子集**而不是「有交集」—— 有交集会让 ``LGD`` 这类短名
+      把一堆无关页面都捞进来。
+
+    为什么需要它：``DreamLeague Season 30`` 与 ``DreamLeague/30`` 去掉修饰词后
+    实义词完全相同，但**谁也不是谁的前缀 / 子串**，前两级一律够不着。
+    """
+    want = _title_tokens(base)
+    if len(want) < 2:
+        return []
+    return [h for h in cands if want <= _title_tokens(h)]
 
 
 def team_alias(query: str) -> str:
@@ -1663,9 +1717,16 @@ def _extract_year(text: str) -> str:
 def pick_page_title(hits: list[str], base: str, year: str = "") -> str:
     """从搜索结果里挑出最像目标页面的那个标题；**挑不出来就返回空串**。
 
-    规则：先留下**以基干开头**的；没有再退一步留**包含基干**的（``LGD`` →
-    ``PSG.LGD``，这种页面不以基干开头）；给了年份就优先含该年份的；
-    最后取年份最大的（「TI」→ 命中 The International 2026 / 2025 / …，取 2026）。
+    规则（三级，逐级放宽，前一级命中就不往下一级走）：
+
+    1. **以基干开头**（`_norm` 之后比对，斜杠与空格等价 ⇒
+       ``The International 2026`` 认得 ``The International/2026``）；
+    2. **包含基干**（``LGD`` → ``PSG.LGD``，这种页面不以基干开头）；
+    3. **实义词全中**（:func:`_tokens_by_subset`）—— 治的是「两种写法谁也不含谁」
+       的那类，``DreamLeague Season 30`` ↔ ``DreamLeague/30``。
+
+    给了年份就优先含该年份的；最后取年份最大的（「TI」→ 命中 The International
+    2026 / 2025 / …，取 2026），同年则主页面优先于子页面。
 
     有一条**刻意的拒绝**：基干一条都对不上时返回空串，**不拿搜索结果第一条
     凑数**。实测踩过：搜一个根本不存在的赛事，旧逻辑会把「The International
@@ -1682,6 +1743,8 @@ def pick_page_title(hits: list[str], base: str, year: str = "") -> str:
             pool = prefixed
         elif len(low) >= 3:
             pool = [h for h in cands if low in _norm(h)]
+            if not pool:
+                pool = _tokens_by_subset(cands, base)
         else:
             pool = []
         if not pool:
@@ -1719,7 +1782,12 @@ async def resolve_tournament_page(client: "LiquipediaClient", query: str) -> tup
         if text and "Infobox league" in text:
             return direct, ""
 
-    hits = await client.search(f"{base} {year}".strip() if year else base, limit=10)
+    # 年份不能重复拼：`tournament_alias` 会把年份拼回别名结果
+    # （「TI 2026」→ `The International 2026`），这里再无脑补一次就会发出
+    # 「The International 2026 2026」这种脏搜索词 —— 真机日志里抓到过。
+    # 只在基干确实不含年份时才补。
+    search_term = base if (not year or year in base) else f"{base} {year}"
+    hits = await client.search(search_term, limit=10)
     picked = pick_page_title(hits, base, year)
     if picked:
         return picked, ""

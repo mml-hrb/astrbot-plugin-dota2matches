@@ -482,12 +482,26 @@ def build_tool_specs(*, include_write: bool = True) -> list[dict]:
             "所以工具只负责**发起**并立刻返回受理回执，复盘正文稍后由插件"
             "直接发到本会话。比赛 ID 必须由用户给出，或者来自会话上下文里"
             "已经出现过的某一场（工具会自行取用，不要编造）。"
+            "**用户用「回复 / 引用」指着的那条消息里若写了比赛 ID，用那个** —— "
+            "他就是那个意思。"
+            "**用户点名了要看谁**（「焦点玩家是某某」「以某某为焦点」「重点看某某」）"
+            "时，必须把那个名字填进 `focus`，否则复盘会按默认对象写。"
             "问「复盘这一局」「刚才那场打得怎么样」时用。",
             {
                 "match_id": {
                     "type": "integer",
                     "description": "要复盘的比赛 ID（8~10 位数字）。",
-                }
+                },
+                "focus": {
+                    "type": "string",
+                    "description": (
+                        "可选：用户**点名**要聚焦的玩家（昵称 / 32 位账号 ID / "
+                        "64 位 SteamID；多位用「、」「,」分隔）。"
+                        "用户说「焦点玩家是青丘有狐名不规」「以某某为焦点」"
+                        "「重点看某某」时，把名字**原样**填进来，别漏、别换成别人、"
+                        "也别塞进别的字段。留空表示用户没点名。"
+                    ),
+                },
             },
             ["match_id"],
         ),
@@ -1567,7 +1581,15 @@ async def _tool_query_match_detail(args: dict, ctx: ToolContext) -> str:
     match_id, why = _match_id_arg(args)
     if match_id is None:
         return why
-    return await _async_or_refuse(ctx, "match_detail", {"match_id": match_id})
+    params: dict = {"match_id": match_id}
+    # 用户点名的焦点玩家**原样**带下去，由插件用本局十人名单去消歧解析
+    # （名字怎么变成 account_id 是插件的事，工具只管转达）。漏掉这个参数
+    # 就等于没听见 —— 真机上出过：用户写了「焦点玩家青丘有狐名不规」，
+    # 工具只传了 match_id，复盘于是按默认对象写，用户以为插件没识别出来。
+    focus = str(args.get("focus") or "").strip()
+    if focus:
+        params["focus"] = focus
+    return await _async_or_refuse(ctx, "match_detail", params)
 
 
 async def _tool_request_match_parse(args: dict, ctx: ToolContext) -> str:
@@ -1964,6 +1986,13 @@ TOOL_GUIDE = """=== 你可以调用工具查数据、也可以调用工具改设
    - **不要**为了等结果反复调同一个工具 —— 重调只会重复申请，不会更快。
    - `query_match_detail` 需要比赛 ID：要么用户直接给了，要么会话上下文里已经
      出现过那一场（插件会按上下文自行解析）。**不要编造比赛 ID**，拿不准就先问。
+     · **【用户本条消息引用的内容】里那场最权威** —— 用户用「回复 / 引用」指着的
+       那一条就是他说「这盘」时的所指；同一轮里它优先于「本会话涉及过的比赛」。
+   - **用户点名了要看谁**（「焦点玩家是某某」「以某某为焦点」「重点看某某」）时，
+     必须把那个名字填进 `focus` 参数。**漏了就等于没听见**：复盘会按默认对象
+     （提问者自己绑定的账号，或全场净经济靠前的人）来写，用户会以为你没识别出来。
+     名字**照抄用户的写法**（昵称、32 位账号 ID、64 位 SteamID 都行），
+     不要自己换成别人，也不要塞进 `match_id` 或其它参数。
    - `request_match_parse` 只在用户明确说要催、或复盘提示「录像还没解析好」时用。
 
 【三、修改设置类】调了也**不会立刻生效**
