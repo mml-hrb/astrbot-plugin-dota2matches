@@ -104,6 +104,20 @@ class HeroPool:
     turbo_games: int = 0
     #: 放宽的原因 / 降级的原因，供文案与排障
     reason: str = ""
+    #: 取数失败的原因（空 = 没失败）。
+    #:
+    #: ⚠️ 为什么必须和 :attr:`reason` 分开（P1-2，2026-10-14 审查）：
+    #: 这两件事在渲染层长得一模一样，含义却完全相反 ——
+    #:
+    #: * ``reason`` 非空 + 有数据：**正常降级**。例如「STRATZ 不支持版本过滤，
+    #:   已退成全量口径」，数据是完整的，只是口径变宽了。
+    #: * ``error`` 非空 + 无数据：**取数失败**。网络超时 / 限流 / 数据源挂了，
+    #:   这件事**可以稍后重试**，绝不能讲成「这个玩家没有记录」。
+    #:
+    #: 以前 ``_fetch_heroes`` 把 ``except Exception`` 连 ``TimeoutError`` 一起
+    #: 吃掉并 ``return []``，于是「网络抖了一下」被渲染成
+    #: 「没有查询到 X 的英雄使用记录」—— 用户会以为是自己账号的问题。
+    error: str = ""
 
     # ------------------------------------------------------------------
     @property
@@ -119,6 +133,15 @@ class HeroPool:
     @property
     def has_data(self) -> bool:
         return bool(self.rows)
+
+    @property
+    def failed(self) -> bool:
+        """是否**取数失败**（与「这个玩家没有记录」是两件事）。
+
+        渲染层必须用它选措辞：失败时不能说「没有记录」，那是在把一次
+        网络抖动讲成对方的账号状态。
+        """
+        return bool(self.error) and not self.rows
 
     @property
     def wide(self) -> bool:
@@ -141,8 +164,19 @@ async def _fetch_heroes(
     game_mode: int | None = None,
     include_turbo: bool = True,
     timeout: float = DEFAULT_TIMEOUT,
-) -> list[dict]:
-    """拉一次英雄统计，失败/超时返回空列表（英雄池取不到不该打断整条回答）。"""
+) -> tuple[list[dict], str]:
+    """拉一次英雄统计，返回 ``(行, 失败原因)``。
+
+    ``(非空, "")`` = 成功；``([], 原因)`` = **取数失败**（可稍后重试）；
+    ``([], "")`` = 成功但这位玩家在这个口径下确实没有场次。
+
+    以前这里是 ``-> list[dict]``，且把所有异常（**含 ``TimeoutError``**）都
+    吞成 ``[]``，于是上层分不出上面后两种（P1-2）。现在把「失败」显式
+    回传，由 :class:`HeroPool` 决定措辞。
+
+    英雄池取不到**不该打断整条回答**，所以这里仍然不抛异常 —— 只是不再
+    撒谎说「没有记录」。
+    """
     kwargs: dict[str, Any] = {"include_insignificant": include_turbo}
     if patch is not None:
         kwargs["patch"] = int(patch)
@@ -155,12 +189,15 @@ async def _fetch_heroes(
         # 退化成旧口径调用：至少还能给出一份全量英雄池，而不是报错。
         logger.debug("[dota2] 英雄池：数据源不支持过滤参数，退回全量调用")
         coro = api.get_player_heroes(account_id)
+    except Exception as e:  # noqa: BLE001 - 连构造协程都炸，照样归入「取数失败」
+        logger.warning(f"[dota2] 英雄池取数失败（patch={patch} mode={game_mode}）: {e}")
+        return [], f"{type(e).__name__}: {str(e)[:120]}"
     try:
         rows = await asyncio.wait_for(coro, timeout=max(0.1, timeout))
-    except Exception as e:  # noqa: BLE001 - 取不到就是没有，交给上层措辞
+    except Exception as e:  # noqa: BLE001 - 取不到就是取不到，但要说清是取不到
         logger.warning(f"[dota2] 英雄池取数失败（patch={patch} mode={game_mode}）: {e}")
-        return []
-    return [row for row in (rows or []) if isinstance(row, dict)]
+        return [], f"{type(e).__name__}: {str(e)[:120]}"
+    return [row for row in (rows or []) if isinstance(row, dict)], ""
 
 
 def _sum_games(rows: Iterable[dict]) -> int:
@@ -233,24 +270,29 @@ async def collect_hero_pool(
 
     if pool.reason:
         # 全量口径：一次请求拿完（含加速），并如实标注
-        rows = await _fetch_heroes(
+        rows, err = await _fetch_heroes(
             api, account_id, include_turbo=include_turbo, timeout=timeout
         )
         turbo = 0
         if include_turbo:
-            turbo = _sum_games(
-                await _fetch_heroes(
-                    api,
-                    account_id,
-                    game_mode=GAME_MODE_TURBO,
-                    include_turbo=True,
-                    timeout=timeout,
-                )
+            turbo_rows, turbo_err = await _fetch_heroes(
+                api,
+                account_id,
+                game_mode=GAME_MODE_TURBO,
+                include_turbo=True,
+                timeout=timeout,
             )
+            turbo = _sum_games(turbo_rows)
+            err = err or turbo_err
         pool.rows = to_rows(rows)
         pool.games = _sum_games(rows)
         pool.turbo_games = min(turbo, pool.games)
         pool.scope = SCOPE_ALL_TIME
+        # 第一趟就失败 ⇒ 记成取数失败（不是「没有记录」）。
+        # 第二趟（加速占比）失败则**不算整体失败** —— 英雄维度已经拿到了，
+        # 只是「其中加速多少场」这一项缺失，如实留空比整块报错好。
+        if err and not rows:
+            pool.error = err
         logger.info(f"[dota2] 英雄池走全量口径（{pool.reason}）")
         return pool
 
@@ -270,24 +312,26 @@ async def collect_hero_pool(
             patches = []
     if not patches:
         pool.reason = "拿不到补丁表，无法按版本过滤"
-        rows = await _fetch_heroes(
+        rows, err = await _fetch_heroes(
             api, account_id, include_turbo=include_turbo, timeout=timeout
         )
         turbo = 0
         if include_turbo:
-            turbo = _sum_games(
-                await _fetch_heroes(
-                    api,
-                    account_id,
-                    game_mode=GAME_MODE_TURBO,
-                    include_turbo=True,
-                    timeout=timeout,
-                )
+            turbo_rows, turbo_err = await _fetch_heroes(
+                api,
+                account_id,
+                game_mode=GAME_MODE_TURBO,
+                include_turbo=True,
+                timeout=timeout,
             )
+            turbo = _sum_games(turbo_rows)
+            err = err or turbo_err
         pool.rows = to_rows(rows)
         pool.games = _sum_games(rows)
         pool.turbo_games = min(turbo, pool.games)
         pool.scope = SCOPE_ALL_TIME
+        if err and not rows:
+            pool.error = err
         return pool
 
     pool.latest_patch = dict(patches[0])
@@ -295,29 +339,41 @@ async def collect_hero_pool(
     covered: list[dict] = []
     total = 0
     turbo_total = 0
+    failures: list[str] = []
+    failed_patch_names: list[str] = []
 
     for patch in patches:
         pid = patch.get("id")
         if pid is None:
             continue
         # 全模式 + 加速模式两次请求：前者给英雄维度，后者只用来算「其中加速多少场」
-        rows = await _fetch_heroes(
+        rows, err = await _fetch_heroes(
             api, account_id, patch=int(pid), include_turbo=include_turbo, timeout=timeout
         )
+        if err and not rows:
+            # ⚠️ 这个版本**取数失败**，不是「这个版本他没打过」（P1-3）。
+            # 以前这里无条件 ``covered.append(dict(patch))``，于是失败版本
+            # 照样计进「已覆盖 N 个版本」，文案会说「已覆盖 A + B 版本」——
+            # 而 B 其实一次都没取到。要分开记，并在文案里如实交代。
+            failures.append(err)
+            failed_patch_names.append(str(patch.get("name") or pid))
+            continue
         patch_games = _sum_games(rows)
         turbo_games = 0
         if include_turbo:
-            turbo_games = _sum_games(
-                await _fetch_heroes(
-                    api,
-                    account_id,
-                    patch=int(pid),
-                    game_mode=GAME_MODE_TURBO,
-                    include_turbo=True,
-                    timeout=timeout,
-                )
+            turbo_rows, turbo_err = await _fetch_heroes(
+                api,
+                account_id,
+                patch=int(pid),
+                game_mode=GAME_MODE_TURBO,
+                include_turbo=True,
+                timeout=timeout,
             )
+            turbo_games = _sum_games(turbo_rows)
+            # 这一趟失败只影响「加速占比」，不影响英雄维度 ⇒ 不记 failure
+            _ = turbo_err
         _merge(merged, rows)
+        # 只有**成功取到**的版本才进 covered
         covered.append(dict(patch))
         total += patch_games
         turbo_total += min(turbo_games, patch_games)
@@ -340,10 +396,23 @@ async def collect_hero_pool(
             f"当前版本样本不足（{min_games} 场门槛），已并入更早的版本一起统计"
             f"（覆盖 {names}）"
         )
-    if total < max(1, int(min_games)) and len(covered) >= len(patches):
+    if total < max(1, int(min_games)) and not failed_patch_names and len(covered) >= len(patches):
         pool.reason = (
             f"最近 {len(covered)} 个版本合计仅 {total} 场，样本仍然偏少"
         )
+
+    # ---- 取数失败的如实交代（P1-2 / P1-3）----
+    if failures and not covered:
+        # 一个版本都没取到 ⇒ 这是**取数失败**，不是「他没打过」
+        pool.error = failures[0]
+    elif failed_patch_names:
+        # 部分版本取数失败：数据能用，但**覆盖范围不是我们声称的那个**。
+        # 单列一条交代，免得文案说「已覆盖 A + B」而 B 其实没取到。
+        miss = " / ".join(failed_patch_names)
+        if pool.reason:
+            pool.reason += f"；其中 {miss} 取数失败，未纳入统计"
+        else:
+            pool.reason = f"{miss} 取数失败，未纳入统计"
     return pool
 
 
@@ -388,6 +457,16 @@ def format_hero_pool(
     抬头**必须**写清版本与模式构成：这是这一版最容易被忽略的信息 ——
     同一份「胜率 55%」，在只有正常局和九成加速两种口径下含义完全不同。
     """
+    if pool.failed:
+        # ⚠️ 与下面那句**不是同一件事**（P1-2）：「没拿到」是可重试的取数故障，
+        # 「没有记录」是对这位玩家下的结论。混用会让一次超时看起来像是在说
+        # 对方的账号有问题。
+        return (
+            f"⚠️ 查询 {player_name} 的英雄池时数据源没有返回结果"
+            f"（{pool.error}）。\n"
+            "这是**这一次没取到**，不代表他没有英雄记录 —— 可以稍后重试，"
+            "或换用排行榜上的常用英雄作为参考。"
+        )
     if not pool.has_data:
         return f"没有查询到 {player_name} 的英雄使用记录。"
 

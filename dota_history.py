@@ -69,6 +69,10 @@ DEFAULT_TTL_HOURS = 12
 #: 群里闲聊可能连着好几轮，每次都写盘既没必要也浪费。
 FLUSH_INTERVAL = 3.0
 
+#: 过期回收节流（秒）。:meth:`ChatHistoryStore.purge_expired` 是 O(会话数) 的，
+#: 不能每写一条就跑；但**也不能永远不跑** —— 见 ``_maybe_purge`` 的说明。
+PURGE_INTERVAL = 600.0
+
 _ROLE_BOT = "bot"
 _ROLE_USER = "user"
 
@@ -118,6 +122,7 @@ class ChatHistoryStore:
         #: ``{umo: [ChatTurn, ...]}``，按时间由旧到新。
         self._sessions: dict[str, list[dict[str, Any]]] = {}
         self._last_flush = 0.0
+        self._last_purge = 0.0
         self._loaded = False
 
     # ------------------------------------------------------------------
@@ -174,13 +179,16 @@ class ChatHistoryStore:
     def _save_sync(self) -> None:
         if not self.enabled:
             return
-        self.data_dir.mkdir(parents=True, exist_ok=True)
         tmp_path = self.file_path.with_suffix(".json.tmp")
         payload = {
             "version": SCHEMA_VERSION,
             "sessions": self._sessions,
         }
         try:
+            # ⚠️ ``mkdir`` 与 ``dota_store._save_sync`` 同理，必须也在 try 里 ——
+            # 否则「建目录失败」会直接抛穿，而这里是**每次追加一条对话**都会
+            # 经过的路径（写不进去只该记日志，不该让这一轮回答整段失败）。
+            self.data_dir.mkdir(parents=True, exist_ok=True)
             tmp_path.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -212,6 +220,28 @@ class ChatHistoryStore:
         if now - self._last_flush >= FLUSH_INTERVAL:
             self._save_sync()
 
+    def _maybe_purge(self, now: float) -> None:
+        """节流回收过期条目（顺手丢掉空会话）。
+
+        ⚠️ 为什么必须有人调它（2026-10-14 审查报告 4.4）：:meth:`purge_expired`
+        写好了却**从来没有调用点**，而 :meth:`append` 只在**本会话**的列表上做
+        上限裁剪 —— 于是进程内 ``_sessions`` 的**会话数无上界**：一个进了几百个
+        群的机器人会一直攒 ``umo → 条目``，过期会话只在下次 ``load()``（也就是
+        插件重载）时才被丢掉，而 :meth:`_save_sync` 每次还把这些死会话整份重写
+        一遍磁盘。会话条目本身有 :data:`MAX_TURNS_PER_SESSION` 兜着，泄漏的是
+        **会话数**，所以这里按 :data:`PURGE_INTERVAL` 节流跑一次就够。
+
+        没有 ``append`` 的任何调用方依赖「回收后必须立刻落盘」；
+        :meth:`purge_expired` 只在真删掉东西时才写盘，且写盘会刷新
+        ``_last_flush``，所以紧接着的 :meth:`_maybe_flush` 不会再写第二遍。
+        """
+        if now - self._last_purge < PURGE_INTERVAL:
+            return
+        self._last_purge = now
+        removed = self.purge_expired(now)
+        if removed:
+            logger.debug(f"[dota2] 对话历史回收了 {removed} 条过期条目")
+
     # ------------------------------------------------------------------
     # 写入
     # ------------------------------------------------------------------
@@ -238,10 +268,15 @@ class ChatHistoryStore:
             return
         is_user = str(role or "").strip().lower() == _ROLE_USER
         limit = MAX_USER_CHARS if is_user else MAX_BOT_CHARS
+        # `ts` 单独留一份局部变量：`entry` 是个 `dict[str, str | float]`，
+        # `entry["ts"]` 的静态类型是 `str | float`，直接递给 `_maybe_purge(now: float)`
+        # 会被 mypy 判 `[arg-type]`（2026-10-14 第三批）。留局部变量比在三个
+        # 调用点各包一层 `float(...)` 更清楚，也免去一次多余的转换。
+        ts_value = float(now if now is not None else time.time())
         entry = {
             "role": _ROLE_USER if is_user else _ROLE_BOT,
             "text": _clip(body, limit),
-            "ts": float(now if now is not None else time.time()),
+            "ts": ts_value,
             "kind": str(kind or "chat"),
         }
         rows = self._sessions.setdefault(umo, [])
@@ -253,7 +288,10 @@ class ChatHistoryStore:
         rows.append(entry)
         if len(rows) > MAX_TURNS_PER_SESSION:
             del rows[: len(rows) - MAX_TURNS_PER_SESSION]
-        self._maybe_flush(entry["ts"])
+        # 先回收（可能顺手落盘，刷新 _last_flush），再判要不要节流落盘 ——
+        # 反过来会在同一拍里写两次磁盘。
+        self._maybe_purge(ts_value)
+        self._maybe_flush(ts_value)
 
     def clear(self, umo: str) -> None:
         """清空某个会话的历史（维护口子：测试与将来的管理指令用）。"""

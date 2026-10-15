@@ -23,7 +23,6 @@ import asyncio
 import json
 import os
 import tempfile
-import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -209,7 +208,7 @@ class ZhNames:
     # ------------------------------------------------------------------
     async def fill_missing(
         self,
-        translator: Callable[[str, list[str]], Awaitable[dict[str, str]]],
+        translator: Callable[[str, list[str]], Awaitable[dict[str, str]]] | None,
     ) -> bool:
         """把待补译的键批量问一遍并落盘。
 
@@ -220,7 +219,10 @@ class ZhNames:
         Returns:
             是否学到了新词。True 表示调用方应当用**原始**数据重新本地化一次。
         """
-        if not self.enabled or not self.learn or not translator:
+        # 用 `is None` 而不是 `not translator`：后者是「取函数对象的真值」，
+        # 对静态检查器没有意义（`mypy` 的 `[truthy-function]`），而且万一将来
+        # 换成实现了 `__bool__` 的可调用对象就会悄悄走错分支。
+        if not self.enabled or not self.learn or translator is None:
             self.clear_miss()
             return False
         pending = self.pending()

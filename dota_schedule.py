@@ -266,6 +266,10 @@ def parse_clock(text: str) -> Clock | None:
         if hour is None or hour > 24:
             continue
         raw_minute = match.group("m")
+        # 这里显式标 `int | None`：`cn_to_int()` 可能返回 None（下面立刻判掉），
+        # 而 `minute = 0 / 30` 那两条分支推出的是 `int`，两者会打架
+        # （mypy `[assignment]`，2026-10-14 第三批）。
+        minute: int | None
         if raw_minute in (None, ""):
             minute = 0
         elif raw_minute == "半":
@@ -472,6 +476,11 @@ def parse_time_spec(text: str, *, default_time: str = DEFAULT_TIME) -> TimeSpec 
     weekly_any = _WEEKLY_ANY_RE.search(raw)
     weekly_day = _WEEKLY_DAY_RE.search(raw)
     if weekly_any or weekly_day:
+        # `weekly_day or weekly_any` 一定是非 None 的那个（外层的 or 已经保证
+        # 至少有一个命中），但静态类型仍是 `Match | None`，所以要再兜一次；
+        # 原先写成 `weekly_day.group(0) if weekly_day else weekly_any.group(0)`，
+        # 第二条分支在 mypy 眼里可能是 None（`[union-attr]`，2026-10-14 第三批）。
+        hit = weekly_day or weekly_any
         token = ""
         if weekly_day:
             token = weekly_day.group(1) or weekly_day.group(2) or weekly_day.group(3) or ""
@@ -482,7 +491,7 @@ def parse_time_spec(text: str, *, default_time: str = DEFAULT_TIME) -> TimeSpec 
             cron=f"{minute} {hour} * * {code}",
             label=f"每{WEEKDAY_LABELS.get(code, code)} {hour:02d}:{minute:02d}",
             used_default_time=used_default,
-            detail=(weekly_day.group(0) if weekly_day else weekly_any.group(0)),
+            detail=hit.group(0) if hit else "",
         )
 
     # ---- 5. 每天 ----

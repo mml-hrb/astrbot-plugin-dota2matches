@@ -111,9 +111,15 @@ class DotaStore:
         self._loaded = True
 
     def _save_sync(self) -> None:
-        self.data_dir.mkdir(parents=True, exist_ok=True)
         tmp_path = self.file_path.with_suffix(".json.tmp")
         try:
+            # ⚠️ ``mkdir`` 必须也在 try 里（2026-10-14，第三批：由
+            # ``tests/p1_batch3_check.py`` 的「目录不可写时不许抛」抓出来）。
+            # 原先它在 try 外面，于是「建目录失败」会**直接抛穿** —— 而本方法的
+            # 契约是「写入失败只记日志」（调用方是绑定的 / 监听的 handler，
+            # 保存失败不该把用户操作整个打断）。写失败吞、建目录失败抛，
+            # 是同一条承诺上的两个洞，只堵一个没有意义。
+            self.data_dir.mkdir(parents=True, exist_ok=True)
             tmp_path.write_text(
                 json.dumps(self._data, ensure_ascii=False, indent=2),
                 encoding="utf-8",

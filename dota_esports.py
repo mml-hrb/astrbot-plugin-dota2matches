@@ -65,9 +65,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import io
 import json
-import os
 import re
 import time
 from pathlib import Path
@@ -357,6 +355,10 @@ class LiquipediaClient:
         if persisted > time.time():
             self._blocked_until = time.monotonic() + (persisted - time.time())
         self._strikes = self.cache.get_strikes()
+        #: 保护「避让检查 → strikes 自增 → 置避让」这段读改写（P1-9）。
+        #: 见 :meth:`_call` 的 docstring：不加锁时两个并发调用能把指数避让
+        #: 的底数多算一次，一次 429 直接跳到上限 3600 秒。
+        self._state_lock = asyncio.Lock()
 
     # -- 底层 --------------------------------------------------------
     def _get_client(self) -> httpx.AsyncClient:
@@ -407,12 +409,35 @@ class LiquipediaClient:
         return self._strikes
 
     async def _call(self, params: dict[str, Any], *, lane: _Lane, retry_after_lane: bool = True) -> dict:
-        """发一次 API 请求，返回 JSON 的 ``parse`` / ``query`` 部分。"""
-        if self.blocked_seconds > 0:
-            raise EsportsRateLimited(
-                f"Liquipedia 限流中（插件已停发请求，本地避让还剩 "
-                f"{int(self.blocked_seconds)} 秒）"
-            )
+        """发一次 API 请求，返回 JSON 的 ``parse`` / ``query`` 部分。
+
+        ⚠️ 「检查避让 → 递增 strikes → 置避让时刻」必须**在同一把锁里**
+        完成（P1-9，2026-10-14 审查）。:class:`_Lane` 只串行化**发请求**那一
+        瞬间，管不到这里的状态检查与自增；而两个并发工具调用（模型一轮里
+        同时调 ``query_tournament`` + ``query_transfers``）完全可以双双通过
+        ``blocked_seconds > 0`` 的检查、各自 ``+= 1``。
+
+        ``strikes`` 是**指数避让**的底数（``600 * 2**(strikes-1)``，封顶
+        3600 秒），被多算一次就从 10 分钟跳到 20~60 分钟；而避让期内对**任何
+        页面**一律拒绝，且落盘后热重载不忘 —— 一次并发就能让插件自锁一小时。
+
+        锁内要**二次检查**：等锁的过程中另一次调用可能已经踩了 429 并把避让
+        置上了，这时本次必须跟着停发，而不是拿着过期的判断继续往外发。
+        """
+        async with self._state_lock:
+            if self.blocked_seconds > 0:
+                raise EsportsRateLimited(
+                    f"Liquipedia 限流中（插件已停发请求，本地避让还剩 "
+                    f"{int(self.blocked_seconds)} 秒）"
+                )
+            # 真正发请求的整个重试循环都在锁内：否则「第 1 次尝试成功 →
+            # 释放锁 → 另一个调用撞了 429 置上避让 → 本次第 2 次尝试又发出去」
+            # 这条路径仍然能绕过避让。代价是同一条车道的请求会串起来 ——
+            # 而 _Lane 本来就在做这件事，所以不额外损失并发度。
+            return await self._call_locked(params, lane=lane)
+
+    async def _call_locked(self, params: dict[str, Any], *, lane: _Lane) -> dict:
+        """``_call`` 的实体（**必须**在 :attr:`_state_lock` 保护下调用）。"""
         request = dict(params)
         request.setdefault("format", "json")
         request.setdefault("formatversion", 2)
@@ -460,6 +485,9 @@ class LiquipediaClient:
                 # 文案纪律（2026-10-13 改）：只说「插件停发请求 X 分钟」这个**事实**，
                 # **不许**写成「约 X 分钟后恢复」—— 那个时长是我们自己估的止损时间，
                 # 不是站点给的解封时间（站点那侧要人工过校验，等待本身不解封）。
+                #
+                # ⚠️ 这一段是「读改写」，全靠 _call 外面那把 _state_lock 保护
+                # （P1-9）：两个并发调用各自 += 1 会让避让时长一次翻到上限。
                 self._strikes += 1
                 wait = self._cooldown_for(
                     self._strikes, _parse_retry_after(resp.headers.get("retry-after"))
@@ -836,7 +864,18 @@ async def resolve_prize_pool(client: "LiquipediaClient", info: dict[str, str]) -
     raw = info.get("_prizepool_raw") or ""
     m = re.search(r"\{\{\s*:\s*([^}|]+?)\s*\}\}", raw)
     if not m:
-        return cleaned
+        # ⚠️ 这里**不能** ``return cleaned``（P1-8，2026-10-14 审查）。
+        #
+        # 走到这一行的含义是：``prizepoolusd`` 清洗后非空，但**两条数字正则
+        # 都没匹配上**（带单位 / 脚注 / 写成模板名之类的写法）。原样返回它，
+        # 上层会无条件采信（``if pool: info["prizepoolusd"] = pool``），
+        # 于是「奖池：1,600,000 详见页面」这种**看起来是真实金额、实为页面原文**
+        # 的字符串被当成解析成功的金额渲染出去 —— 渲染层完全分不出这两者。
+        #
+        # 金额这一项的口径是「只认原始数字或子页面里的纯数字」
+        # （DEVELOPMENT.md「金额纪律」）。解析不出就如实**返回空**（渲染成 ``-``），
+        # 要交代原因就交给调用方写进 ``notes``。
+        return ""
     try:
         text = await client.wikitext(m.group(1).strip())
     except EsportsError:
@@ -1865,7 +1904,26 @@ async def collect_tournament(
         return result
     result["page"] = page
 
-    wikitext = await client.wikitext(page)
+    # ⚠️ 取主页正文要**兜住限流**（P1-7，2026-10-14 审查）。
+    #
+    # 原来 ``await client.wikitext(page)`` 是裸的：第一次 429 会一路冒到
+    # ``dota_tools._esports_guard`` → 返回 ``(None, note)`` → 调用方看到
+    # ``data["page"]`` 为空，于是回一句**「没查到赛事「X」的页面。」**。
+    #
+    # 这句话把「站点在限流（等一会儿就有）」说成了「这个赛事不存在」——
+    # 正是本仓库反复强调不许混的那两件事，而且此时 ``page`` 明明已经解析
+    # 出来了（就在上面一行），连页面标题都被丢掉了。
+    #
+    # 现在：限流/不可用 ⇒ 保留已解析出的 ``page``，把它记进 notes 交给渲染层，
+    # 让用户看到「这个赛事页存在，但内容现在取不到」。
+    try:
+        wikitext = await client.wikitext(page)
+    except EsportsError as e:
+        result["notes"].append(
+            f"赛事页「{page}」已找到，但正文这次没取到（{e}）。"
+            "这是**这一块暂时取不到**，不是「没有这个赛事」。"
+        )
+        return result
     if not wikitext:
         result["notes"].append("赛事页面内容为空（可能不存在，或站点暂时不可用）。")
         return result
@@ -1880,21 +1938,41 @@ async def collect_tournament(
     pool = await resolve_prize_pool(client, info)
     if pool:
         info["prizepoolusd"] = pool
+    elif info.get("_prizepool_raw") and (info.get("prizepoolusd") or "").strip():
+        # 页面上**写了**奖池，但两条数字正则都没吃下来（带单位 / 脚注等写法），
+        # 且子页面这条回退路也没走通 ⇒ 如实说「这里不给数字」，绝不回退成原文
+        # （P1-8）。与下面那条「写在子页面里」分开措辞，否则排查时会指错方向。
+        info["prizepoolusd"] = ""
+        result["notes"].append(
+            "奖池这一栏在页面上有内容，但不是可直接读取的纯数字"
+            "（可能带单位 / 脚注或写在子页面里），这里不给具体金额。"
+        )
     elif info.get("_prizepool_raw"):
         info["prizepoolusd"] = ""
         result["notes"].append("奖池金额写在单独的子页面里且没取到，这里不给具体数字。")
 
     # 赛程 / 积分榜常在子页面。只有「主页里没拿到」才去多花请求。
+    #
+    # ⚠️ 这一段是 P1-7 里最容易丢东西的地方：``info / teams / slots / tables``
+    # **在上面已经全部解析好了**，原先一句裸抛的 ``client.wikitext(sub)``
+    # 就能把整批成果连同「已找到页面」的事实一起丢掉，用户只看到
+    # 「没查到赛事「X」的页面。」现在每一次取正文都单独兜住，取到多少算多少。
     if max_subpages > 0 and (not matches or not tables):
         try:
             subs = await client.subpages(page, limit=100)
         except EsportsError as e:
             subs = []
             result["notes"].append(f"子页面列举失败（{e}）。")
+        failed_subs: list[str] = []
         for sub in _usable_subpages(subs)[:max_subpages]:
             if sub.replace("_", " ") == page:
                 continue
-            sub_wt = await client.wikitext(sub)
+            try:
+                sub_wt = await client.wikitext(sub)
+            except EsportsError as e:
+                # 单个子页取不到不该毁掉另一个子页，更不该毁掉主页成果
+                failed_subs.append(f"{sub}（{e}）")
+                continue
             if not sub_wt:
                 continue
             if not matches:
@@ -1905,6 +1983,11 @@ async def collect_tournament(
                 swiss = parse_swiss_zones(sub_wt) or swiss
             if matches and tables:
                 break
+        if failed_subs:
+            result["notes"].append(
+                "以下子页面这次没取到（可能被限流）：" + "、".join(failed_subs) + "。"
+                "主页信息照常给，只是赛程 / 积分榜可能不全。"
+            )
 
     if not teams:
         result["notes"].append("该赛事页没有列出参赛队伍（可能还没抽签 / 页面未更新）。")
@@ -1939,7 +2022,18 @@ async def collect_team_page(client: "LiquipediaClient", query: str) -> dict[str,
         out["notes"].append(note or "没找到战队页面。")
         return out
     out["page"] = page
-    wikitext = await client.wikitext(page)
+    try:
+        wikitext = await client.wikitext(page)
+    except EsportsError as e:
+        # 同 collect_tournament 的 P1-7：页面找到了就留住这个事实，
+        # 别把「限流」讲成「这个队不存在」。对 query_esports_team 尤其重要 ——
+        # OpenDota 那半边的评分 / 胜负 / 近期战绩**已经取成功了**，不能因为
+        # wiki 这半边取不到就整批丢掉（``if not info and not od`` 那个分支）。
+        out["notes"].append(
+            f"战队页「{page}」已找到，但正文这次没取到（{e}）。"
+            "这是**这一块暂时取不到**，不是「没有这个战队」。"
+        )
+        return out
     if not wikitext:
         out["notes"].append("战队页面内容为空（可能不存在，或站点暂时不可用）。")
         return out

@@ -29,20 +29,17 @@ analytics），并且提供 OpenDota 没有的字段（分位表现 IMP、位置
 from __future__ import annotations
 
 import asyncio
+import http.client
 import json
 import urllib.error
 import urllib.request
-from typing import Any
+from typing import Any, Callable
 
 from astrbot.api import logger
 
 try:  # 插件目录被作为包加载时的相对导入
     from .dota_api import (
-        AmbiguousTargetError,
         OpenDotaError,
-        OpenDotaClient,
-        TargetNotFoundError,
-        to_account_id,
     )
 except ImportError:  # 兜底：以普通模块方式加载时，把插件目录加入 sys.path
     import os
@@ -50,11 +47,7 @@ except ImportError:  # 兜底：以普通模块方式加载时，把插件目录
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from dota_api import (  # type: ignore[no-redef]
-        AmbiguousTargetError,
         OpenDotaError,
-        OpenDotaClient,
-        TargetNotFoundError,
-        to_account_id,
     )
 
 
@@ -230,15 +223,20 @@ class StratzClient:
         request = urllib.request.Request(
             STRATZ_ENDPOINT, data=body, headers=headers, method="POST"
         )
-        opener = (
-            urllib.request.build_opener(
+        # ⚠️ 走 `.open()` 而不是直接 `opener(request, …)`：`OpenerDirector`
+        # **是可调用的**（`__call__` 等价于 `.open()`），线上一直是那么跑的；
+        # 但 typeshed 没有声明 `__call__`，于是 mypy 报
+        # `"OpenerDirector" not callable`（2026-10-14）。两条分支在这里统一成
+        # 同一个签名 `(request, timeout=…)`，行为与原先逐字一致。
+        fetch: Callable[..., Any]
+        if self.proxy:
+            fetch = urllib.request.build_opener(
                 urllib.request.ProxyHandler({"http": self.proxy, "https": self.proxy})
-            )
-            if self.proxy
-            else urllib.request.urlopen
-        )
+            ).open
+        else:
+            fetch = urllib.request.urlopen
         try:
-            with opener(request, timeout=self.timeout) as resp:
+            with fetch(request, timeout=self.timeout) as resp:
                 raw = resp.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             detail = ""
@@ -269,6 +267,25 @@ class StratzClient:
             ) from e
         except urllib.error.URLError as e:
             raise StratzUnavailableError(f"无法连接 STRATZ：{e.reason}") from e
+        except (OSError, TimeoutError, http.client.HTTPException) as e:
+            # ⚠️ 必须补这一段（P1-1，2026-10-14 审查）：CPython 的
+            # ``urllib/request.py`` **只把「发送请求」阶段的 OSError 包成
+            # URLError**；``getresponse()`` / ``resp.read()`` 里抛出的
+            # ``TimeoutError``（socket 超时）/ ``ConnectionResetError`` /
+            # ``RemoteDisconnected`` / ``BadStatusLine``（都是 OSError 或
+            # http.client.HTTPException 的子类）会**直接穿出**上面两个分支。
+            #
+            # 后果不只是「日志难看」：`_gql` 只 catch 三个 Stratz* 异常，
+            # `FallbackDataSource._make_forwarder` 只 catch
+            # `_fallback_trigger_types()`（= Stratz*/OpenDota*）——
+            # 于是读超时会**逃出整条降级链**，直接冒到 handler 层变成
+            # 「执行失败」，后备的 OpenDota 一次都不会被问到。
+            #
+            # 顺序要紧：``HTTPError`` 是 ``URLError`` 的子类，
+            # 必须排在它前面（这里是独立分支，天然满足）。
+            raise StratzUnavailableError(
+                f"连接 STRATZ 时发生网络错误（{type(e).__name__}）：{e}"
+            ) from e
 
         try:
             data = json.loads(raw)
@@ -447,9 +464,44 @@ class StratzClient:
         row["radiant_win"] = did_radiant_win
         row["is_radiant"] = is_radiant
         row["parsed_datetime"] = node.get("parsedDateTime")
+        # 「队伍总击杀」—— ``dota_format.summarize_matches`` 的场均击杀参与率要用它。
+        # 这个键在本文件之外**只被读、从来没有写入方**（2026-10-14 审查报告 4.4），
+        # 于是那项指标恒不出数。补上唯一能拿到它的地方：
+        #
+        # * OpenDota 侧**拿不到**：``/players/{id}/recentMatches`` 与
+        #   ``/players/{id}/matches`` 都不返回 ``radiant_score``/``dire_score``
+        #   （2026-10-14 实测各 20 条全为 None，``project=radiant_score`` 也无效）；
+        # * STRATZ 侧**能拿到**：``radiantKills``/``direKills`` 是逐分钟击杀数数组，
+        #   与本文件 :meth:`_normalize_match` 的口径一致，求和即可。
+        #
+        # 取不到就**不写这个键**，让渲染层按「样本 0 场」自然省略那一行 ——
+        # 不要写 0（0 会被读成「零参与」）。
+        row["_team_kills"] = cls._team_kills_of(node, is_radiant)
         if account_id is not None:
             row["account_id"] = account_id
         return row
+
+    @staticmethod
+    def _team_kills_of(node: dict, is_radiant: object) -> int | None:
+        """该玩家**所在队伍**本场总击杀（拿不到返回 ``None``）。
+
+        ``radiantKills``/``direKills`` 是逐分钟击杀数（形状与 OpenDota 的
+        ``radiant_score``/``dire_score`` 一致，见 :meth:`_normalize_match`）。
+        阵营未知、数组缺失、元素不是数字时一律返回 ``None`` —— 让「参团率」
+        这一项缺席，而不是拿半份数据算出个错的百分比。
+        """
+        if not isinstance(is_radiant, bool):
+            return None
+        series = node.get("radiantKills") if is_radiant else node.get("direKills")
+        if not isinstance(series, list) or not series:
+            return None
+        total = 0
+        for value in series:
+            try:
+                total += int(value or 0)
+            except (TypeError, ValueError):
+                return None
+        return total if total > 0 else None
 
     # ------------------------------------------------------------------
     # 英雄 / 道具常量
@@ -604,14 +656,18 @@ class StratzClient:
                 ranks[0],
             )
             if isinstance(core, dict):
-                try:
-                    rank_num = int(core.get("rank"))
-                    # STRATZ 的 rank 是 1~80 的「段位*10+星级」，转成 OpenDota 的
-                    # rank_tier（十位=段位、个位=星级）。STRATZ 的 rank 本身就是
-                    # 这个编码（如 42 = 统帅 2 星 = Archon II），可直接用。
-                    rank_tier = rank_num
-                except (TypeError, ValueError):
-                    rank_tier = None
+                # rank 字段缺失 / 不是数字时 `rank_tier` 保持 None（不猜段位）。
+                # 原先写成 `int(core.get("rank"))` 靠 except 兜住 None —— 效果一样，
+                # 但静态检查器看不到「None 也被兜住了」（mypy `[arg-type]`）。
+                raw_rank = core.get("rank")
+                if raw_rank is not None:
+                    try:
+                        # STRATZ 的 rank 是 1~80 的「段位*10+星级」，与 OpenDota 的
+                        # rank_tier（十位=段位、个位=星级）是同一套编码
+                        # （如 42 = 统帅 2 星 = Archon II），可直接用。
+                        rank_tier = int(raw_rank)
+                    except (TypeError, ValueError):
+                        rank_tier = None
 
         return {
             "profile": {
@@ -723,6 +779,15 @@ class StratzClient:
                     lane
                     position
                   }}
+                  # ⚠️ 只为「队伍总击杀」而取（2026-10-14，审查报告 4.4 ：
+                  # ``dota_format`` 的「场均击杀参与率」靠 ``_team_kills``，
+                  # 而那个键**从来没有写入方**）。STRATZ 的 MatchType **没有**
+                  # 标量比分字段（实测 ``radiantScore`` / ``direScore`` 都报
+                  # Unknown field），只有这两个逐分钟击杀数数组，求和即
+                  # 「该队本场总击杀」。代价实测：20 场查询 9,573 → 11,469
+                  # 字节（+20%），仍是一次请求。
+                  radiantKills
+                  direKills
                 }}
               }}
             }}

@@ -11,11 +11,15 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
-
 from astrbot.api import logger
+
+if TYPE_CHECKING:  # pragma: no cover - 仅静态检查期存在，运行期不导入
+    # ⚠️ 必须放在 TYPE_CHECKING 里：`dota_stratz` 模块级就 import 了本模块的
+    # `OpenDotaError`（见其类定义），这里若在运行期反向 import 会构成真循环。
+    from .dota_stratz import StratzClient
 
 #: 32 位 account_id 与 64 位 SteamID 的换算基准
 STEAM_ID_64_BASE = 76561197960265728
@@ -104,15 +108,22 @@ def to_steam_id64(account_id: int | str) -> str:
 
 
 class RateLimiter:
-    """极简令牌桶：保证两次请求之间的最小间隔。"""
+    """最小间隔闸门：保证两次 ``acquire()`` 之间至少隔 ``60 / per_minute`` 秒。
+
+    ⚠️ 名字里的「令牌桶」是历史误称（2026-10-14 改正）：这里**没有桶、也没有
+    突发额度** —— 它只用「上一次请求的时刻」算一个下限，均匀铺开每次请求。
+    真正的令牌桶允许攒额度后连打，本类不允许，这是刻意的：OpenDota 的限流按
+    分钟计，均匀铺开比攒一波再打更安全。
+
+    也**没有** ``configure()``（同日删除）：它当年在锁外直接改
+    ``_min_interval``，而且从来没有调用点 —— 限速值来自配置，实例构造时定死。
+    要改就跑新的实例，别让一个运行中的限速器在中途换档。
+    """
 
     def __init__(self, per_minute: int) -> None:
         self._lock = asyncio.Lock()
         self._min_interval = 60.0 / max(1, per_minute)
         self._last_request_at = 0.0
-
-    def configure(self, per_minute: int) -> None:
-        self._min_interval = 60.0 / max(1, per_minute)
 
     async def acquire(self) -> None:
         async with self._lock:
@@ -379,8 +390,11 @@ class OpenDotaClient:
             for row in rows:
                 if not isinstance(row, dict):
                     continue
+                raw_id = row.get("id")
+                if raw_id is None:
+                    continue
                 try:
-                    ability_id = int(row.get("id"))
+                    ability_id = int(raw_id)
                 except (TypeError, ValueError):
                     continue
                 name = row.get("name") or row.get("dname")
@@ -672,15 +686,6 @@ class OpenDotaClient:
             return rows[: int(limit)]
         return rows
 
-    async def get_leagues(self) -> list[dict]:
-        """全部赛事名单（``GET /leagues``）。
-
-        实测约 1MB / 数千条，每行是 ``{leagueid, name, tier}``。**调用方必须自己缓存**，
-        本客户端不做缓存（体量大、且不同调用方要的切片不一样）。
-        """
-        data = await self._request("/leagues", timeout=max(30, self.timeout))
-        return [row for row in (data or []) if isinstance(row, dict)]
-
     async def get_team(self, team_id: int) -> dict:
         """某战队的评分与总胜负（``GET /teams/{id}``）。取不到返回空 dict。"""
         data = await self._request(f"/teams/{int(team_id)}", allow_404=True)
@@ -868,8 +873,212 @@ def _fallback_trigger_types() -> tuple[type[Exception], ...]:
     return _FALLBACK_TRIGGER
 
 
+# ======================================================================
+# 双数据源的公共契约
+# ======================================================================
+class DataSource(Protocol):
+    """STRATZ 与 OpenDota 两个客户端**可互换使用**的那部分接口。
+
+    为什么要有这个 Protocol
+    -----------------------
+    本插件的核心设计是「双数据源 + 自动降级」，整套机制的成立前提是
+    :class:`StratzClient` 与 :class:`OpenDotaClient` 在**同一批方法上
+    口径一致、可以互换**。在此之前这条契约只靠两样东西维持：文档里的
+    一句承诺，和 ``tests/fallback_check.py`` 里一条「STRATZ 实现了全部
+    白名单方法」的存在性检查 —— 没有签名、没有返回类型、也没有任何人替
+    上层调用点把关。这个 Protocol 把那条口头契约变成静态可验的东西：
+    本模块末尾的 :data:`_CONTRACT_OD` / :data:`_CONTRACT_SZ` /
+    :data:`_CONTRACT_FB` 会让 mypy 亲自确认两个客户端与组合数据源
+    都满足它。
+
+    它描述的边界
+    ------------
+    只有「**两端都实现、且上层可以不加区分地调用**」的成员才在这里。
+    共 19 个方法 ＋ 1 个能力位，而 :data:`_FALLBACK_METHODS` 的降级转发
+    白名单是它的**真子集**（16 个：19 减去 ``close`` / ``is_parsed`` /
+    ``request_parse``，后三者不需要降级转发）。
+
+    **单端能力一律不放进来**，它们由 :class:`FallbackDataSource` 用
+    :meth:`FallbackDataSource._opendota_side` / :meth:`…_stratz_side`
+    按类型定位后转发：
+
+    * 只有 OpenDota 有：``get_hero_stats`` / ``get_latest_patch`` /
+      ``get_hero_item_popularity`` / ``get_pro_matches`` / ``get_teams_index``
+      / ``get_team`` / ``get_team_players`` / ``get_team_matches``
+    * 只有 STRATZ 有：``configured`` / ``get_hero_playstyle`` /
+      ``get_hero_lane_outcome`` / ``get_hero_item_purchase``
+
+    把它们写进来的代价不是「多余」，而是**主动撒谎**：Protocol 的语义
+    就是「两端都有」。当年 ``get_hero_item_popularity`` 正是这样被误放进
+    ``_FALLBACK_METHODS`` 的，被存在性检查当场抓住。
+
+    签名口径：最窄的公共面
+    ----------------------
+    ``get_ability_names`` 两端并不一致 —— OpenDota 多一个
+    ``force: bool = False``（缓存刷新开关），STRATZ 没有。这里取**没有参数**
+    的那一版，因为 Protocol 描述的是「按这种调用方式，任一端都能用」：
+
+    * 实现方多出**带默认值**的参数 → 满足（OpenDota 那版照样能按 ``()`` 调用）；
+    * 实现方少参数 → 不满足（这正是要拦住的）。
+
+    没有把 ``force`` 强行补到 STRATZ 上：补一个被忽略的假参数只会制造
+    「签名看着一致、行为并不一致」的错觉 —— STRATZ 侧本来就有自己的缓存
+    管理，那个开关对它没有意义。
+
+    为什么不加 ``@runtime_checkable``
+    ---------------------------------
+    本 Protocol 只服务静态检查。运行期的数据源身份判定由 ``SOURCE_KIND``
+    ＋ :func:`is_opendota_source` 负责，那套是按**类型**定位、能容忍包装类
+    与打桩对象的。``runtime_checkable`` 的 ``isinstance`` 只查属性**名字**
+    是否存在、**不查签名**，很容易被后人不小心当成可靠判据用，所以宁可不给
+    这个能力。
+    """
+
+    # ------------------------------------------------------------------
+    # 能力位
+    # ------------------------------------------------------------------
+    @property
+    def SUPPORTS_PATCH_FILTER(self) -> bool:
+        """当前数据源能否「按版本过滤场次」。
+
+        两端都必须**显式声明**自己是哪一种（OpenDota ``True`` / STRATZ
+        ``False``），不能靠默认值蒙过去：这是上层判断「手上的数据到底是
+        当前版本口径还是全生涯口径」的唯一依据，猜错的代价是把两份不同口径
+        的数据摆在一起比高下。
+
+        ⚠️ 这里用 ``@property`` 而不是 ``SUPPORTS_PATCH_FILTER: bool``
+        （可变属性声明）：两个客户端的写法是类属性、而
+        :class:`FallbackDataSource` 是**动态计算**的只读 property
+        （见其实现 —— 它必须按「主源此刻是否可用」实时算，写死会报错口径），
+        只读属性通不过可变属性声明（mypy：``expected settable variable,
+        got read-only attribute``）。声明成 property 则三者都能满足。
+        """
+        ...
+
+    # ------------------------------------------------------------------
+    # 生命周期
+    # ------------------------------------------------------------------
+    async def close(self) -> None:
+        """释放底层连接池。"""
+        ...
+
+    # ------------------------------------------------------------------
+    # 常量与元数据
+    # ------------------------------------------------------------------
+    async def get_ability_names(self) -> dict[int, str]:
+        """技能 ID → 技能名（口径见各端实现；签名口径见类文档）。"""
+        ...
+
+    async def get_benchmarks(self, hero_id: int) -> dict:
+        """英雄分档基准数据。"""
+        ...
+
+    async def get_heroes(self, force: bool = False) -> dict[int, dict]:
+        """英雄常量表：``hero_id → 英雄信息``。"""
+        ...
+
+    async def get_items(self, force: bool = False) -> dict[str, dict]:
+        """物品常量表：``item_key → 物品信息``。"""
+        ...
+
+    async def get_patches(self, limit: int = 0) -> list[dict]:
+        """补丁表（新→旧）。``limit<=0`` 表示不限。"""
+        ...
+
+    async def hero_name(self, hero_id: int | None) -> str:
+        """英雄 ID → 中文 / 官方名；未知 ID 返回占位串而非抛错。"""
+        ...
+
+    # ------------------------------------------------------------------
+    # 单条比赛
+    # ------------------------------------------------------------------
+    async def get_match(self, match_id: int, timeout_factor: float = 3.0) -> dict | None:
+        """单场比赛详情；``None`` 表示**本数据源没有这条记录**。
+
+        ``None`` 的语义很关键：它同时也是 :data:`_EMPTY_TRIGGERS_FALLBACK`
+        的触发条件（两个源的收录范围不一致，主源没有不代表真的没有）。
+        """
+        ...
+
+    def is_parsed(self, match: dict | None) -> bool:
+        """这盘是否已解析（两端判据一致）。
+
+        ⚠️ 两端都把它写成 ``@staticmethod``，而 :class:`FallbackDataSource`
+        写成实例方法 —— 两者都满足这里的实例方法声明（mypy 实测），
+        调用方一律按 ``api.is_parsed(match)`` 用，不要直接引用类上的函数。
+        """
+        ...
+
+    async def request_parse(self, match_id: int) -> bool:
+        """提交解析申请（**写操作**，不做降级）。"""
+        ...
+
+    # ------------------------------------------------------------------
+    # 玩家维度
+    # ------------------------------------------------------------------
+    async def get_player(self, account_id: int) -> dict | None:
+        """账号资料；``None`` 表示查不到这位玩家。"""
+        ...
+
+    async def search_player(self, query: str, timeout: float = 60.0) -> list[dict]:
+        """按昵称 / ID 搜索玩家，返回候选列表。"""
+        ...
+
+    async def get_player_heroes(
+        self,
+        account_id: int,
+        *,
+        patch: int | None = None,
+        game_mode: int | None = None,
+        include_insignificant: bool = True,
+    ) -> list[dict]:
+        """玩家英雄池（可限定版本 / 模式）。"""
+        ...
+
+    async def get_player_matches(
+        self,
+        account_id: int,
+        limit: int = 20,
+        offset: int = 0,
+        win: int | None = None,
+        lose: int | None = None,
+        hero_id: int | None = None,
+        significant: int = 0,
+    ) -> list[dict]:
+        """玩家比赛列表（可带胜负 / 英雄 / 显著场次过滤）。"""
+        ...
+
+    async def get_player_matches_enriched(
+        self, account_id: int, limit: int = 20
+    ) -> tuple[list[dict], int]:
+        """带补充信息的比赛列表，返回 ``(场次, 总数)``。"""
+        ...
+
+    async def get_player_peers(self, account_id: int) -> list[dict]:
+        """玩家常一起玩的队友 / 对手。"""
+        ...
+
+    async def get_player_totals(self, account_id: int, field: str = "kills") -> dict:
+        """玩家某个字段的生涯汇总。"""
+        ...
+
+    async def get_player_wl(self, account_id: int) -> dict:
+        """玩家胜负场次统计。"""
+        ...
+
+    async def get_recent_matches(self, account_id: int, limit: int = 20) -> list[dict]:
+        """最近场次（两端都有硬性条数上限，见各端实现）。"""
+        ...
+
+
 #: 需要被「主数据源优先、失败切后备」包裹的方法名。
 #: 这些方法都是**只读查询**；``request_parse`` 等写操作不做降级（见类文档）。
+#:
+#: ⚠️ 这张白名单必须是 :class:`DataSource` 的**子集**（16 = 19 − ``close`` −
+#: ``is_parsed`` − ``request_parse``：那三个不需要降级转发）。往这里加名字之前
+#: 先确认它是「双源共有」的，否则会重演当年 ``get_hero_item_popularity``
+#: 误入白名单的错 —— 主源上没有这个方法，转发时只会拿到一句「没这个方法」，
+#: 然后把「能力不存在」误报成「没有数据」。
 _FALLBACK_METHODS: tuple[str, ...] = (
     "get_heroes",
     "hero_name",
@@ -950,6 +1159,61 @@ class FallbackDataSource:
     name = "fallback"
     label = "STRATZ（后备 OpenDota）"
 
+    # ------------------------------------------------------------------
+    # 公共契约声明（**仅在类型检查期存在**，运行期一行都没有）
+    # ------------------------------------------------------------------
+    if TYPE_CHECKING:
+        # 下面这 16 个 ``...`` 只是**声明**：真正的实现是 __init__ 里按
+        # _FALLBACK_METHODS 动态生成的转发函数。之所以要手写一遍，是因为
+        # ``setattr`` 对静态检查器完全不可见 —— 不写的话 mypy 会认为本类
+        # 缺少全部 16 个查询方法，进而不满足 DataSource 契约，也跟着
+        # 用不了任何按契约标注形参的地方。
+        #
+        # 代价是「_FALLBACK_METHODS 白名单」与「这份声明」成了两份真相。
+        # 由 tests/batch3_check.py 的断言守着：逐名比对两份名单，漏一个就红。
+        # （这也是没有把它们做成自动同步的原因 —— 动态生成的东西一旦出错
+        #   是**静默**的，宁可留一份能被断言比对的明文。）
+        async def get_ability_names(self) -> dict[int, str]: ...
+        async def get_benchmarks(self, hero_id: int) -> dict: ...
+        async def get_heroes(self, force: bool = False) -> dict[int, dict]: ...
+        async def get_items(self, force: bool = False) -> dict[str, dict]: ...
+        async def get_match(
+            self, match_id: int, timeout_factor: float = 3.0
+        ) -> dict | None: ...
+        async def get_patches(self, limit: int = 0) -> list[dict]: ...
+        async def get_player(self, account_id: int) -> dict | None: ...
+        async def get_player_heroes(
+            self,
+            account_id: int,
+            *,
+            patch: int | None = None,
+            game_mode: int | None = None,
+            include_insignificant: bool = True,
+        ) -> list[dict]: ...
+        async def get_player_matches(
+            self,
+            account_id: int,
+            limit: int = 20,
+            offset: int = 0,
+            win: int | None = None,
+            lose: int | None = None,
+            hero_id: int | None = None,
+            significant: int = 0,
+        ) -> list[dict]: ...
+        async def get_player_matches_enriched(
+            self, account_id: int, limit: int = 20
+        ) -> tuple[list[dict], int]: ...
+        async def get_player_peers(self, account_id: int) -> list[dict]: ...
+        async def get_player_totals(
+            self, account_id: int, field: str = "kills"
+        ) -> dict: ...
+        async def get_player_wl(self, account_id: int) -> dict: ...
+        async def get_recent_matches(
+            self, account_id: int, limit: int = 20
+        ) -> list[dict]: ...
+        async def hero_name(self, hero_id: int | None) -> str: ...
+        async def search_player(self, query: str, timeout: float = 60.0) -> list[dict]: ...
+
     @property
     def SUPPORTS_PATCH_FILTER(self) -> bool:
         """当前**实际生效**的那一端能否按版本过滤（见 OpenDotaClient 上的说明）。
@@ -957,10 +1221,27 @@ class FallbackDataSource:
         不能简单写死 True：这个能力只归属 OpenDota。一旦已经降级到后备源，
         版本过滤就没了 —— 上层必须看得见这件事，否则会把全生涯数据
         当成当前版本摆给用户。
+
+        ⚠️ 判据必须是**这一次的降级原因**，而不是「历史上降过级没有」
+        （P1-4，2026-10-14 审查）：
+
+        ``degrade_reason`` 是个**粘滞**标记 —— 只在下标两处被赋值、全仓库
+        没有任何复位点，于是在这个进程里第一次网络抖动之后，它会一直挂着
+        ``"unavailable"``。而 ``_make_forwarder`` 每次请求**仍然是主源优先**
+        （它自己说了：「可能只是瞬时抖动」），所以主源早就恢复了、后面的
+        每一次英雄池请求都走的是 OpenDota，这里却还在按「已经降级」报告
+        ``SUPPORTS_PATCH_FILTER = False`` —— 上层于是把一份**完整的当前版本
+        数据**标成「未按版本过滤的全生涯口径」，恰好是这段 docstring 最怕的
+        那种错误，只是方向反了。
+
+        改法：把这里的判据从粘滞原因换成**主源此刻有没有配置好**。它才是
+        「这一次实际会用到哪一端」的真实依据（见 ``_primary_ready``）——
+        主源可用 ⇒ 转发一定先走主源 ⇒ 能力就是主源的能力；
+        主源不可用（未配置 / 无 Key）⇒ 必然走后备 ⇒ 用后备的能力。
         """
-        if self.degrade_reason == "unavailable":
-            return bool(getattr(self.secondary, "SUPPORTS_PATCH_FILTER", False))
-        return bool(getattr(self.primary, "SUPPORTS_PATCH_FILTER", False))
+        if self._primary_ready():
+            return bool(getattr(self.primary, "SUPPORTS_PATCH_FILTER", False))
+        return bool(getattr(self.secondary, "SUPPORTS_PATCH_FILTER", False))
 
     def __init__(
         self,
@@ -1017,6 +1298,25 @@ class FallbackDataSource:
                 return await self._call_secondary(
                     method_name, secondary_method, args, kwargs, reason=str(e)
                 )
+
+            # ---- 主源这一次答上来了：如果之前挂着降级标记，现在复位 ----
+            # ⚠️ 必须复位（P1-4，2026-10-14 审查）：
+            # ``degrade_reason`` 原本是个**只写不读回**的粘滞标记 —— 全仓库
+            # 只有下面两处赋值、没有任何复位点。于是这个进程里第一次网络抖动
+            # 之后，它会一直挂着 ``"unavailable"``，而 :meth:`describe` 会
+            # 一直报告「STRATZ 暂时不可用」——**哪怕主源早就恢复了、后面每一次
+            # 请求都走的它**。用户看到的抬头就成了一条永远不准的状态。
+            #
+            # 复位时机选在这里（主源成功返回）而不是「每次请求开始时清零」：
+            # 后者会让降级标记在「主源又抖了一下」时来不及被看见。
+            if self.degraded:
+                logger.info(
+                    f"[dota2] {self.primary_label}已恢复，清除降级标记"
+                    f"（原因曾是 {self.degrade_reason or '未知'}）"
+                )
+                self.degraded = False
+                self.degrade_reason = ""
+                self.last_error = ""
 
             if (
                 result is None
@@ -1195,10 +1495,6 @@ class FallbackDataSource:
             "get_pro_matches", [], what="近期职业比赛", *args, **kwargs
         )
 
-    async def get_leagues(self, *args: Any, **kwargs: Any) -> list[dict]:
-        """赛事名单：**固定走 OpenDota**。"""
-        return await self._from_opendota("get_leagues", [], what="赛事名单", *args, **kwargs)
-
     async def get_team(self, *args: Any, **kwargs: Any) -> dict:
         """战队概览：**固定走 OpenDota**。"""
         return await self._from_opendota("get_team", {}, what="战队概览", *args, **kwargs)
@@ -1334,3 +1630,36 @@ class FallbackDataSource:
         if checker is None:
             checker = OpenDotaClient.is_parsed
         return bool(checker(match))
+
+
+# ======================================================================
+# 公共契约的静态验证（运行期完全不执行）
+# ======================================================================
+# 这是 :class:`DataSource` Protocol 的**全部价值所在**：下面三行让 mypy 亲自确认
+# 「两个客户端 + 组合数据源」都满足那份契约。只要哪天有人在某一端改了方法名、
+# 收紧了参数、或者换了返回类型，CI 里的 mypy 一步就会红 —— 而不是等到线上某个
+# 查询在降级路径上炸掉才发现。
+#
+# 在此之前，这条契约只有一份文档，外加 tests/fallback_check.py 里一条
+# 「STRATZ 客户端实现了全部白名单方法」的**存在性**检查 —— 名字对上了就算过，
+# 签名、参数、返回类型一概不管。
+#
+# 之所以放在模块末尾：FallbackDataSource 定义在上面几个段落之后，
+# 而它的检查必须在它定义完之后才能写。
+#
+# 运行期整个块都不执行（TYPE_CHECKING 恒为 False）：既不会真的构造出三个
+# 客户端、不产生连接池开销，`StratzClient` 的导入也只活在类型世界里，
+# 不会和 `dota_stratz` 构成循环导入（那边模块级就 import 了本模块的 OpenDotaError）。
+if TYPE_CHECKING:  # pragma: no cover - 仅静态检查期存在
+    #: OpenDota 客户端满足公共契约
+    _CONTRACT_OD: DataSource = OpenDotaClient(api_key="")
+    #: STRATZ 客户端满足公共契约
+    _CONTRACT_SZ: DataSource = StratzClient(api_key="")
+    #: 组合数据源同样满足 —— 它是对外**唯一**的入口，上层拿到的 ``api``
+    #: 绝大多数时候就是它。这里不靠继承，靠的是 Protocol 的**结构化子类型**：
+    #: 成员齐、签名对，mypy 就认。那 16 个 ``setattr`` 动态生成的方法由
+    #: 类体里的 ``if TYPE_CHECKING:`` 声明补上（见 FallbackDataSource 内部）。
+    _CONTRACT_FB: DataSource = FallbackDataSource(
+        OpenDotaClient(api_key=""), StratzClient(api_key="")
+    )
+

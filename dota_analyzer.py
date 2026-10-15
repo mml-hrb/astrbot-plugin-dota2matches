@@ -20,6 +20,7 @@ from astrbot.api import logger
 
 try:  # 插件目录被作为包加载时的相对导入
     from .dota_format import (
+        BENCHMARK_ENABLED,
         HERO_ATTR_ZH,
         HERO_ROLE_ZH,
         MIN_HERO_SAMPLE_GAMES,
@@ -28,7 +29,6 @@ try:  # 插件目录被作为包加载时的相对导入
         fmt_ago,
         fmt_duration,
         fmt_timestamp,
-        fmt_wan,
         format_summary_block,
         hero_meta_label,
         hname,
@@ -37,8 +37,8 @@ try:  # 插件目录被作为包加载时的相对导入
         mode_text,
         normalize_focus_ids,
         rank_text,
-        result_text,
         recent_hero_usage,
+        result_text,
         summarize_hero_history,
         summarize_matches,
         to_steam_id64,
@@ -49,6 +49,7 @@ except ImportError:  # 兜底：以普通模块方式加载时，把插件目录
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from dota_format import (  # type: ignore[no-redef]
+        BENCHMARK_ENABLED,
         HERO_ATTR_ZH,
         HERO_ROLE_ZH,
         MIN_HERO_SAMPLE_GAMES,
@@ -57,7 +58,6 @@ except ImportError:  # 兜底：以普通模块方式加载时，把插件目录
         fmt_ago,
         fmt_duration,
         fmt_timestamp,
-        fmt_wan,
         format_summary_block,
         hero_meta_label,
         hname,
@@ -66,8 +66,8 @@ except ImportError:  # 兜底：以普通模块方式加载时，把插件目录
         mode_text,
         normalize_focus_ids,
         rank_text,
-        result_text,
         recent_hero_usage,
+        result_text,
         summarize_hero_history,
         summarize_matches,
         to_steam_id64,
@@ -137,15 +137,15 @@ RECENT_REPORT_FORMAT = """请严格按照以下结构输出（使用 Markdown �
 MATCH_REPORT_FORMAT = """写作纪律（先读这七条，再动笔）：
 1. **这是给人看的点评，不是数据表的复述。** 数据块是给你下判断用的证据，不是抄进正文的素材。判据就一句：**一眼能概括整场的宏观数字可以写，单个选手的细节数值不要写**。
    - ✅ **可以写**：团队总比分（「32:18」）、比赛时长（「41 分钟」）、最终结果、双方总阵亡、建筑与兵营的存活情况、团战次数、肉山次数 —— 这类数字给读者一个坐标，写出来是加分。
-   - ❌ **不要写**：**单个选手**的任何数值 —— 净经济 / GPM / XPM、同英雄分位的百分比、补刀与反补、伤害与治疗量、经济差、买活次数，以及过程中的时间点（「第 27 分钟」）。这些一律翻译成人话：「刷得很快」「那一波之后就再没翻过身」「中期一波团之后」「在玩同一个英雄的人里属于上游」。
+   - ❌ **不要写**：**单个选手**的任何数值 —— 净经济 / GPM / XPM、补刀与反补、伤害与治疗量、经济差、买活次数，以及过程中的时间点（「第 27 分钟」）。这些一律翻译成人话：「刷得很快」「那一波之后就再没翻过身」「中期一波团之后」「在玩同一个英雄的人里属于上游」。
    - 胜负与 **K/D/A 必须写在标题里**（它是身份的锚点）。**但只在标题里出现这一次** —— 正文里不要再复述它的数字，尤其**不许用中文数字绕**：「七死一次」「两死三助攻」「零阵亡」这类写法一律不许（实测 9033548881 写出过「七死一次」，读起来像「死了七次」）。正文说「几乎没死过」「阵亡次数极少」就够了。注意「零阵亡」这种**数量词**同样是复述，改成「全程没被击杀」。
    - **中文数字同样算数字** —— 「领先一千金币」「前三分钟」和「领先 1000 金币」「第 3 分钟」一样不许写。
 2. **不报数 ≠ 不依据数据 —— 这是最容易退化成废话的一条。** 每一句评价背后都必须有数据块里的证据撑着，只是出口时把它翻译成人话。凡是「发挥不错」「有待提高」「还有提升空间」这类换个名字就能套给任何人的空话，一律不许写：要么说清具体是什么，要么不说。**数据块没给、或标注为「不可用 / -」的维度，本报告里直接跳过不提，一个字都不要写** —— 「本场数据未提供」「数据未予展示」「相关数据缺失」「查不到记录」「无相关统计」这类话一个都不许出现，换了说法也算。**特别注意：连「我在跳过」这个动作本身都不许交代** —— 「数据源未提供视野收支记录，因此本项略过」「此处不展开」「本项略过」「缺少相关数据所以无法评价」这类话同样是错的（实测模型会从「数据未提供」翻新成「因此本项略过」，本质一样）：读者不需要知道我们拿不到什么、也不需要知道哪里被跳过了，他只需要知道这局打得怎么样。不要推测、不要编造。
    - **再封杀一类更隐蔽的填充：把「这一项没数据 / 数值偏低」写成负面评价。** 典型句式：「他没能对建筑造成伤害」「建筑输出为零」「零推进贡献」「完全没有参与推塔」「本场基本没做视野布置」「抢符堆野都没做」。这些话**只有在第 7 条的前提成立时**才允许出现（他这个英雄在这个局面里本该干这件事、而且确实干了没有），否则它们就是在**挤占真正原因的位置** —— 缺数据不是罪过，塔伤为 0 往往也不是。
 3. 允许用「领先 / 落后」「上游 / 中游 / 下游」「明显 / 略」「早早 / 一直拖到后面」这类**定性程度词**表达强弱。除第 1 条白名单里的宏观数字之外，**不要再给数值、百分比、时间点**（阿拉伯数字与中文数字都不行，「领先一千块」这种写法同样不许）。
 4. 同一维度同时给了总量与构成时（英雄伤害 vs 输出构成、净经济 vs 经济来源分解、参团率 vs 团战逐场贡献、英雄治疗量 vs 治疗分布），要结合起来解释「为什么」，而不是各说一句。装备名与技能名可以写（它们不是「原始数据」），但不要附金币数与时间戳。
-5. **下判断前先给参照系**：能拿到「同英雄分位」的就用它定位上游 / 中游 / 下游；拿不到的就用对手的同类表现、他本人的逐分钟曲线做对照。禁止拿孤立绝对值下结论 —— 同一个 GPM 放在 1 号位和 5 号位身上含义相反。
-   - **这一步只做、不写。** 参照系的数字不要写（「分位上游」可以说，「分位 93%」不许写），**挑选参照系的过程更不要写**：不许出现「同英雄分位数据未提供，此处以其对线压制力与队友产出为参照系」「由于拿不到分位，改看他的逐分钟曲线」这类话 —— 实测模型把这一条读成了「必须交代我用了哪个参照系」，于是每段开头先来一句说明。那是内部动作，写出来与第 2 条禁掉的「数据未提供」同罪，一样在占真正原因的篇幅。
+5. **下判断前先给参照系**：{参照系说明}禁止拿孤立绝对值下结论 —— 同一个 GPM 放在 1 号位和 5 号位身上含义相反。
+   - **这一步只做、不写。** 参照系的数字不要写，**挑选参照系的过程更不要写**：{参照系反例}这类话 —— 实测模型把这一条读成了「必须交代我用了哪个参照系」，于是每段开头先来一句说明。那是内部动作，写出来与第 2 条禁掉的「数据未提供」同罪，一样在占真正原因的篇幅。
 6. 该批评就批评：该做没做的事、该出没出的装备、该撤没撤的团，都要点名说清。要允许自己得出「他这场打得不好」这个结论。对事不对人，不写脏话、不做人身攻击。
    但请注意「**该做**」这两个字是有前提的 —— 谁说「该做」？由第 7 条定，不由号位刻板印象定。
 7. **评价任何一个维度之前，先把这三件事定下来，再动笔**（这条决定上面几条能不能用对）：
@@ -185,8 +185,8 @@ MATCH_REPORT_FORMAT = """写作纪律（先读这七条，再动笔）：
   只有一位焦点玩家就只写一位；有几位就写几位，**一位都不能漏**。）
 
 ### ① 发挥定性 —— **必须写在最前面，3~5 句**
-**第一句就要开始判断，不要先交代数据情况**（不许写「同英雄分位数据未提供，此处以其…为
-参照系」这类话 —— 见写作纪律第 5 条：参照系是你的内部步骤，只做不写）。
+**第一句就要开始判断，不要先交代数据情况**（不许写{参照系反例_短}这类话 ——
+见写作纪律第 5 条：参照系是你的内部步骤，只做不写）。
 先判断**这局对他这一边是顺风还是逆风**，再判断**他在这个局面里起了什么作用**，
 然后从下表里选一组说法，用你自己的话把这局的他讲清楚：
 
@@ -273,21 +273,93 @@ MATCH_REPORT_FORMAT = """写作纪律（先读这七条，再动笔）：
 焦点玩家在这些转折点上是受益者还是责任人。与 ⑧ 的分工：⑧ 是**选手个人视角**，
 这里从**全局视角**讲这局是怎么被改变的，不要与之重复）"""
 
+#: 写作纪律第 5 条「参照系」那句话的**开/关两版**。
+#:
+#: 与口径说明同理：分位开关关闭后，**不能再在提示词里承诺有这个参照系**。
+#: 开着时是原话（「能拿到同英雄分位的就…」），关掉时换成不依赖分位的说法
+#: （「拿他本人的逐分钟曲线与对手同类表现做对照」）。
+_FORMAT_REFSYS_ON = (
+    "能拿到「同英雄分位」的就用它定位上游 / 中游 / 下游；"
+    "拿不到的就用对手的同类表现、他本人的逐分钟曲线做对照。"
+)
+_FORMAT_REFSYS_OFF = (
+    "用对手的同类表现、他本人的逐分钟曲线做对照。"
+)
+#: 第 5 条里「不许交代挑选参照系这个过程」的反例（开/关两版）。
+_FORMAT_REFBAD_ON = (
+    "不许出现「同英雄分位数据未提供，此处以其对线压制力与队友产出为参照系」"
+    "「由于拿不到分位，改看他的逐分钟曲线」"
+)
+_FORMAT_REFBAD_OFF = (
+    "不许出现「此处以其对线压制力与队友产出为参照系」"
+    "「由于数据不全，改看他的逐分钟曲线」"
+)
+#: ① 发挥定性里的短版反例（开/关两版）。
+_FORMAT_REFBAD_SHORT_ON = "「同英雄分位数据未提供，此处以其…为参照系」"
+_FORMAT_REFBAD_SHORT_OFF = "「此处以其…为参照系」"
+
+
+def match_report_format() -> str:
+    """按 :data:`~dota_format.BENCHMARK_ENABLED` 拼出写作纪律全文。
+
+    关闭分位时只改「第 5 条参照系」与两处反例措辞，**其余逐字不动**。
+    """
+    if BENCHMARK_ENABLED:
+        refsys, refbad, refbad_short = (
+            _FORMAT_REFSYS_ON, _FORMAT_REFBAD_ON, _FORMAT_REFBAD_SHORT_ON,
+        )
+    else:
+        refsys, refbad, refbad_short = (
+            _FORMAT_REFSYS_OFF, _FORMAT_REFBAD_OFF, _FORMAT_REFBAD_SHORT_OFF,
+        )
+    return MATCH_REPORT_FORMAT.format(
+        参照系说明=refsys, 参照系反例=refbad, 参照系反例_短=refbad_short,
+    )
+
 #: 数据块的口径说明。
 #:
 #: 这些不是客气话，而是**不写清楚就会被读错的点**。每一条都对应一个真实陷阱：
 #: 分位是按分钟归一化的（短局会整体抬高 GPM 量级）、治疗分布里含自我治疗、
 #: 符文类型本仓库证伪不了、团战块只列前 12 次。缺了这段，模型会把「Turbo 局
 #: GPM 1752」当成常规局的怪物数据，也会把自我治疗算成团队贡献。
-DATA_CAVEATS = """=== 读数据前必须知道的口径 ===
-1. 「同英雄分位」的百分比 = 他优于多少比例的同英雄玩家，越高越好；其中「死亡频率」已按「越低越好」反向成「生存」。
+#:
+#: ⚠️ **第 1、2 条讲的是「同英雄分位」，随 :data:`~dota_format.BENCHMARK_ENABLED`
+#: 一起开关**（见 :func:`data_caveats`）。它们被单独拆出来，是因为数据块里根本
+#: 没有分位时还要在口径里讲「分位是按每分钟归一化的」会直接诱发模型写
+#: 「分位数据未提供」这类交代 —— 而那是写作纪律第 2 条明令封杀的。
+#: **文案本身一字不动**：重新开启分位后，它们会原样回到口径说明里。
+_DATA_CAVEATS_HEAD = """1. 「同英雄分位」的百分比 = 他优于多少比例的同英雄玩家，越高越好；其中「死亡频率」已按「越低越好」反向成「生存」。
 2. 分位是按**每分钟**归一化的：节奏快的模式（Turbo 等）或时长很短的局会整体抬高 GPM/XPM 的量级。判断水平请以分位为准，不要拿绝对值跨模式比较。
-3. 「治疗分布」里的「自我治疗」不计入英雄治疗量，「给队友合计」才等于英雄治疗量。评价团队贡献时看后者。
-4. 「吃符时间点」只给时间、不给符文类型（数据源的类型编码本仓库无法证实），所以只能判断他有没有在符点去抢符，不能说他吃到了哪种符。
-5. 「视野收支」里的「排眼」指清掉**敌方**的眼，是判断辅助有没有做视野对抗的关键；「买X/插Y（差N）」的差值表示买了没插。
-6. 团战块**只列出前 12 次**团战（原文会注明总次数）；「焦点贡献」是焦点玩家在该次团战里的个人数据。
-7. **任何标注「不可用 / -」的维度都表示数据源没有给：直接跳过，不要在报告里做任何交代**（详见写作纪律第 2 条）。
-8. **「`-`」与「`0`」是两回事，不要混。** `-` 是「数据源没给这个字段」，`0` 是「给了、值确实就是 0」。把 `-` 当成 0 会直接写出假结论（例如把「拿不到建筑伤害」写成「他建筑输出为零」）。也不要用同类比赛的经验去补全缺失项。"""
+"""
+
+#: 口径说明里与「同英雄分位」无关的固定部分（编号已在注释里说明为什么从 1 开始）。
+_DATA_CAVEATS_TAIL = """「治疗分布」里的「自我治疗」不计入英雄治疗量，「给队友合计」才等于英雄治疗量。评价团队贡献时看后者。
+「吃符时间点」只给时间、不给符文类型（数据源的类型编码本仓库无法证实），所以只能判断他有没有在符点去抢符，不能说他吃到了哪种符。
+「视野收支」里的「排眼」指清掉**敌方**的眼，是判断辅助有没有做视野对抗的关键；「买X/插Y（差N）」的差值表示买了没插。
+团战块**只列出前 12 次**团战（原文会注明总次数）；「焦点贡献」是焦点玩家在该次团战里的个人数据。
+**任何标注「不可用 / -」的维度都表示数据源没有给：直接跳过，不要在报告里做任何交代**（详见写作纪律第 2 条）。
+**「`-`」与「`0`」是两回事，不要混。** `-` 是「数据源没给这个字段」，`0` 是「给了、值确实就是 0」。把 `-` 当成 0 会直接写出假结论（例如把「拿不到建筑伤害」写成「他建筑输出为零」）。也不要用同类比赛的经验去补全缺失项。"""
+
+
+def data_caveats() -> str:
+    """拼出「读数据前必须知道的口径」。
+
+    开启「同英雄分位」时 = 原样的 8 条（第 1、2 条讲分位，TAIL 接着编 3~8）；
+    关闭时 = 跳过那两条，**余下各条重新编号为 1~6** ——
+    编号连号是给模型「这是一份清单」的信号，跳号会被当成漏给了内容。
+
+    注意：TAIL 各条**不带编号**（编号由本函数统一补），这样两种形态共用同一份
+    文案，不会出现「改了一处漏了另一处」。
+    """
+    start = 3 if BENCHMARK_ENABLED else 1
+    numbered: list[str] = []
+    for idx, line in enumerate(_DATA_CAVEATS_TAIL.splitlines(), start=start):
+        if not line.strip():
+            continue
+        numbered.append(f"{idx}. {line}")
+    if BENCHMARK_ENABLED:
+        return "=== 读数据前必须知道的口径 ===\n" + _DATA_CAVEATS_HEAD + "\n".join(numbered)
+    return "=== 读数据前必须知道的口径 ===\n" + "\n".join(numbered)
 
 
 def mode_caveat(match: dict) -> str:
@@ -296,14 +368,24 @@ def mode_caveat(match: dict) -> str:
     Turbo（加速模式）的经济/经验获取速度远高于常规局，样本里一局 23 分钟的
     Turbo 能出现 GPM 1752 的 Sniper —— 与常规局放在一起比会得出「这是顶级
     发挥」的错误结论，而他的同英雄分位其实只有 93%（上游但谈不上碾压）。
+
+    ⚠️ 开启「同英雄分位」时沿用原话（让模型以分位为准）；**关闭时必须改口径** ——
+    不能再让模型「以分位为准」（数据块里没有分位），改用它本人的逐分钟曲线与
+    对手同类表现做参照。否则等于把模型又推回「分位数据未提供」那句填充上。
     """
     mode = mode_text(match)
     lowered = mode.lower()
     if "turbo" in lowered or "加速" in mode:
+        if BENCHMARK_ENABLED:
+            return (
+                f"本局模式为「{mode}」：金钱与经验获取速度远高于常规局，"
+                "GPM / XPM / 净经济的绝对值不要与常规局直接比较，"
+                "判断水平请以「同英雄分位」为准。"
+            )
         return (
             f"本局模式为「{mode}」：金钱与经验获取速度远高于常规局，"
             "GPM / XPM / 净经济的绝对值不要与常规局直接比较，"
-            "判断水平请以「同英雄分位」为准。"
+            "判断水平请以他本人的逐分钟发育曲线、以及对手的同类表现做参照。"
         )
     return ""
 
@@ -376,8 +458,11 @@ def _watch_focus_side(match: dict, player: dict) -> str:
     """
     radiant = player.get("isRadiant")
     if not isinstance(radiant, bool):
+        raw_slot = player.get("player_slot")
+        if raw_slot is None:
+            return ""
         try:
-            radiant = int(player.get("player_slot")) < 128
+            radiant = int(raw_slot) < 128
         except (TypeError, ValueError):
             return ""
     rs = match.get("radiant_score")
@@ -531,10 +616,17 @@ def build_recent_analysis_prompt(
     heroes: dict[int, dict],
     hero_rows: list[dict],
     economy_samples: int | None = None,
-    requested_count: int = 20,
     pool_scope: str = "",
 ) -> str:
-    """构造「近期表现与打法风格分析」的提示词。"""
+    """构造「近期表现与打法风格分析」的提示词。
+
+    ⚠️ 曾经有个 ``requested_count: int = 20`` 形参，函数体里**一次都没引用**
+    （2026-10-14 审查报告 4.4 列为死参数，连同 ``main.py`` 的实参一起删）。
+    「用户要了多少场」这件事**不该由调用方转述给提示词** —— 样本量得从
+    ``matches`` 数出来，否则调用方传 50、手上只有 20 场时，提示词里就会出现
+    一个不存在的样本数，模型会照着它下结论（这就是「机器已经报过的数字，
+    正文不许再说第二遍」那条约定的反面：**能算的别转述**）。
+    """
     summary = summarize_matches(matches, economy_samples=economy_samples)
     rows = summarize_hero_history(hero_rows)
 
@@ -635,8 +727,12 @@ def _lane_role_text(matches: list[dict]) -> str:
     counts: dict[int, int] = {}
     unknown = 0
     for match in matches or []:
+        raw_lane = match.get("lane_role")
+        if raw_lane is None:
+            unknown += 1
+            continue
         try:
-            lane = int(match.get("lane_role"))
+            lane = int(raw_lane)
         except (TypeError, ValueError):
             unknown += 1
             continue
@@ -756,18 +852,26 @@ def build_hero_pick_prompt(
     if rows:
         lines.append(f"英雄 | 场次 | 胜率 | {recent_label} | 与版本榜的关系")
         for row in rows[:pool_size]:
-            hero_id = row["hero_id"]
-            rank = board_index.get(hero_id)
-            if rank is None:
+            # 用 `hid` 而不是 `hero_id`：本函数**上面**已经有一个 `hero_id`
+            # （标量 int），这里再拿它接 `row["hero_id"]`（`Any`）会与前面的
+            # 推断打架（mypy `[assignment]`，2026-10-14）。
+            hid = row["hero_id"]
+            # `rank_pos` 而不是 `rank`：本函数上面已经有一个 `rank`（int），
+            # 这里接的是 `dict.get()`（`int | None`），同名会打架（mypy
+            # `[assignment]`，2026-10-14）。
+            rank_pos = board_index.get(hid)
+            if rank_pos is None:
                 relation = "不在版本榜内"
             else:
-                hit = meta_rows[rank - 1]
-                mark = "★" if rank <= board_size else ""
-                relation = f"{mark}版本榜第 {rank} 名（胜率 {hit['winrate'] * 100:.1f}%）"
-            hits = recent_counts.get(hero_id, 0)
+                hit = meta_rows[rank_pos - 1]
+                mark = "★" if rank_pos <= board_size else ""
+                relation = (
+                    f"{mark}版本榜第 {rank_pos} 名（胜率 {hit['winrate'] * 100:.1f}%）"
+                )
+            hits = recent_counts.get(hid, 0)
             fresh_text = f"{hits} 次" if hits else "未出现"
             lines.append(
-                f"{hname(heroes, hero_id)} | {row['games']} | {row['winrate']:.1f}% | "
+                f"{hname(heroes, hid)} | {row['games']} | {row['winrate']:.1f}% | "
                 f"{fresh_text} | {relation}"
             )
     else:
@@ -819,10 +923,14 @@ def build_hero_pick_prompt(
     if matches:
         lines.append("英雄 | 结果 | K/D/A | GPM | 分路 | 时间")
         for match in matches:
-            try:
-                lane_text = LANE_ROLE_ZH.get(int(match.get("lane_role")), "未知")
-            except (TypeError, ValueError):
+            raw_lane = match.get("lane_role")
+            if raw_lane is None:
                 lane_text = "未知"
+            else:
+                try:
+                    lane_text = LANE_ROLE_ZH.get(int(raw_lane), "未知")
+                except (TypeError, ValueError):
+                    lane_text = "未知"
             lines.append(
                 f"{hname(heroes, match.get('hero_id'))} | "
                 f"该玩家{result_text(match)} | "
@@ -843,7 +951,7 @@ def build_hero_pick_prompt(
             + f" · 胜率 {rate}"
         )
         gpm_values = [
-            int(match.get("gold_per_min"))
+            int(match["gold_per_min"])
             for match in matches
             if match.get("gold_per_min")
         ]
@@ -872,7 +980,7 @@ def build_single_match_analysis_prompt(
     """构造「单场比赛深度复盘」的提示词。
 
     整体分成四段，顺序不能调换：**数据块** → **比赛质量客观指标** →
-    **口径说明**（:data:`DATA_CAVEATS` ＋ 模式提醒）→ **输出要求**。
+    **口径说明**（:func:`data_caveats` ＋ 模式提醒）→ **输出要求**。
     口径说明必须夹在数据与要求之间：它是数据的注解，放到最后会被模型当成
     收尾的客套话略过。
 
@@ -923,7 +1031,7 @@ def build_single_match_analysis_prompt(
     # 口径说明必须单独成段、且排在输出要求之前：它是数据的一部分。
     # 放在最后会被模型的「先看结构再填内容」习惯吃掉。
     lines.append("")
-    lines.append(DATA_CAVEATS)
+    lines.append(data_caveats())
     caveat = mode_caveat(match)
     if caveat:
         lines.append(caveat)
@@ -935,7 +1043,7 @@ def build_single_match_analysis_prompt(
 
     lines.append("")
     lines.append("=== 输出要求 ===")
-    lines.append(MATCH_REPORT_FORMAT)
+    lines.append(match_report_format())
     return "\n".join(lines)
 
 
@@ -1239,7 +1347,7 @@ def normalize_base_url(raw: str, provider_hint: str = "") -> str:
             return PROVIDER_PRESETS[key]
 
     if not value:
-        key = PRESET_ALIASES.get((provider_hint or "").strip().lower())
+        key = PRESET_ALIASES.get((provider_hint or "").strip().lower()) or ""
         return PROVIDER_PRESETS.get(key, PROVIDER_PRESETS["openai"])
 
     value = value.rstrip("/")

@@ -1,0 +1,40 @@
+# ============================================================
+# ruff 配置 —— 静态检查（pycodestyle 子集 + Pyflakes + isort）
+# ============================================================
+#
+# 为什么用独立的 `ruff.toml` 而**不是** `pyproject.toml`：
+#   AstrBot 对带 `requirements.txt` 的插件会执行 pip install，而
+#   `pyproject.toml` 会被当成「这是一个可安装的 Python 包」的信号，
+#   凭空引入构建元数据语义。本文件只是工具配置，不该带这层含义。
+#
+# 跑法（在插件目录内）：
+#   ruff check .
+#   ruff check . --fix        # 仅自动修（主要是导入排序 I001）
+#
+# 历史上本项目从未跑过 linter，首次接入时把规则集刻意收窄到
+# 「一个字符都不改也能过」的最小面：
+#   E4 / E7 —— pycodestyle 的导入与语句级错误（重复导入、多重语句…）
+#   E9      —— 运行时错误类（语法层面就读不下去的东西）
+#   F       —— Pyflakes：未定义名、未使用导入 / 变量、f-string 无占位符…
+#   I       —— isort：导入分组与排序
+# 这三组是 ruff 默认集（E4,E7,E9,F），`I` 是本次额外加的（当时 36 处，已全数修完）。
+#
+# ⚠️ **刻意不启用 E501（行宽）**：本仓库历史代码不限制行宽，
+#    实测最长行 408 字符（dota_analyzer.py:143，一处内嵌的长数据表）。
+#    在没有做格式化改造之前开启 E501 只会淹没真问题。
+#    下面的 line-length 只是为将来可能开启的 E5 系 / ruff format 预置口径，
+#    当前不影响任何检查结果。
+
+target-version = "py310"
+line-length = 100
+
+# 缓存目录与被 gitignore 的运行时数据目录都不扫
+extend-exclude = [
+    "__pycache__",
+    ".mypy_cache",
+    ".ruff_cache",
+    "data",
+]
+
+[lint]
+select = ["E4", "E7", "E9", "F", "I"]

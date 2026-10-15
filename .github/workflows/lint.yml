@@ -1,0 +1,95 @@
+name: 代码检查
+
+# ============================================================
+# ruff（静态检查）+ mypy（类型检查）
+# ============================================================
+#
+# ⚠️ 为什么**没有** `on: push`：
+#   本仓库的 GitHub 侧是只读镜像，由 `sync-from-gitee.yml` 每 10 分钟
+#   往 origin force push。而 GitHub 有一条硬规定：
+#       「用仓库的 GITHUB_TOKEN 执行的任务，其触发的事件不会再创建新的 workflow run」
+#   （防止 workflow 互相递归触发）。sync 用的正是 checkout 自带的
+#   GITHUB_TOKEN，所以它推上来的提交**不会**触发 push 事件 —— 写上 `on: push`
+#   只会给人「一提交就会检查」的错觉，实际上一次都不会跑。
+#
+#   因此自动检查靠 `schedule`：cron 到点就拉当前代码检查一遍，
+#   不依赖任何事件。时刻刻意错开 sync 的 `*/10`（0/10/20/30/40/50），
+#   取 7 / 37，留 7 分钟给同步跑完，等价于「Gitee 有改动后最多 ~37 分钟被检查」。
+#   `pull_request` 保留：PR 由人的操作触发，不走 GITHUB_TOKEN，能正常跑。
+#   手动调试直接 `workflow_dispatch`，或在 Actions 页面点 "Run workflow"。
+#
+# ⚠️ 检查范围：只有插件源码。测试套件在工作区（仓库的**上一级**）的 `tests/` 下，
+#   **不在本仓库里**，因此不纳入 CI —— 它们是带实机依赖的取证 / 验收脚本
+#   （要走 OpenDota / STRATZ / LLM 真接口），不是无副作用可复跑的单元测试。
+#   CI 在这里只当「语法 / 类型防回归闸门」。
+
+on:
+  pull_request:
+  schedule:
+    # 每 30 分钟一次，错开 sync-from-gitee 的 */10
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lint
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: ruff + mypy
+    runs-on: ubuntu-latest
+    steps:
+      # mypy 需要「父目录 + 包名」的调用姿势才能解析包内相对导入
+      # （详见 astrbot_plugin_dota2/mypy.ini 顶部的说明），
+      # 所以这里刻意 checkout 到一个子路径，让工作目录停在上层。
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          path: pkg/astrbot_plugin_dota2
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装检查工具
+        # 版本与本地开发环境一致（本机实测：ruff 0.17.0 / mypy 2.4.0）。
+        # 刻意钉死小版本：这两个工具的规则集与判定会随版本漂移，
+        # 一边绿一边红会让人怀疑代码而不是怀疑工具。
+        # 升级时请同步升级本地环境，并重跑一次全量检查确认结论一致。
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "ruff==0.17.0" "mypy==2.4.0"
+          python -m pip install -r pkg/astrbot_plugin_dota2/requirements.txt
+
+      - name: ruff 静态检查
+        working-directory: pkg/astrbot_plugin_dota2
+        run: ruff check . --output-format=github
+
+      - name: mypy 类型检查
+        # 必须是「cwd 在父目录 + 把插件目录当包名传」，在插件目录内跑
+        # 会直接报 `No parent module -- cannot perform relative import`。
+        working-directory: pkg
+        run: |
+          python -m mypy \
+            --config-file astrbot_plugin_dota2/mypy.ini \
+            --explicit-package-bases \
+            astrbot_plugin_dota2
+
+      - name: 汇总结果
+        if: always()
+        run: |
+          {
+            echo "### 代码检查完成"
+            echo
+            echo "- 分支：${{ github.ref_name }}"
+            echo "- 触发方式：${{ github.event_name }}"
+            echo "- ruff：E4 / E7 / E9 / F / I（配置见 \`astrbot_plugin_dota2/ruff.toml\`）"
+            echo "- mypy：conf 见 \`astrbot_plugin_dota2/mypy.ini\`"
+            echo
+            echo "> 注：自动检查由 \`schedule\` 驱动，Gitee 侧的改动同步到 GitHub 后"
+            echo "> 最多约 37 分钟被检查一次（原因见 workflow 文件顶部注释）。"
+          } >> "$GITHUB_STEP_SUMMARY"

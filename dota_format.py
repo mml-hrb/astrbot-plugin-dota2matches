@@ -14,7 +14,12 @@ from typing import Any
 # 常量映射
 # ----------------------------------------------------------------------
 
-GAME_MODES: dict[int, str] = {
+#: 游戏模式对照表。**键类型写成 ``Any``** 而不是 ``int``：查表用的是数据源给的
+#: 原始 JSON 值，它可能是字符串、也可能整个字段不存在。``dict[int, str]`` 会让
+#: ``mypy`` 拒绝 `GAME_MODES.get(match.get("game_mode"))`（``.get()`` 的结果是
+#: ``Any | None``），而**不能**用 `or 0` 绕过去 —— 0 在本表里是合法键
+#: （"Unknown"），那样会把「字段缺失」悄悄说成「未知模式」。值仍然是有类型的 str。
+GAME_MODES: dict[Any, str] = {
     0: "Unknown",
     1: "All Pick",
     2: "Captains Mode",
@@ -42,7 +47,8 @@ GAME_MODES: dict[int, str] = {
     24: "Mutation",
 }
 
-LOBBY_TYPES: dict[int, str] = {
+#: 大厅类型对照表（键放宽为 ``Any`` 的理由同 :data:`GAME_MODES`）。
+LOBBY_TYPES: dict[Any, str] = {
     -1: "Invalid",
     0: "Normal",
     1: "Practice",
@@ -80,6 +86,26 @@ POSITION_TEXT: dict[str, str] = {
     "POSITION_4": "4号位（游走/打架辅助）",
     "POSITION_5": "5号位（保人辅助）",
 }
+
+# ----------------------------------------------------------------------
+# 功能开关
+# ----------------------------------------------------------------------
+
+#: 「同英雄分位」（OpenDota ``benchmarks``）总开关 —— **当前为关闭状态**。
+#:
+#: 关闭原因（用户决定，2026-10-14）：这个数据对生成报告的帮助不大，且它在
+#: **默认链路上本来就永远拿不到** —— 默认主源是 STRATZ，而 STRATZ 的
+#: ``_normalize_player`` 是显式白名单，会把 ``benchmarks`` 丢掉
+#: （``dota_stratz.get_benchmarks`` 也是空实现）。只有降级到 OpenDota 路径时
+#: 该字段才存在，于是**同一个报告里的两套文案经常对不上**：渲染层静默消失、
+#: 提示词层却照旧承诺有这个参照系，模型只好自己写一句「同英雄分位数据未提供，
+#: 此处以其…为参照系」来交代 —— 正是写作纪律明令封杀的那类填充。
+#:
+#: 关闭后**不改任何一处原逻辑**（常量表 / 两个渲染函数 / 十人概览块 / 焦点玩家块 /
+#: 口径说明第 1·2 条 / 模式提醒 / 全局提示词全部原样保留），只让它们**不下发**：
+#: 渲染侧返回空串、提示词侧跳过对应段落。想恢复时把这里改回 ``True`` 即可，
+#: 不需要重新接线。
+BENCHMARK_ENABLED: bool = False
 
 #: OpenDota ``benchmarks`` 的键 → ``(中文名, 是否越低越好)``。
 #:
@@ -306,8 +332,14 @@ def fmt_k(value: Any) -> str:
     return f"{num:.0f}"
 
 
-def hname(heroes: dict[int, dict], hero_id: Any) -> str:
-    """hero_id → 英雄名。"""
+def hname(heroes: dict[int, dict] | None, hero_id: Any) -> str:
+    """hero_id → 英雄名。
+
+    形参接受 ``None``：调用方手里未必有英雄表（数据源没给、或者工具在
+    「先渲染后取数」的路径上），而函数体本来就用 ``heroes.get(...) if heroes
+    else None`` 兜住了。``mypy`` 在 ``format_hero_pool(heroes=None)`` 那条路上
+    抓到了这个不一致（2026-10-14 第三批）—— **签名把「可空」说漏了**。
+    """
     try:
         hid = int(hero_id)
     except (TypeError, ValueError):
@@ -348,10 +380,10 @@ class ItemIndex:
             if not isinstance(value, dict):
                 continue
             self._by_key[str(key)] = value
-            try:
-                self._by_id[int(value.get("id"))] = value
-            except (TypeError, ValueError):
+            item_id = _as_int(value.get("id"))
+            if item_id is None:
                 continue
+            self._by_id[item_id] = value
 
     def get(self, value: Any) -> dict | None:
         """按 key 或数字 ID 查询道具信息。"""
@@ -444,9 +476,8 @@ def match_result(match: dict) -> bool | None:
     if isinstance(is_rad, bool):
         return radiant_win == is_rad
 
-    try:
-        slot = int(match.get("player_slot"))
-    except (TypeError, ValueError):
+    slot = _as_int(match.get("player_slot"))
+    if slot is None:
         return None
     return radiant_win == (slot < 128)
 
@@ -752,7 +783,7 @@ def summarize_matches(matches: list[dict], economy_samples: int | None = None) -
     result["hero_decided"] = hero_decided
 
     # 组队情况（是否单排）
-    party = Counter()
+    party: Counter[int] = Counter()
     for match in valid:
         size = match.get("party_size")
         if size is None:
@@ -1318,7 +1349,7 @@ def summarize_wards(player: dict, heroes: dict[int, dict]) -> str:
     ``obs_left_log`` / ``sen_left_log`` 里 ``attackername`` 是「是谁让它消失的」，
     自己把自己插的眼换掉（补位）也会记进去，因此这里只把「敌方英雄清除」算作被反。
     """
-    hero_info = heroes.get(player.get("hero_id")) if isinstance(heroes, dict) else None
+    hero_info = _hero_info(heroes, player.get("hero_id"))
     own_npc = (hero_info or {}).get("name")
 
     def _times(rows: Any) -> list[int]:
@@ -1439,6 +1470,10 @@ def benchmark_text(player: dict, *, only: tuple[str, ...] | None = None) -> str:
     Args:
         only: 只渲染这几个键（十人概览用）；``None`` = 全部。
     """
+    if not BENCHMARK_ENABLED:
+        # 开关关闭：如实返回空，由调用方的 ``if bench:`` 跳过整块
+        # （见 :data:`BENCHMARK_ENABLED` 的关闭原因）。
+        return ""
     data = player.get("benchmarks")
     if not isinstance(data, dict) or not data:
         return ""
@@ -1459,6 +1494,9 @@ def benchmark_text(player: dict, *, only: tuple[str, ...] | None = None) -> str:
 
 def benchmark_digest(player: dict) -> str:
     """十人概览用的分位摘要（见 :data:`BENCHMARK_DIGEST`）。"""
+    if not BENCHMARK_ENABLED:
+        # 开关关闭：如实返回空，由调用方的 ``if digest:`` 跳过整块。
+        return ""
     parts: list[str] = []
     data = player.get("benchmarks")
     if not isinstance(data, dict) or not data:
@@ -1491,7 +1529,7 @@ def healing_breakdown(player: dict, heroes: dict[int, dict], limit: int = 5) -> 
     data = player.get("healing")
     if not isinstance(data, dict) or not data:
         return ""
-    hero_info = heroes.get(player.get("hero_id")) if isinstance(heroes, dict) else None
+    hero_info = _hero_info(heroes, player.get("hero_id"))
     own_npc = (hero_info or {}).get("name")
     entries: list[tuple[float, str, str]] = []
     for npc, value in data.items():
@@ -1511,8 +1549,11 @@ def healing_breakdown(player: dict, heroes: dict[int, dict], limit: int = 5) -> 
         ``healing`` 的非自我部分之和恰好等于 ``hero_healing``，因此
         「总和 − hero_healing」就是自我治疗量，再回到明细里找是哪一条。
         """
+        raw_healing = player.get("hero_healing")
+        if raw_healing is None:
+            return None
         try:
-            expected = float(player.get("hero_healing"))
+            expected = float(raw_healing)
         except (TypeError, ValueError):
             return None
         amount = sum(num for num, _, _ in entries) - expected
@@ -1690,11 +1731,18 @@ def chat_text(match: dict, heroes: dict[int, dict], limit: int = 10) -> list[str
     chat = match.get("chat")
     if not isinstance(chat, list) or not chat:
         return []
-    by_slot = {
-        int(p.get("player_slot")): p
-        for p in (match.get("players") or [])
-        if isinstance(p, dict) and p.get("player_slot") is not None
-    }
+    # ⚠️ 原先这里是个字典推导，用 `int(p.get("player_slot"))` 直接当键 ——
+    # 那个 `int()` **没有** try/except 兜着，slot 一旦是非数字字符串就会
+    # 抛 ValueError 把整条渲染打断（2026-10-14 顺手改成 `_as_int` 时发现）。
+    # 现在按项目口径处理：转不了的 slot 直接跳过这条记录。
+    by_slot: dict[int, dict] = {}
+    for p in match.get("players") or []:
+        if not isinstance(p, dict):
+            continue
+        slot = _as_int(p.get("player_slot"))
+        if slot is None:
+            continue
+        by_slot[slot] = p
     rows: list[str] = []
     for entry in chat:
         if not isinstance(entry, dict):
@@ -2382,6 +2430,26 @@ def _as_int(value: Any) -> int | None:
         return None
 
 
+def _hero_info(heroes: Any, raw_hero_id: Any) -> dict | None:
+    """按一个**可能不是数字**的 ``hero_id`` 去英雄表里取一条记录。
+
+    抽它的原因有三个，缺一个都不够（2026-10-14 第三批）：
+
+    1. 同一段「先判 heroes 是不是 dict → 再 ``.get(hero_id)``」在本文件里有
+       3 处（战绩明细、治疗明细、位置分布统计）；
+    2. ``heroes.get(x)`` 里的 ``x`` 直接来自 API 的 JSON，静态类型是
+       ``Any | None``，``mypy`` 会拒绝把它当 ``dict[int, dict]`` 的键
+       （``[arg-type]``）；而**不能**用 ``heroes.get(x or 0)`` 绕过 ——
+       ``None`` 与 ``0`` 在本项目里是两件事（0 是合法 hero_id，None 是「没这个字段」）；
+    3. 上面那条纪律在 :func:`_as_int` 里已经写死了（``None``/``bool`` 一律返回
+       ``None``），这里复用它，避免在三个调用点上各写一遍判断。
+    """
+    if not isinstance(heroes, dict):
+        return None
+    hero_id = _as_int(raw_hero_id)
+    return heroes.get(hero_id) if hero_id is not None else None
+
+
 def _pct_or_dash(value: Any, digits: int = 1) -> str:
     """把 0~1 的比例渲染成百分比；缺失时返回 ``-``。"""
     if value is None or isinstance(value, bool):
@@ -2951,9 +3019,8 @@ def hero_meta_rows(
     for raw in hero_stats or []:
         if not isinstance(raw, dict):
             continue
-        try:
-            hero_id = int(raw.get("id"))
-        except (TypeError, ValueError):
+        hero_id = _as_int(raw.get("id"))
+        if hero_id is None:
             continue
         roles = [str(role) for role in (raw.get("roles") or [])]
         if not _in_position(roles, position):
@@ -3062,8 +3129,10 @@ def _patch_age_days(patch_date: str) -> int | None:
     text = str(patch_date or "").strip()
     if not text:
         return None
-    import datetime
-
+    # 这里原先还有一个**函数内的 `import datetime`**，把文件顶部那个同名的
+    # 模块级 import 遮住了 —— 于是顶部那行「看起来没人用」（F401）、这一行
+    # 「重定义了一个没被用过的名字」（F811）。两处都由 `ruff` 在引入当天抓出
+    # （2026-10-14 第三批）。删掉这个局部 import，顶部的就变成正常使用。
     for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d"):
         try:
             when = datetime.datetime.strptime(text[: len(fmt) + 6], fmt).replace(
@@ -3238,9 +3307,8 @@ def recent_hero_usage(
     latest: dict[int, int] = {}
     now = time.time()
     for match in matches or []:
-        try:
-            hero_id = int(match.get("hero_id"))
-        except (TypeError, ValueError):
+        hero_id = _as_int(match.get("hero_id"))
+        if hero_id is None:
             continue
         start = int(match.get("start_time") or 0)
         if days > 0 and start and (now - start) > days * 86400:
@@ -3265,7 +3333,7 @@ def _player_role_hints(
     """
     counter: dict[str, int] = {}
     for row in (pool or [])[:limit]:
-        info = (heroes or {}).get(row.get("hero_id")) or {}
+        info = _hero_info(heroes, row.get("hero_id")) or {}
         for role in info.get("roles") or []:
             key = str(role)
             counter[key] = counter.get(key, 0) + 1
@@ -3504,7 +3572,7 @@ def match_quality_block(match: dict) -> str:
     buildings = building_states_text(match)
     if buildings:
         rows.append("建筑存活: " + buildings)
-    sides = {"天辉": [], "夜魇": []}
+    sides: dict[str, list[dict]] = {"天辉": [], "夜魇": []}
     for player in players:
         if not isinstance(player, dict):
             continue

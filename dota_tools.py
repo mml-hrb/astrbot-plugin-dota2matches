@@ -38,6 +38,7 @@ from typing import Any, Awaitable, Callable
 from astrbot.api import logger
 
 try:  # 插件目录被作为包加载时的相对导入
+    from . import dota_chat, dota_esports, dota_hero_playstyle, dota_pool
     from .dota_format import (
         format_hero_meta_board,
         format_match_list,
@@ -49,12 +50,15 @@ try:  # 插件目录被作为包加载时的相对导入
         pick_heroes_for_player,
         summarize_matches,
     )
-    from . import dota_chat, dota_esports, dota_hero_playstyle, dota_pool
 except ImportError:  # 兜底：以普通模块方式加载时，把插件目录加入 sys.path
     import os
     import sys
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import dota_chat  # type: ignore[no-redef]
+    import dota_esports  # type: ignore[no-redef]
+    import dota_hero_playstyle  # type: ignore[no-redef]
+    import dota_pool  # type: ignore[no-redef]
     from dota_format import (  # type: ignore[no-redef]
         format_hero_meta_board,
         format_match_list,
@@ -66,10 +70,6 @@ except ImportError:  # 兜底：以普通模块方式加载时，把插件目录
         pick_heroes_for_player,
         summarize_matches,
     )
-    import dota_chat  # type: ignore[no-redef]
-    import dota_esports  # type: ignore[no-redef]
-    import dota_hero_playstyle  # type: ignore[no-redef]
-    import dota_pool  # type: ignore[no-redef]
 
 #: 单个工具返回给模型的文本上限。超出的部分截掉并标注 —— 只留最前面
 #: 最有信息量的部分，比塞满上下文更有用。
@@ -212,6 +212,28 @@ class ToolContext:
     #: 的计划文本）要和用户逐字对齐，模型顺手改一个字，用户点头的东西就和
     #: 实际建的不是一回事了。
     pending_prompts: list[str] = field(default_factory=list)
+
+    def note_failure(self, name: str) -> None:
+        """显式登记一次工具失败 —— **给内部降级路径用**。
+
+        为什么要单独有它：:func:`run_tool` 只在工具**抛出**异常时累加失败计数，
+        而有一批工具把异常吞成了**正常返回值**（``_safe_data`` / ``_esports_guard``
+        把异常转成 ``(None, 说明)``，``_compare_one`` 内部消化，``_tool_compare_players``
+        也不抛）。于是数据源整体挂掉时，``compare_players`` 每被调一次就重新并行
+        取 N 个人（各默认 180 秒）并以说明收场 —— **配额照烧、短路永不生效**，
+        而同一份故障下 ``query_matches`` 却能正常短路：同一个问题两种相反行为。
+
+        实测源头（2026-09-18）：OpenDota 大面积 521/500，模型逐个玩家调
+        ``query_matches``，6 个人各超时 30 秒，合计沉默 194 秒、烧光调用预算。
+        ``MAX_TOOL_FAILURES`` 正是为这类故障设计的，却被降级路径绕过了。
+
+        降级路径拿到说明后**必须**调一次本方法；成功时不要调（成功由
+        :func:`run_tool` 的清零逻辑负责，且降级路径本来就没有「成功」可谈）。
+        """
+        key = str(name or "").strip()
+        if not key:
+            return
+        self.failures[key] = self.failures.get(key, 0) + 1
 
 
 # ======================================================================
@@ -715,6 +737,36 @@ def _resolve_tool_window(
     return dota_chat.recent_days_window(days, now) if days else None
 
 
+def _time_args(
+    args: dict, ctx: ToolContext
+) -> tuple[int, "dota_chat.TimeWindow | None"]:
+    """把「场次」与「时间窗口」一起解析出来，返回 ``(count, window)``。
+
+    两者**必须一起算**，所以放在同一个函数里 —— 这正是原先两处逐字重复的那段
+    逻辑（2026-10-14 审查报告 4.3「取数准备重复」）：
+
+    * ``count`` = 用户/模型要的场次（``count`` 参数，默认 10，上限
+      :data:`MAX_MATCHES_PER_CALL`）；
+    * ``window`` = 时间范围（``day_offset`` 优先于 ``days``，见
+      :func:`_resolve_tool_window`）；
+    * **只要给了时间范围，就把 ``count`` 放宽**到
+      :data:`dota_chat.WINDOW_FETCH_LIMIT`：默认 10 场常常只覆盖一两天，
+      用户说「这三天」时手上很可能压根没取全，于是答出「他就打了 2 场」这种
+      **假否定**。取多了不吃亏（多的场次会被窗口过滤掉）。
+
+    上一句就是为什么不能只抽个「读 count」的 helper 了事 —— 漏掉放宽那一步，
+    功能会**静默退化**成原来那个假否定，而且测试不一定抓得到（两处都漏才等价，
+    只改一处则是「有时对、有时错」）。
+    """
+    count = _clamp_int(
+        args.get("count"), default=10, low=1, high=MAX_MATCHES_PER_CALL
+    )
+    window = _resolve_tool_window(args, ctx.now or None)
+    if window is not None:
+        count = max(count, min(dota_chat.WINDOW_FETCH_LIMIT, MAX_MATCHES_PER_CALL))
+    return count, window
+
+
 def _window_blank_note(
     name: str,
     window: "dota_chat.TimeWindow",
@@ -850,14 +902,10 @@ async def _tool_list_players(args: dict, ctx: ToolContext) -> str:
 
 async def _tool_query_matches(args: dict, ctx: ToolContext) -> str:
     account_id, name = await _person(args, ctx)
-    count = _clamp_int(args.get("count"), default=10, low=1, high=MAX_MATCHES_PER_CALL)
-    # day_offset（「昨天」这类**单日**）优先，其次 days（「最近 N 天」，含今天）；
-    # 都没给 = 不限时间（按最近 N 场统计）。
-    window = _resolve_tool_window(args, ctx.now or None)
-    if window is not None:
-        # 有时间范围就放宽取数：默认 10 场常常只覆盖一两天，
-        # 说「这三天」时手上可能根本没取全，会得出「他只打了 2 场」这种假否定。
-        count = max(count, min(dota_chat.WINDOW_FETCH_LIMIT, MAX_MATCHES_PER_CALL))
+    # 场次与时间窗口一起解析：``day_offset``（「昨天」这类**单日**）优先，其次
+    # ``days``（「最近 N 天」，含今天）；都没给 = 不限时间（按最近 N 场统计）。
+    # 有窗口时 :func:`_time_args` 会自动放宽取数场次（否则会答出假否定）。
+    count, window = _time_args(args, ctx)
     matches = await _guarded(ctx.fetch_matches(account_id, count), ctx)
     if not matches:
         return (
@@ -953,13 +1001,8 @@ async def _tool_compare_players(args: dict, ctx: ToolContext) -> str:
     ``query_matches`` 会串行取六次数（用户干等好几分钟），且各次的时间范围
     一旦不一致，比出来的高下就站不住。这里一次取完，口径天然一致。
     """
-    count = _clamp_int(args.get("count"), default=10, low=1, high=MAX_MATCHES_PER_CALL)
-    # 同 query_matches：day_offset（「昨天」）优先，其次 days（「最近 N 天」）。
-    window = _resolve_tool_window(args, ctx.now or None)
-    if window is not None:
-        # 默认 10 场往往只覆盖一两天，说「这三天」时
-        # 手上可能压根没取全，会得出「他就打了 2 场」这种假否定。
-        count = max(count, min(dota_chat.WINDOW_FETCH_LIMIT, MAX_MATCHES_PER_CALL))
+    # 同 query_matches：场次与时间窗口一起解析（见 :func:`_time_args`）。
+    count, window = _time_args(args, ctx)
 
     names = _split_names(args.get("players"))
     problems: list[str] = []
@@ -1011,12 +1054,40 @@ async def _tool_compare_players(args: dict, ctx: ToolContext) -> str:
             + "\n可以先让用户说清楚要比谁的昵称。"
         )
 
-    results = await asyncio.gather(
+    # ⚠️ `return_exceptions=True` 不能省（P1-6，2026-10-14 审查）：
+    # `_compare_one` 的 docstring 承诺「单人失败不影响其他人」，但它只把
+    # `fetch_matches` 包进 try —— 其后的行过滤与 `scope_matches` 并无保护。
+    # 一旦那里抛出非预期异常，默认的 gather 会**取消整批**，run_tool 只回一句
+    # 「[compare_players 执行失败]」，六个人（含已成功取到的）全部丢弃。
+    # 传 True 之后异常会作为返回值出现，下面统一转成带 error 的快照。
+    raw_results = await asyncio.gather(
         *(
             _compare_one(ctx, account_id, name, relation, count, window)
             for account_id, name, relation in targets
-        )
+        ),
+        return_exceptions=True,
     )
+    results: list[tuple["dota_chat.PlayerSnapshot", int]] = []
+    for target, item in zip(targets, raw_results):
+        if isinstance(item, BaseException):
+            account_id, name, relation = target
+            logger.warning(f"[dota2] compare_players 处理 {name}({account_id}) 失败: {item}")
+            snap = dota_chat.PlayerSnapshot(
+                account_id=account_id, name=name, relation=relation
+            )
+            snap.error = f"{type(item).__name__}: {str(item)[:80]}"
+            results.append((snap, 0))
+        elif isinstance(item, tuple) and len(item) == 2:
+            results.append(item)
+        else:
+            # 形状不对也算这一位失败，同样不拖垮整批。
+            account_id, name, relation = target
+            logger.warning(f"[dota2] compare_players 处理 {name} 返回形状异常: {item!r}")
+            snap = dota_chat.PlayerSnapshot(
+                account_id=account_id, name=name, relation=relation
+            )
+            snap.error = "内部返回形状异常"
+            results.append((snap, 0))
     snapshots = [item[0] for item in results]
     excluded = sum(item[1] for item in results)
     heroes = await _guarded(ctx.heroes(), ctx)
@@ -1026,6 +1097,16 @@ async def _tool_compare_players(args: dict, ctx: ToolContext) -> str:
     failed = [s for s in snapshots if s.error]
     empty = [s for s in snapshots if not s.error and not s.games]
     if not with_data:
+        # ⚠️ **一个人都没取到 = 这个工具这次失败了**，必须显式登记。
+        # 这一条是 P0 级修复（2026-10-14 审查）：本函数把取数异常吞成快照的
+        # `error` 正常返回，`run_tool` 看不到抛出、失败计数永不累加 ——
+        # 于是数据源整体挂掉时，模型每轮重调 `compare_players` 都会**重新并行
+        # 取 N 个人**（各默认 180 秒），配额照烧、短路永不生效；
+        # 而同一份故障下 `query_matches` 却能正常短路，两种相反行为。
+        # 注意只在**全员失败**时登记：有人取到（哪怕别人失败）说明工具本身没坏，
+        # 那是「某个账号没数据」，不是「工具坏了」。
+        if failed and len(failed) == len(snapshots):
+            ctx.note_failure("compare_players")
         period = window.describe() if window is not None else "最近一段时间"
         detail = "；".join(
             f"{s.name}（{s.error}）" if s.error else f"{s.name}（{period}内 0 场）"
@@ -1053,9 +1134,12 @@ async def _tool_compare_players(args: dict, ctx: ToolContext) -> str:
 
     for snap in snapshots:
         lines.append(snap.summary_line(now))
-        detail = snap.detail_lines(heroes, now)
-        if detail:
-            lines.extend(detail)
+        # 变量名带上 `_lines`：本函数上面已经有一个 `detail`（是**字符串**，
+        # 拼「哪些人没有数据」那句），复用同一个名字会被静态检查器判成
+        # 「把 list 赋给 str」（2026-10-14 引入 mypy 时抓到）。
+        detail_lines = snap.detail_lines(heroes, now)
+        if detail_lines:
+            lines.extend(detail_lines)
     lines.append("（上面缩进的行是对应玩家的逐场明细）")
 
     comparison = dota_chat.format_comparison_block(snapshots)
@@ -1094,6 +1178,14 @@ async def _tool_compare_players(args: dict, ctx: ToolContext) -> str:
 async def _tool_query_hero_pool(args: dict, ctx: ToolContext) -> str:
     account_id, name = await _person(args, ctx)
     pool = await _pool_of(ctx, account_id)
+    if pool.failed:
+        # ⚠️ 「没取到」≠「没公开」（P1-2）：前者是这一次的取数故障（可重试），
+        # 后者是对账号下的结论。以前两者共用一句话，超时会被讲成
+        # 「该账号未公开比赛数据」—— 一个查不出来的指控。
+        return (
+            f"⚠️ 查询 {name} 的英雄池时数据源没有返回结果（{pool.error}）。\n"
+            "这是**这一次没取到**，不代表该账号没有公开数据 —— 可以稍后重试。"
+        )
     if not pool.has_data:
         return f"没有取到 {name} 的英雄池数据（可能该账号未公开比赛数据）。"
     heroes = await _guarded(ctx.heroes(), ctx)
@@ -1267,8 +1359,11 @@ async def _tool_query_hero_playstyle(args: dict, ctx: ToolContext) -> str:
     for row in stats_rows or []:
         if not isinstance(row, dict):
             continue
+        raw_row_id = row.get("id")
+        if raw_row_id is None:
+            continue
         try:
-            row_id = int(row.get("id"))
+            row_id = int(raw_row_id)
         except (TypeError, ValueError):
             continue
         if row_id == hero_id:
@@ -1314,7 +1409,9 @@ _ESPORTS_OFF = (
 )
 
 
-async def _esports_guard(coro: Awaitable[Any], ctx: ToolContext) -> tuple[Any, str]:
+async def _esports_guard(
+    coro: Awaitable[Any], ctx: ToolContext, *, tool: str = ""
+) -> tuple[Any, str]:
     """给赛事数据源调用套上超时与降级，返回 ``(结果, 说明)``。
 
     说明非空即「这块没取到」，文字直接可读、可以原样转述给用户。限流单独
@@ -1324,10 +1421,20 @@ async def _esports_guard(coro: Awaitable[Any], ctx: ToolContext) -> tuple[Any, s
     限流这条还多一层纪律（2026-10-13 加）：**不许给时间承诺**。避让时长是插件
     自己估的止损，站点那侧的解封要人工过校验，写「稍后再试」就是替我们许一个
     兑现不了的承诺（原来那句「请如实说明稍后再试」就是这个毛病）。
+
+    ``tool``：**对外工具名**，必传。降级路径不抛异常，:func:`run_tool` 看不到
+    失败，所以这里要替它登记（见 :meth:`ToolContext.note_failure`）——
+    没有名字就记不了账，数据源整体挂掉时赛事类工具会一直重试、短路永不生效。
+
+    ⚠️ 为什么不从协程对象反推名字（试过，不可靠）：实测调用方传进来的是
+    ``dota_esports.collect_tournament`` / ``collect_team_page`` / ``collect_transfers``,
+    即**赛事模块内的函数**，按函数名映射到工具名要维护一份易漂的对照表。
+    直接由调用方传名字最稳 —— 它本来就知道自己在实现哪个工具。
     """
     try:
         return await _guarded(coro, ctx, factor=2.0), ""
     except dota_esports.EsportsRateLimited as e:
+        ctx.note_failure(tool)
         # 注意**别把它括在括号里**：e 自己的文案里就可能带括号（HTTP 429 那种），
         # 套一层就变成嵌套括号。（`DEFAULT_UA` 上就栽过同一坑。）
         return None, (
@@ -1337,10 +1444,13 @@ async def _esports_guard(coro: Awaitable[Any], ctx: ToolContext) -> tuple[Any, s
             "也不要改用你记忆里的赛果作答。"
         )
     except dota_esports.EsportsError as e:
+        ctx.note_failure(tool)
         return None, f"赛事数据源暂时不可用：{e}。这块没取到，请如实说明。"
     except asyncio.TimeoutError:
+        ctx.note_failure(tool)
         return None, "赛事数据源响应超时，这块没取到。"
     except Exception as e:  # noqa: BLE001 —— 赛事源挂掉不该打断整轮问答
+        ctx.note_failure(tool)
         return None, f"赛事数据源读取失败（{type(e).__name__}），这块没取到。"
 
 
@@ -1351,6 +1461,16 @@ async def _safe_data(coro: Awaitable[Any], ctx: ToolContext) -> tuple[Any, str]:
     赌这一点：一旦这里抛出去，整轮问答只剩一句「执行失败」，连另一条
     数据源（赛事 wiki）已经拿到的内容也一起丢了。所以这里兜住并记一句
     说明，让另一条链路照常输出。
+
+    ⚠️ 这里**不登记失败计数**，理由是它认不出调用者：``_safe_data`` 被
+    ``query_matches`` / ``query_player_info`` / ``compare_players`` /
+    ``query_tournament`` 等多处复用，传进来的协程名五花八门
+    （``_fetch_matches`` / ``_compare_one`` / ``get_pro_matches`` …），
+    按函数名记账会记到一堆永远不会被 :func:`is_disabled` 查到的键上 ——
+    **记账记错比不记账更糟**（失败计数分散在假键里，真工具永远短路不了）。
+
+    所以「谁失败了」由**调用方自己**在拿到非空说明时登记 —— 见
+    :func:`_tool_compare_players`（全员失败分支）等处的 ``ctx.note_failure(...)``。
     """
     try:
         return await _guarded(coro, ctx), ""
@@ -1358,6 +1478,8 @@ async def _safe_data(coro: Awaitable[Any], ctx: ToolContext) -> tuple[Any, str]:
         return None, "数据源响应超时，这块没取到。"
     except Exception as e:  # noqa: BLE001
         return None, f"数据源读取失败（{type(e).__name__}），这块没取到。"
+
+
 
 
 async def _tool_query_tournament(args: dict, ctx: ToolContext) -> str:
@@ -1384,7 +1506,7 @@ async def _tool_query_tournament(args: dict, ctx: ToolContext) -> str:
     if ctx.esports is None:
         return _ESPORTS_OFF
     data, note = await _esports_guard(
-        dota_esports.collect_tournament(ctx.esports, query), ctx
+        dota_esports.collect_tournament(ctx.esports, query), ctx, tool="query_tournament"
     )
     data = data if isinstance(data, dict) else {}
     notes: list[str] = list(data.get("notes") or [])
@@ -1436,7 +1558,9 @@ async def _tool_query_esports_team(args: dict, ctx: ToolContext) -> str:
         rows = dota_esports.od_roster(players if isinstance(players, list) else [])
         matches, _ = await _safe_data(ctx.api.get_team_matches(team_id, limit=20), ctx)
         recent_rows = dota_esports.od_recent_rows(
-            matches if isinstance(matches, list) else [], int(team_id), limit=10
+            matches if isinstance(matches, list) else [],
+            int(team_id or 0),
+            limit=10,
         )
         return detail, rows, recent_rows
 
@@ -1470,7 +1594,9 @@ async def _tool_query_esports_team(args: dict, ctx: ToolContext) -> str:
     # ② Liquipedia：赛区 / 教练 / 阵容（社区数据，可能滞后）
     if ctx.esports is not None:
         data, note = await _esports_guard(
-            dota_esports.collect_team_page(ctx.esports, query), ctx
+            dota_esports.collect_team_page(ctx.esports, query),
+            ctx,
+            tool="query_esports_team",
         )
         if isinstance(data, dict) and data:
             page = str(data.get("page") or "")
@@ -1489,6 +1615,12 @@ async def _tool_query_esports_team(args: dict, ctx: ToolContext) -> str:
         return "\n".join(
             [f"没查到战队「{query}」的信息。"] + [f"> {n}" for n in notes]
         )
+
+    # ⚠️ 走到这里说明**至少有一半**有内容（P1-7，2026-10-14 审查）。
+    # 注意 ``_esports_guard`` 失败时会返回 ``(None, note)``，此时 ``info`` 是
+    # 空的，但 ``od``（评分 / 总胜负 / 近期战绩）已经取成功了 —— 上面那个
+    # 分支正是为了**不**把这份成果丢掉。渲染时把 note 一起带出去，
+    # 用户既能看到战绩，也知道赛区 / 阵容那块现在取不到。
 
     # 近期参加过哪些赛事（去重后给模型一个「在册赛事」的视角）
     leagues: list[str] = []
@@ -1516,7 +1648,7 @@ async def _tool_query_transfers(args: dict, ctx: ToolContext) -> str:
         return _ESPORTS_OFF
     player = str(args.get("player") or "").strip()
     rows, note = await _esports_guard(
-        dota_esports.collect_transfers(ctx.esports, limit=80), ctx
+        dota_esports.collect_transfers(ctx.esports, limit=80), ctx, tool="query_transfers"
     )
     rows = rows if isinstance(rows, list) else []
     if note and not rows:
@@ -1845,6 +1977,14 @@ async def run_tool(name: str, arguments: Any, ctx: ToolContext) -> str:
     args = parse_arguments(arguments)
     started = asyncio.get_running_loop().time()
     failed = False
+    #: 调用前的失败计数。工具内部可能通过 :meth:`ToolContext.note_failure`
+    #: **自我登记**失败（降级路径不抛异常，run_tool 看不到）—— 所以要靠
+    #: 「调用前后计数有没有涨」来判定，而不是只看有没有抛出。
+    #:
+    #: ⚠️ 这一点踩过一次：`_tool_compare_players` 在全员失败时登记了失败，
+    #: 但它**正常返回了文本**，于是走到下面的「成功即清零」把刚记的删掉 ——
+    #: 登记等于没做。判定必须基于**增量**，而不是返回值形态。
+    before = ctx.failures.get(name, 0)
     try:
         text = await tool(args, ctx)
     except asyncio.TimeoutError:
@@ -1854,10 +1994,18 @@ async def run_tool(name: str, arguments: Any, ctx: ToolContext) -> str:
         failed = True
         logger.warning(f"[dota2] 兜底工具 {name} 执行失败: {e}")
         text = f"[{name} 执行失败] {type(e).__name__}: {str(e)[:120]}"
+    # 工具自我登记的增量（降级路径不抛异常，只有这条路能看见它们的失败）。
+    noted = max(0, ctx.failures.get(name, 0) - before)
     if failed:
-        ctx.failures[name] = ctx.failures.get(name, 0) + 1
+        ctx.failures[name] = before + 1
+    elif noted:
+        # 工具明确说「我这次失败了」：保留它的登记，**不清零**。
+        # 注意不用 `before + noted`：工具若一次调用里登记多次（例如内部重试
+        # 各记一次），累加会虚高、过早触发短路。这里统一按**一次调用算一次失败**。
+        ctx.failures[name] = before + 1
     else:
-        # 成功即清零：失败计数说的是「连续」，一次成功就说明工具本身没坏
+        # 既没抛、也没自我登记 —— 这才是「成功」，清零。
+        # 失败计数说的是「连续」，一次成功就说明工具本身没坏。
         ctx.failures.pop(name, None)
     elapsed = asyncio.get_running_loop().time() - started
     out = _truncate(text, _output_limit(name))

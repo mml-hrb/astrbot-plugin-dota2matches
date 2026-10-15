@@ -13,6 +13,12 @@ OpenDota 对一场比赛的收录与解析是两件独立的事：
 判断是否已解析的正确口径见 :func:`parse_state`：``od_data`` 是**状态对象**，
 存在并不代表解析完成，必须看 ``has_parsed`` 或玩家级 ``gold_t``。
 
+⚠️ 不过 :func:`parse_state` 自己**不再判**这件事（P1-5，2026-10-14 审查）——
+它把结论整个委托给 :func:`dota_format.parsed_state`，只额外填出
+:class:`ParseState` 里的描述性字段。历史上这里另有一套判据，和报告正文
+用的那套**真的分叉了**（STRATZ 链路上「等待流程说未解析、报告标题说已解析」），
+详见该函数的 docstring。
+
 未解析时可以用 ``POST /request/{match_id}`` 主动催，之后只能轮询等待。
 本模块把「催 + 等」封装成 :func:`wait_for_parse`，调用方拿到
 :class:`ParseWaitResult` 再决定是继续分析还是放弃。
@@ -27,8 +33,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable, Awaitable
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable
 
 # ======================================================================
 # 默认节奏
@@ -152,15 +158,50 @@ def _as_bool(value: Any) -> bool:
     return value is True
 
 
+def _parsed_state_of(match: dict) -> tuple[bool, str]:
+    """转调 :func:`dota_format.parsed_state`（本插件唯一的解析判据）。
+
+    单独包一层是为了处理导入方式：``dota_format`` 是纯函数模块、不反向依赖
+    本模块，因此不存在循环导入；但本仓库同时存在「包内相对导入」与
+    「AstrBot 以模块方式加载时的绝对导入」两种运行方式，照抄
+    ``dota_api`` 里的同一套双分支写法。
+    """
+    try:
+        from .dota_format import parsed_state
+    except ImportError:  # 模块方式加载时的兜底
+        from dota_format import parsed_state  # type: ignore[no-redef]
+
+    return parsed_state(match)
+
+
 def parse_state(match: dict | None) -> ParseState:
     """读取一场比赛的解析状态。
 
-    判定顺序（任一满足即视为已解析）：
+    .. important::
 
-    1. ``od_data.has_parsed is True`` —— OpenDota 官方标记，最权威；
-    2. 任一玩家的 ``gold_t`` 非空 —— 只有解析后才会注入的分时间线数据。
+       **「是否已解析」这个结论不再由本函数自己判**（P1-5，2026-10-14 审查）。
 
-    其他字段只用于给用户描述「卡在哪一步」。
+       本函数只负责把 :class:`ParseState` 这个**描述性**快照填出来（供
+       :meth:`ParseState.describe` 给用户讲「卡在哪一步」，以及把
+       ``od_data`` 四字段透出来）；**唯一**的判据是
+       :func:`dota_format.parsed_state`，直接调它。
+
+       为什么必须这样（这不是洁癖）：两套判据历史上已经**真的分叉**了 ——
+
+       * ``dota_format`` 的 ``_match_has_timeseries`` 同时认
+         **STRATZ 的比赛级曲线**（``radiant_gold_adv`` / ``radiant_xp_adv``）
+         与 OpenDota 的玩家级 ``gold_t``；
+       * 本函数原先只看 ``gold_t``，外加一层「顶层 ``obj`` / ``chat`` /
+         ``teamfights`` 非空也算解析」。
+
+       于是默认的 **STRATZ 链路上**，等待流程（用旧判据）会认为「还没解析」
+       而一直催、一直等，最后超时降级出一份「未解析版」报告；而报告正文
+       的标题行（用新判据）却写着「已解析（32 分钟）」—— 同一份报告里
+       两条自相矛盾的信息。
+
+       反向的分叉同样存在：``obj`` / ``chat`` 这种**解析副产物**在
+       OpenDota 上偶尔先于 ``gold_t`` 出现，旧判据会把「曲线还没来」
+       说成「已解析」，等待流程提前收工，报告里没有逐分钟数据。
     """
     state = ParseState()
     if not isinstance(match, dict) or not match:
@@ -171,6 +212,8 @@ def parse_state(match: dict | None) -> ParseState:
         return state
     state.known = True
 
+    # ``od_data`` 四字段仍然透出来 —— describe() 要靠它们细分「卡在哪一步」，
+    # 这是本结构**描述性**的一半，与「判不判已解析」无关。
     od_data = match.get("od_data")
     if isinstance(od_data, dict):
         state.has_api = _as_bool(od_data.get("has_api"))
@@ -178,21 +221,9 @@ def parse_state(match: dict | None) -> ParseState:
         state.has_parsed = _as_bool(od_data.get("has_parsed"))
         state.has_archive = _as_bool(od_data.get("has_archive"))
 
-    if state.has_parsed:
-        state.parsed = True
-        return state
-
-    for player in match.get("players") or []:
-        if isinstance(player, dict) and player.get("gold_t"):
-            state.parsed = True
-            return state
-
-    # 顶层派生数据是解析的副产物，作为最后的补充判据
-    for key in ("obj", "chat", "teamfights"):
-        if match.get(key):
-            state.parsed = True
-            return state
-
+    # 判据单一来源：与本插件所有其他出口（标题行、提示词正文）逐字同口径。
+    parsed, _ = _parsed_state_of(match)
+    state.parsed = bool(parsed)
     return state
 
 
@@ -221,7 +252,11 @@ async def wait_for_parse(
     timeout: int = DEFAULT_WAIT_TIMEOUT,
     submit: bool = True,
     resubmit_every: int = RESUBMIT_EVERY,
-    on_check: Callable[[ParseState, int, int], Awaitable[None]] | None = None,
+    # 第三个参数是**秒数（float）**，不是整数 —— 原先这里标成 `int`，
+    # 而两个调用点都传 `time.time() - started` / `result.waited`（都是 float），
+    # 由 mypy 抓出（2026-10-14 第三批）。回调侧（`main._on_parse_check`）本来就
+    # 声明的是 `elapsed: float`，只是这里写漏了。
+    on_check: Callable[[ParseState, int, float], Awaitable[None]] | None = None,
     on_submit: Callable[[bool], Awaitable[None]] | None = None,
     cancel_event: asyncio.Event | None = None,
     first_match: dict | None = None,
