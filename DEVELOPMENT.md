@@ -2531,11 +2531,59 @@ workflow 里，就等于「文件在、断言在、没人跑」—— 正是本�
 **CI 在 `.github/workflows/lint.yml`**，跑的就是上面那两条命令（版本与本机一致，
 钉死 `ruff==0.17.0` / `mypy==2.4.0`：规则集会随版本漂移，一边绿一边红会让人去怀疑代码
 而不是怀疑工具）。它**没有 `on: push`**，原因是镜像语义：GitHub 侧是只读镜像，由
-`sync-from-gitee.yml` 用 checkout 自带的 `GITHUB_TOKEN` 每 10 分钟 force push；
-而 GitHub 明确规定「用 `GITHUB_TOKEN` 触发的事件不会再创建新的 workflow run」（防递归），
-所以 `on: push` 在这里**一次都不会跑**，写上只给人「一提交就检查」的错觉。自动检查
-改由 `schedule` 驱动（每 30 分钟，刻意错开 sync 的 `*/10`，留 7 分钟让同步跑完），
-另保留 `pull_request`（人的操作触发，不走 `GITHUB_TOKEN`）与手动 `workflow_dispatch`。
+`sync-from-gitee.yml` 每 10 分钟 force push；而 GitHub 明确规定「用 `GITHUB_TOKEN`
+触发的事件不会再创建新的 workflow run」（防递归），所以 `on: push` 在这里
+**一次都不会跑**，写上只给人「一提交就检查」的错觉。自动检查改由 `schedule` 驱动
+（每 30 分钟，刻意错开 sync 的 `*/10`，留 7 分钟让同步跑完），另保留
+`pull_request`（人的操作触发，不走 `GITHUB_TOKEN`）与手动 `workflow_dispatch`。
+
+### 镜像同步推不了 workflow 文件：必须配 `SYNC_TOKEN`（2026-10-15）
+
+**默认 `GITHUB_TOKEN` 永远无法写入 `.github/workflows/` 下的文件。** 这是 GitHub 的
+硬性安全边界，**`permissions:` 里写 `write-all` 也无效** —— `workflows` 这个 scope
+根本不在 `GITHUB_TOKEN` 可授予的范围内，只能由 PAT 提供。推送一旦包含 workflow 文件的
+新增或修改，服务端直接拒：
+
+```
+! [remote rejected] main -> main (refusing to allow a GitHub App to
+  create or update workflow `.github/workflows/xxx.yml` without
+  `workflows` permission)
+```
+
+**2026-10-15 就是这么挂的**：Gitee 侧提交 `1480ee2` 新增了
+`.github/workflows/lint.yml`，同步任务碰到它就连推不上去，`#60`/`#61` 连续失败，
+GitHub 卡在 `5a278eb`。此前 58 次成功运行**都不涉及 workflow 文件**，所以这个坑一直
+没暴露 —— 它不是偶发抖动，是「第一次改 workflow 才会踩」的确定性失败。
+
+**解法：建 PAT，存为仓库 Secret `SYNC_TOKEN`**
+
+1. GitHub → Settings → Developer settings → Personal access tokens →
+   **Fine-grained tokens** → Generate new token
+2. Repository access：只勾本仓库
+3. Permissions 至少给：
+   - **Workflows: Read and write** ← 关键，只在 fine-grained PAT 里能授予
+   - **Contents: Read and write**
+   - Metadata: Read-only（必选，自动带上）
+4. 仓库 Settings → Secrets and variables → Actions → New repository secret，
+   名字必须是 `SYNC_TOKEN`
+5. 之后同步任务自动改用 PAT，无需再改 workflow
+
+> 用 classic PAT 也行，勾 `workflow` + `repo` scope 即可。
+> fine-grained PAT **会过期**，到期后同步又会失败 —— 建议设长有效期并记好续期。
+
+**⚠️ 关键：PAT 必须交给 `actions/checkout` 的 `token:` 输入，不能只交给 push 步骤。**
+checkout 会把凭据写进本地 git config，之后所有 git 命令都用这一份；单独给 push 步骤
+传 token 是**无效**的（这是最常见的误解，社区里大量「我明明传了 PAT 还是被拒」都是这个原因）。
+workflow 里已写成 `token: ${{ secrets.SYNC_TOKEN || github.token }}` —— 没配 PAT 时
+退回默认 token，普通文件照常同步。
+
+未配 `SYNC_TOKEN` 时，同步任务在遇到 workflow 文件改动前会**主动报错并指出原因**
+（见 workflow 的「预检」步骤），不会再让人对着红色叉号猜。
+
+> 另一个选择是让镜像**不包含** workflow 文件（同步时排除 `.github/workflows/`）。
+> 这样不需要 PAT，但两边结构会不一致，GitHub 侧的 CI 配置将无法从主仓库同步 ——
+> 本仓库要的是完整镜像，所以选了 PAT 方案。
+
 
 ## 版本发布（打 tag 与推送）
 

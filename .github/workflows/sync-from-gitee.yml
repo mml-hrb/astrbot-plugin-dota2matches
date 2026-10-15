@@ -7,6 +7,28 @@ name: 从 Gitee 同步
 # 想往 GitHub 自己推，必须用 `origin`（**不要写 `github`**，
 # checkout 不会创建这个 remote，写了必然 "fatal: 'github' does not appear to be a git repository"）。
 # 往 Gitee 拉才需要自己 `git remote add gitee`。
+#
+# ---------------------------------------------------------------
+# ⚠️ 核心限制：默认 GITHUB_TOKEN **永远**无法写入 .github/workflows/
+# ---------------------------------------------------------------
+# GitHub 的硬性安全边界（不是配置问题）：用仓库自带 GITHUB_TOKEN 执行的任务，
+# 其推送一旦包含 .github/workflows/ 下的新增或修改，会被服务端直接拒绝：
+#
+#   ! [remote rejected] main -> main (refusing to allow a GitHub App to
+#     create or update workflow `.github/workflows/xxx.yml` without
+#     `workflows` permission)
+#
+# permissions: 里写 write-all 也**无效** —— `workflows` 这个 scope 根本
+# 不在 GITHUB_TOKEN 可授予的范围内，只能由 PAT 提供。
+#
+# 这就是本仓库 2026-10-15 连续失败的原因：Gitee 侧提交 1480ee2 新增了
+# .github/workflows/lint.yml，同步任务一碰到它就推不上去（此前 58 次
+# 成功运行都不涉及 workflow 文件，所以看不出问题）。
+#
+# 解法：配一个带 Workflows 权限的 PAT，存为仓库 Secret `SYNC_TOKEN`。
+# 建法见 DEVELOPMENT.md「Gitee → GitHub 镜像同步」一节。
+# 未配置时本 workflow 仍照常同步普通文件，只在遇到 workflow 文件时失败，
+# 并会给出明确报错（见「预检」步骤），不会让人对着红色叉号猜。
 
 on:
   schedule:
@@ -33,6 +55,13 @@ jobs:
           # 必须拉全历史，否则下面的 force push 会丢提交
           fetch-depth: 0
           ref: main
+          # ⚠️ 必须把 PAT 交给 checkout，**不能**只交给后面的 push 步骤。
+          # checkout 会把凭据写进本地 git config，之后所有 git 命令都用这一份；
+          # 单独给 push 步骤传 token 是无效的 —— 这是最常见的误解。
+          #
+          # 兜底写法 `|| github.token`：没配 SYNC_TOKEN 时退回默认 token，
+          # 普通文件照常同步，只有 workflow 文件的同步会失败。
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
 
       - name: 配置 Gitee 远程
         run: |
@@ -66,6 +95,36 @@ jobs:
           echo "--- Gitee 分支 ---"
           git branch -r | grep gitee/ || echo "(无)"
 
+      - name: 预检：待同步内容是否包含 workflow 文件
+        # 把「推送被拒」这种难以自查的远端报错，提前变成一条明确的本地提示。
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          changed=$(git diff --name-only HEAD gitee/main 2>/dev/null || echo "")
+          wf_changed=$(printf '%s\n' "$changed" | grep '^\.github/workflows/' || true)
+          if [ -z "$wf_changed" ]; then
+            echo "待同步改动不涉及 workflow 文件，默认 GITHUB_TOKEN 足够。"
+            exit 0
+          fi
+          echo "待同步改动包含以下 workflow 文件："
+          printf '%s\n' "$wf_changed" | sed 's/^/  /'
+          if [ -n "$SYNC_TOKEN" ]; then
+            echo "已配置 SYNC_TOKEN，可正常同步 workflow 文件。"
+          else
+            {
+              echo "### ❌ 缺少 SYNC_TOKEN，本次同步会失败"
+              echo
+              echo "Gitee 侧改动了 \`.github/workflows/\` 下的文件，而默认"
+              echo "\`GITHUB_TOKEN\` 被 GitHub **禁止**写入 workflow 文件"
+              echo "（硬性安全边界，\`permissions: write-all\` 也无效）。"
+              echo
+              echo "**解法**：建一个带 \`Workflows\` 权限的 PAT，存为仓库 Secret"
+              echo "\`SYNC_TOKEN\`。详见 DEVELOPMENT.md。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=缺少 SYNC_TOKEN::待同步改动包含 .github/workflows/ 下的文件，但未配置 SYNC_TOKEN。默认 GITHUB_TOKEN 无法写入 workflow 文件（GitHub 硬性限制），本次推送必然被拒。请创建带 Workflows 权限的 PAT 并添加为仓库 Secret SYNC_TOKEN。"
+            exit 1
+          fi
+
       - name: 同步主分支到 GitHub
         run: |
           # 镜像语义：GitHub 侧不接受独立改动，一律以 Gitee 为准，
@@ -84,7 +143,7 @@ jobs:
       - name: 汇总结果
         if: always()
         env:
-          GITEE_HEAD: ${{ github.sha }}
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
           {
             echo "### 同步完成"
@@ -92,6 +151,11 @@ jobs:
             echo "- 时间：$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             echo "- Gitee 侧 HEAD：$(git rev-parse --short gitee/main 2>/dev/null || echo '取不到')"
             echo "- 本次运行的起点：$(git rev-parse --short HEAD)"
+            if [ -n "$SYNC_TOKEN" ]; then
+              echo "- 推送凭据：SYNC_TOKEN（可同步 workflow 文件）"
+            else
+              echo "- 推送凭据：默认 GITHUB_TOKEN（**不能**同步 workflow 文件）"
+            fi
             echo
             echo "最近提交（Gitee main）："
             git log --oneline -10 gitee/main 2>/dev/null || echo "(取不到)"
