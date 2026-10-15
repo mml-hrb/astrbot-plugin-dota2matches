@@ -75,10 +75,41 @@ import httpx
 
 try:  # 插件目录被作为包加载时
     from astrbot.api import logger
-except ImportError:  # 离线单测 / 直接跑脚本时
-    import logging
+except ImportError:  # 离线单测 / 从工作区脚本直接 import 时
+    # ⚠️ 刻意**不用**内置 `logging` 模块。
+    # 插件市场自动检查有一条硬性规定：logger 必须且只能从 `astrbot.api` 导入，
+    # 严禁 `import logging` —— 2026-10-15 `dota_pool.py` 已因同样写法被拒过一次
+    # （见 CHANGELOG）。所以这里自带一个最小实现顶上，
+    # 保住「没有 astrbot 也能 import 本模块」的能力。
+    import sys
 
-    logger = logging.getLogger("dota2.esports")
+    class _FallbackLogger:
+        """离线兜底 logger：只把 WARNING 及以上打到 stderr。
+
+        门槛与内置 logging **未配置时一致**（根 logger 默认 WARNING，debug 与
+        info 本就不会输出），所以这次替换不改变原有的日志可见性。
+        """
+
+        def _emit(self, label: str, level: int, msg: object) -> None:
+            if level >= 30:  # WARNING
+                print(f"[dota2.esports] {label} {msg}", file=sys.stderr)
+
+        def debug(self, msg: object, *args: object, **kwargs: object) -> None:
+            self._emit("DEBUG", 10, msg)
+
+        def info(self, msg: object, *args: object, **kwargs: object) -> None:
+            self._emit("INFO", 20, msg)
+
+        def warning(self, msg: object, *args: object, **kwargs: object) -> None:
+            self._emit("WARNING", 30, msg)
+
+        def error(self, msg: object, *args: object, **kwargs: object) -> None:
+            self._emit("ERROR", 40, msg)
+
+        def exception(self, msg: object, *args: object, **kwargs: object) -> None:
+            self._emit("ERROR", 40, msg)
+
+    logger = _FallbackLogger()
 
 
 # ======================================================================
