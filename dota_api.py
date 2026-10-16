@@ -668,23 +668,46 @@ class OpenDotaClient:
     # ------------------------------------------------------------------
     # 职业赛事（队伍 / 赛事 / 职业比赛）
     # ------------------------------------------------------------------
-    async def get_pro_matches(self, limit: int = 100) -> list[dict]:
+    async def get_pro_matches(
+        self, limit: int = 100, *, before_match_id: int | None = None
+    ) -> list[dict]:
         """最近结束的职业比赛（``GET /proMatches``）。
 
         每行含 ``match_id`` / ``leagueid`` / ``league_name`` /
         ``radiant_name`` / ``dire_name`` / 比分 / ``start_time``。
-        这是 OpenDota **唯一**的「职业比赛」列表端点，固定返回最近约 100 场，
-        没有分页参数 ⇒ 想按赛事看全部对局得靠 ``/leagues/{id}/matches``。
+
+        ``before_match_id`` 是**翻页游标**：接口固定一次返回约 100 场，但接受
+        ``less_than_match_id`` 参数往回翻。这一点 2026-10-16 才查实 —— 旧 docstring
+        写的是「没有分页参数 ⇒ 想按赛事看全部对局得靠 /leagues/{id}/matches」，
+        于是插件从来只看得见最近 100 场（约两天），没法给一个几天前开打的赛事
+        对齐赛果。实测 3 页就能回溯两个月。
 
         .. note::
            对手队伍为 ``null`` 的行是**真实情况**（该队伍没在 OpenDota 登记 ID），
            调用方要如实渲染，不要补成「未知」以外的猜测。
         """
-        data = await self._request("/proMatches")
+        params = {"less_than_match_id": int(before_match_id)} if before_match_id else None
+        data = await self._request("/proMatches", params)
         rows = [row for row in (data or []) if isinstance(row, dict)]
         if limit and int(limit) > 0:
             return rows[: int(limit)]
         return rows
+
+    async def get_league_matches(self, league_id: int) -> list[dict]:
+        """某联赛的**全部**对局（``GET /leagues/{id}/matches``）。
+
+        .. warning::
+           这个端点的 ``radiant_team_name`` / ``dire_team_name`` **恒为 null**
+           （实测 DreamLeague S30：253 行里非空的 0 个），只有
+           ``radiant_team_id`` / ``dire_team_id``。队名要用
+           :func:`dota_esports.od_team_name_index` 从 ``/proMatches`` 换回来。
+
+           另外同一个 ``leagueid`` 可能把**多个赛区合在一起**
+           （``DreamLeague Season 30 Qualifiers`` 是 SEA / 中国 / 东欧 … 合体），
+           调用方要按参赛队名单自己切。
+        """
+        data = await self._request(f"/leagues/{int(league_id)}/matches", allow_404=True)
+        return [row for row in (data or []) if isinstance(row, dict)]
 
     async def get_team(self, team_id: int) -> dict:
         """某战队的评分与总胜负（``GET /teams/{id}``）。取不到返回空 dict。"""
@@ -903,8 +926,8 @@ class DataSource(Protocol):
     按类型定位后转发：
 
     * 只有 OpenDota 有：``get_hero_stats`` / ``get_latest_patch`` /
-      ``get_hero_item_popularity`` / ``get_pro_matches`` / ``get_teams_index``
-      / ``get_team`` / ``get_team_players`` / ``get_team_matches``
+      ``get_hero_item_popularity`` / ``get_pro_matches`` / ``get_league_matches``
+      / ``get_teams_index`` / ``get_team`` / ``get_team_players`` / ``get_team_matches``
     * 只有 STRATZ 有：``configured`` / ``get_hero_playstyle`` /
       ``get_hero_lane_outcome`` / ``get_hero_item_purchase``
 
@@ -1493,6 +1516,12 @@ class FallbackDataSource:
         """近期职业比赛：**固定走 OpenDota**（STRATZ 无等价端点）。"""
         return await self._from_opendota(
             "get_pro_matches", [], what="近期职业比赛", *args, **kwargs
+        )
+
+    async def get_league_matches(self, *args: Any, **kwargs: Any) -> list[dict]:
+        """某联赛的全部对局：**固定走 OpenDota**（STRATZ 无等价端点）。"""
+        return await self._from_opendota(
+            "get_league_matches", [], what="联赛对局", *args, **kwargs
         )
 
     async def get_team(self, *args: Any, **kwargs: Any) -> dict:

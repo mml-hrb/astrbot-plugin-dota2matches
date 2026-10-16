@@ -64,6 +64,7 @@ Liquipedia 的三条硬约束（2026-10-12 实测 + 官方 api-terms-of-use）
 from __future__ import annotations
 
 import asyncio
+import datetime
 import hashlib
 import json
 import re
@@ -145,6 +146,10 @@ RATE_LIMIT_STRIKES_TTL = 86400.0
 
 #: 出处署名。Liquipedia 内容是 CC BY-SA 3.0，条款要求注明来源。
 SOURCE_NOTE = "数据来源：Liquipedia（CC BY-SA 3.0）"
+
+#: 「赛程与结果」表最多渲染多少行。超出的只截断**展示**，但一定会写明总场次 ——
+#: 不写总场次，用户会把「表里 24 行」当成「这个赛事只有 24 场」。
+MAX_SCHEDULE_ROWS = 24
 
 #: 队伍状态色带（``bgN`` / ``pbgN``）→ 中文。语义按「该位置落在哪个区间」解释，
 #: 具体晋级规则由赛事主办方定义，渲染时会加一句说明，不过度解读。
@@ -1120,37 +1125,238 @@ def parse_date(text: str) -> str:
     return text
 
 
-def parse_matches(wikitext: str) -> list[dict[str, str]]:
+#: 时刻写法（``16:00``）。**只在日期确实解析出来了才用** —— 见 :func:`parse_datetime`。
+_TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)\b")
+
+#: 页面在日期旁边标注的时区缩写（``|date=October 16, 2026 - 16:00 {{Abbr/CST}}``）。
+_TZ_RE = re.compile(r"\{\{\s*Abbr\s*/\s*([A-Za-z]{2,5})\s*\}\}", re.I)
+
+#: 常见时区缩写 → 人话（认不出的缩写原样给）。
+_TZ_GLOSS: dict[str, str] = {
+    "cst": "CST＝北京时间（UTC+8）",
+    "utc": "UTC",
+    "gmt": "GMT",
+    "cest": "CEST＝中欧夏令时（UTC+2）",
+    "cet": "CET＝中欧时间（UTC+1）",
+    "bst": "BST＝英国夏令时（UTC+1）",
+    "kst": "KST＝韩国时间（UTC+9）",
+    "jst": "JST＝日本时间（UTC+9）",
+    "est": "EST＝美东时间（UTC-5）",
+    "edt": "EDT＝美东夏令时（UTC-4）",
+    "pst": "PST＝美西时间（UTC-8）",
+    "pdt": "PDT＝美西夏令时（UTC-7）",
+}
+
+#: 规整后的日期 / 日期+时刻（用来判断「解析成功了没有」）。
+_DATE_ONLY_RE = re.compile(r"(\d{4}-\d{2}-\d{2})(?: (\d{2}:\d{2}))?")
+
+
+def _match_tz(raw: str) -> str:
+    """赛程里的时区缩写（``{{Abbr/CST}}`` → ``CST``）；没有则空串。
+
+    为什么要单独捞它：``clean`` 会把 ``{{Abbr/CST}}`` 整个吃掉，于是渲染出来的
+    「16:00」**没有时区**。用户看到 16:00 会当成本地时间，而它其实是页面标注的
+    时区 —— 这正是本次「你说的中午和我读的时间对不上」的来源。
+    """
+    m = _TZ_RE.search(raw or "")
+    return m.group(1).upper() if m else ""
+
+
+def parse_datetime(text: str) -> str:
+    """日期规整成 ``YYYY-MM-DD``，**原文带时刻就一并带上**（``YYYY-MM-DD HH:MM``）。
+
+    ``|date=October 16, 2026 - 16:00 {{Abbr/CST}}`` 里那个 ``16:00`` 是
+    「几点开打」的**唯一**来源（bracket 模板没有别的时刻字段）。2026-10-16 之前
+    这里只回日期，于是用户问「今天几点打」永远答不出 —— 渲染出来只有
+    「2026-10-16　A vs B」，而「近期赛程日期时间」本身就是需求里点名要的一项。
+
+    反向约束（有测试钉住）：**纯净日期不许凭空补时间**。原文里没有 ``HH:MM``
+    就只回日期 —— 补一个 ``00:00`` 等于把「时刻未知」说成「半夜开打」。
+    """
+    date = parse_date(text)
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        return date
+    m = _TIME_RE.search(clean(text))
+    if not m:
+        return date
+    return f"{date} {int(m.group(1)):02d}:{m.group(2)}"
+
+
+def date_to_ts(text: str) -> float:
+    """``YYYY-MM-DD`` → 本地时间戳；认不出返回 ``0.0``。
+
+    用途是给「按赛事日期窗口切 OpenDota 对局」提供一个边界值 —— 拿不到日期
+    就返回 0，调用方按「不设边界」处理（宁可多给几条，也不要凭空砍掉）。
+    """
+    try:
+        return time.mktime(time.strptime(str(text or "").strip(), "%Y-%m-%d"))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _split_datetime(when: str) -> tuple[str, str]:
+    """``parse_datetime`` 的输出 → ``(日期, 时刻)``；认不出就整串当日期、时刻留空。"""
+    m = _DATE_ONLY_RE.fullmatch(when or "")
+    if not m:
+        return when or "", ""
+    return m.group(1), m.group(2) or ""
+
+
+#: 「这一轮已排期、但对手还没决出」时对阵表里写什么。
+#: **不是** ``-`` —— 那个符号在一张表里同时表示「时刻未知」「比分未出」，
+#: 再用它表示「对手待定」就三种含义糊成一团，用户只会以为是脏数据。
+TBD_OPPONENT = "待定"
+
+
+def _format_match_score(left: str, right: str) -> str:
+    """赛程行的比分列。两边都空就是空串（**不是 0**，也不是 ``-`` 的假比分）。"""
+    if left and right:
+        return f"{left}-{right}"
+    return left or right or ""
+
+
+#: ``{{Map}}`` 子模板里 ``winner`` 的取值 → 哪一边赢（``1`` = opponent1）。
+_MAP_WINNERS = frozenset(("1", "2"))
+
+#: 一场 ``{{Match}}`` 里最多几局（Bo5 用不到 5 个 ``matchid`` 槽，但模板留了位置）。
+_MAX_MAP_IDS = 5
+
+
+def _series_from_maps(match_body: str) -> tuple[str, list[str]]:
+    """从一场 ``{{Match}}`` 的 ``{{Map}}`` 子模板数出**系列赛比分**。
+
+    返回 ``(比分, matchid 列表)``；比分取不出来时是空串。
+
+    Liquipedia 的比分**不在** ``{{Match}}`` 顶层的 ``score=`` 里（那个字段除了
+    弃权 ``FF``/``W`` 常年为空），而是**逐局**记在 ``{{Map}}`` 上：每局一个
+    ``|winner=1``（1 = opponent1 赢）/ ``|winner=2``。把这个数出来才是系列赛比分
+    —— 实测 ``DreamLeague/30/China`` 整页 ``score=`` 全空，而同一天的
+    ``BLAST/SLAM/9/China`` 逐局 ``winner`` 填得齐全（2-0、1-0 都数得出来）。
+
+    两条不许含糊的规则：
+
+    1. ``|map3={{Map|finished=skip}}`` 的意思是「**这一局不用打**」（Bo3 里 2-0
+       之后收工），**不是「还没打」**。不排掉它，一场 2-0 会被讲成「第三局待打」。
+    2. **局数不齐时不给比分。** ``winner`` 的个数若少于非空的 ``matchid`` 个数，
+       说明有局只登记了 id、胜负还没填 —— 这时数出来的比分会**低报**（实测
+       ``DreamLeague/30/Southeast Asia`` 有一场 ``matchid`` 两个、``winner`` 一个，
+       真实是 1-1 而数出来只有 0-1）。宁可回空串交给对局库兜底，也不要给一个
+       看着像事实的错数。
+    """
+    wins = {"1": 0, "2": 0}
+    played = 0
+    for body in iter_templates(match_body, "Map"):
+        named, _pos = template_fields(body)
+        if clean(named.get("finished") or "").lower() == "skip":
+            continue  # 「不用打」的局，不许算进 series
+        winner = clean(named.get("winner") or "")
+        if winner in _MAP_WINNERS:
+            wins[winner] += 1
+            played += 1
+    named, _pos = template_fields(match_body)
+    ids = [
+        clean(named.get(f"matchid{i}") or "")
+        for i in range(1, _MAX_MAP_IDS + 1)
+    ]
+    ids = [i for i in ids if i.isdigit()]
+    if not played or played < len(ids):
+        return "", ids
+    return f"{wins['1']}-{wins['2']}", ids
+
+
+def parse_matches(wikitext: str) -> list[dict[str, Any]]:
     """解析赛程（``{{Match|opponent1=…|opponent2=…|date=…}}``）。
 
-    未开赛的赛事主页里这些模板是**空骨架**（对手与日期都为空），
-    解析时会跳过，避免渲染出「- vs -」这种假对阵。
+    行形状：``{left, right, date, time, score, map_score, matchids, winner}``。
+
+    五条硬规则，都是真机撞出来的：
+
+    1. **半骨架必须跳过。**上一版只跳「对手与日期**全**空」的，于是 10-17 那三场
+       半决赛（``|date=October 17, 2026 - 16:00`` 而两个 ``{{TeamOpponent|}}``
+       都空）被渲染成 ``- vs -`` 的**假对阵**（报告 10.3-③）。现在只要对手取不出来
+       就跳过，日期有没有都不算数；这些场次由 :func:`pending_match_dates` 单独交代。
+    2. **弃权比分在嵌套的 ``{{TeamOpponent|…|score=…}}`` 里**，不在 ``{{Match}}`` 上
+       —— 写法是 ``score=FF`` / ``score=W``。**注意它只管弃权**：正常打完的比赛
+       这里也是空的（全页扫下来几乎恒为 0），真比分见第 5 条。
+    3. **时刻保留**（见 :func:`parse_datetime`）。
+    4. **单边对手为空是真信息，保留并写「待定」。**``opponent1=X`` 而
+       ``opponent2={{TeamOpponent|}}`` 不是脏数据 —— 那是「X 已进这一轮，
+       对手等前面那场决出来」（实机：``Yangon Galacticos`` 16:00 一场、
+       对手待定）。上一版把空的那边渲染成 ``-``，看起来像「对手叫横杠」；
+       两边都空的才是纯骨架（由 :func:`pending_match_dates` 交代）。
+    5. **打完的比分要从 ``{{Map}}`` 子模板数**（见 :func:`_series_from_maps`），
+       落进 ``map_score``；``matchids`` 是对局库的精确钥匙，留着给跨源对齐用。
+       这两样**都是 ``{{Match}}`` 顶层没有的** —— 只读顶层就会得出「wiki 不记比分」
+       的错误结论（2026-10-16 踩到）。
     """
-    out: list[dict[str, str]] = []
+    out: list[dict[str, Any]] = []
     for body in iter_templates(wikitext, "Match"):
         named, _ = template_fields(body)
-        left = clean(named.get("opponent1") or "")
-        right = clean(named.get("opponent2") or "")
-        date = parse_date(named.get("date") or "")
-        # ``{{TeamOpponent|TeamA}}`` 这类嵌套模板会被 clean 压成空串，要单独取队名。
-        # 未开赛的赛事里它是空骨架（``{{TeamOpponent|}}``），此时**不能**退化成
-        # 模板名本身 —— 那会渲染出「TeamOpponent| vs TeamOpponent|」这种假对阵。
-        for key, holder in (("opponent1", "left"), ("opponent2", "right")):
-            if left if holder == "left" else right:
-                continue
-            nested = find_template(named.get(key, ""), "TeamOpponent")
-            if not nested:
-                continue
-            value = _first_positional(nested[0])
-            if holder == "left":
-                left = value
+        left = right = ""
+        score_left = score_right = ""
+        for key, side in (("opponent1", "left"), ("opponent2", "right")):
+            raw = named.get(key) or ""
+            value = clean(raw)
+            # ``{{TeamOpponent|TeamA|score=2}}`` 会被 clean 压成空串，要单独取。
+            # 空骨架 ``{{TeamOpponent|}}`` 取出来是空串 —— **不能**退化成模板名本身，
+            # 那会渲染出「TeamOpponent| vs TeamOpponent|」这种怪对阵。
+            nested = find_template(raw, "TeamOpponent")
+            score = ""
+            if nested:
+                n_named, _n_pos = template_fields(nested[0])
+                value = _first_positional(nested[0]) or value
+                score = clean(n_named.get("score") or "")
+            if side == "left":
+                left, score_left = value, score
             else:
-                right = value
-        winner = clean(named.get("winner") or "")
-        if not (left or right or date):
+                right, score_right = value, score
+        # 反面：「对手全空」才跳过。**不许**改成「有日期就渲染」——那正是假对阵的来源。
+        # 单边为空**不跳**：那一方是确定的，缺的一方等前面的比赛决出（写「待定」）。
+        if not (left or right):
             continue
-        out.append({"left": left or "-", "right": right or "-", "date": date or "-", "winner": winner})
+        date, clock = _split_datetime(parse_datetime(named.get("date") or ""))
+        # 打完的比分在 {{Map}} 子模板里逐局记着（见 _series_from_maps）。
+        map_score, matchids = _series_from_maps(body)
+        out.append(
+            {
+                "left": left or TBD_OPPONENT,
+                "right": right or TBD_OPPONENT,
+                "date": date or "-",
+                "time": clock,
+                "tz": _match_tz(named.get("date") or ""),
+                "score": _format_match_score(score_left, score_right),
+                "map_score": map_score,
+                "matchids": matchids,
+                "winner": clean(named.get("winner") or ""),
+            }
+        )
     return out
+
+
+def pending_match_dates(wikitext: str) -> list[str]:
+    """**已排期但对手未定**的对阵日期（去重升序）。
+
+    这些场次不能渲染成 ``- vs -``，但也不能一句不提 —— 「明天还有几场、
+    几点打」本身就是赛程的一部分答案。收集的是**日期**，让渲染层能写出一句
+    「另有 N 场已排期、对阵待定（10-17）」，而不是把它们混进对阵表里充数。
+    """
+    dates: set[str] = set()
+    for body in iter_templates(wikitext, "Match"):
+        named, _ = template_fields(body)
+        if any(_opponent_name(named.get(key) or "") for key in ("opponent1", "opponent2")):
+            continue
+        when, _clock = _split_datetime(parse_datetime(named.get("date") or ""))
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", when):
+            dates.add(when)
+    return sorted(dates)
+
+
+def _opponent_name(raw: str) -> str:
+    """``{{TeamOpponent|X}}`` / 裸队名 → 队名（取不到返回空串）。"""
+    nested = find_template(raw, "TeamOpponent")
+    if nested:
+        return _first_positional(nested[0])
+    return clean(raw)
 
 
 #: 选手模板的两种写法：``{{Person}}``（现在的写法）与 ``{{Player}}``（旧写法）。
@@ -1353,9 +1559,16 @@ def format_tournament(
     tables: list[dict[str, Any]] | None = None,
     swiss: dict[str, Any] | None = None,
     matches: list[dict[str, str]] | None = None,
+    results: list[dict[str, Any]] | None = None,
     notes: list[str] | None = None,
 ) -> str:
-    """渲染赛事概览（中文 Markdown）。"""
+    """渲染赛事概览（中文 Markdown）。
+
+    ``matches``：赛事页 bracket 里的对阵（**含未开打**，带日期与时刻）。
+    ``results``：OpenDota 那边的对局结果（**只有打完的**）。两者在这里合成
+    **一张「赛程与结果」表** —— 用户要的就是这一个视图：哪几场、几点打、谁赢了。
+    """
+    schedule, extra_results = merge_schedule(matches or [], results or [])
     status, span = tournament_status(info)
     title = info.get("name") or page
     short = info.get("shortname") or info.get("tickername") or ""
@@ -1432,11 +1645,39 @@ def format_tournament(
             lines.append(f"- 已记录 {swiss['round_count']} 轮对阵")
         lines.append("_（逐队名次需读取赛事页的实时积分表，未取到时不给具体排名）_")
 
-    if matches:
+    if schedule or extra_results:
         lines.append("")
-        lines.append("### 赛程")
-        for m in matches[:20]:
-            lines.append(f"- {m['date']}　{m['left']} vs {m['right']}")
+        total = len(schedule)
+        lines.append(f"### 赛程与结果（{total} 场）")
+        lines.append("| 日期 | 时间 | 对阵 | 比分/结果 |")
+        lines.append("|---|---|---|---|")
+        for row in schedule[:MAX_SCHEDULE_ROWS]:
+            clock = str(row.get("time") or "") or "-"
+            zone = str(row.get("tz") or "")
+            lines.append(
+                f"| {row.get('date') or '-'} | {clock}{f' {zone}' if zone else ''} | "
+                f"{row.get('left') or '-'} vs {row.get('right') or '-'} | "
+                f"{row.get('score') or '-'} |"
+            )
+        if total > MAX_SCHEDULE_ROWS:
+            lines.append(f"_（共 {total} 场，这里列前 {MAX_SCHEDULE_ROWS} 场）_")
+        zones = [t for t in dict.fromkeys(row.get("tz") or "" for row in schedule) if t]
+        if zones:
+            # 时区必须写出来：页面上的 16:00 是**页面标注的**时区，不是用户本地时间。
+            # 不写这一句，用户会把 16:00 当成本地时间读 —— 「你说的中午和我读的
+            # 时间对不上」就是这么来的。
+            lines.append(
+                "_（时区："
+                + "、".join(_TZ_GLOSS.get(t.lower(), t) for t in zones)
+                + "；没标时区的行多半是从对局库补的，时刻是插件本地时间）_"
+            )
+        if extra_results:
+            lines.append(f"_（另有 {extra_results} 场已收录在 OpenDota、赛事页没列出）_")
+        lines.append(
+            "_（比分是**局分**、一局系列赛一行：**优先取赛事页自己逐局记的胜负**，"
+            "赛事页还没记的才用对局库补 —— 没标时区的行就是从对局库补的那种。"
+            "`-` 表示**还没打完 / 两边都还没记**，不是 0 分、也不是输了）_"
+        )
 
     # 参赛队伍放**最后**：它是最长的一块（大赛事 20+ 行），而工具输出有长度
     # 上限 —— 放前面会把「名次 / 积分榜 / 出线」这些真正要判断的内容挤掉。
@@ -1588,18 +1829,311 @@ def format_transfers(rows: list[dict[str, str]], *, query: str = "", limit: int 
 
 
 def format_pro_matches(rows: list[dict[str, Any]], *, limit: int = 12) -> str:
-    """渲染近期职业比赛（OpenDota ``/proMatches``）。"""
+    """渲染近期职业比赛（OpenDota ``/proMatches``）——**按赛事归并**。
+
+    为什么必须归并（报告方案 B-8）：12 场平铺时，「昨天有哪些职业比赛」这个问题
+    要人肉把同一联赛的行拼起来才答得出；更糟的是那份名单里**没有任何线索**能提示
+    用户问的那个中国区预选赛在哪 —— 真机实测 12 条里一场 BLAST 中国区都没有，
+    模型于是只能猜赛事名，三次全错。
+
+    口径必须写出来（报告方案 B-10）：这条路只拿得到**已收录（即已结束）**的对局，
+    而它长得像「今天有什么比赛」的标准答案 —— 不写清口径，模型会把
+    「今天没别的比赛了」当成事实讲给用户。
+    """
     lines = ["【近期职业比赛】"]
     if not rows:
         lines.append("- 没取到数据。")
         return "\n".join(lines)
+    lines.append(
+        "_口径：以下是 OpenDota **已收录（即已结束）** 的最近职业对局；"
+        "正在进行与尚未开打的不在其中。_"
+    )
+    groups: list[tuple[str, list[dict[str, Any]]]] = []
+    index: dict[str, int] = {}
     for m in rows[:limit]:
-        score = m.get("score") or ""
-        tail = f"（{score}）" if score else ""
+        name = str(m.get("league") or "").strip() or "（未标明赛事）"
+        if name not in index:
+            index[name] = len(groups)
+            groups.append((name, []))
+        groups[index[name]][1].append(m)
+    for name, items in groups:
+        days = sorted({str(x.get("date") or "")[:10] for x in items if x.get("date")})
+        span = ""
+        if days:
+            span = f"｜{days[0]}" + (f" ~ {days[-1]}" if len(days) > 1 else "")
+        lines.append("")
+        lines.append(f"### {name}（{len(items)} 场{span}）")
+        for m in items:
+            score = m.get("score") or ""
+            tail = f"（{score}）" if score else ""
+            lines.append(
+                f"- {m.get('date') or '-'}　{m.get('radiant') or '-'} vs {m.get('dire') or '-'}{tail}"
+            )
+    return "\n".join(lines)
+
+
+# ======================================================================
+# 「今天有什么比赛」—— 跨赛事的日赛程（**只走 Liquipedia**）
+# ======================================================================
+#
+# 为什么单开一条路：``query_tournament`` 空 query 原先退回 OpenDota
+# ``/proMatches``，而那是**结果池**（滞后约 2.4 小时、只有已结束的对局）。
+# 2026-10-16 真机：用户问「今天正在打的中国区预选赛」，模型两次都拿到 SEA /
+# 西欧的**已结束**对局，一场中国区都没有 —— 于是开始猜赛事名（BetBoom /
+# ESL One / TI 2026），三次全错。**连问两轮答不出，错的不是模型，是那条路
+# 结构上就答不了「正在打 / 还没打」这件事。**
+#
+# Liquipedia 有的是**日程池**：没开打的比赛也挂在赛事页上。难的是「同一天
+# 有哪些赛事」这个跨赛事视角 —— 实测 ``insource:"October 16, 2026"`` 一次
+# 就能列出当天全部 6 个赛事页（含用户问的 BLAST/SLAM/9/China），再逐页解析。
+
+#: 英文月份 —— Liquipedia 赛程的日期写法是 ``|date=October 16, 2026 - 16:00``。
+_EN_MONTHS = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+
+#: ``date.weekday()`` → 中文星期（渲染标题用）。
+_WEEKDAYS_CN = ("一", "二", "三", "四", "五", "六", "日")
+
+#: 日赛程最多解析几个赛事页。每页一次 ``wikitext``（Liquipedia 1 次 / 2 秒），
+#: 8 页约 18 秒；再多单次问答就太慢了，超出部分如实写「还有 N 个赛事没展开」。
+MAX_DAILY_PAGES = 8
+
+#: 整体结果的缓存时长（秒）。同一天连着问几次，不该重跑十几秒的请求链。
+DAILY_CACHE_TTL = 600.0
+
+#: ``insource`` 搜索会带上的**非赛事页**。实测 ``insource:"2026-10-16"``
+#: 会返回 ``Primal Beast/Changelogs``（英雄改动页）这种 —— 每漏滤一个就多花
+#: 一次 2 秒的 wikitext 请求。
+_NON_EVENT_PREFIXES = (
+    "Portal:", "Liquipedia:", "Template:", "Category:", "Help:", "User:",
+    "File:", "Module:", "MediaWiki:", "Special:", "Talk:", "Draft:",
+)
+_NON_EVENT_SUFFIXES = ("/changelogs", "/broadcasts", "/statistics")
+
+
+def en_date(iso: str) -> str:
+    """``2026-10-16`` → ``October 16, 2026``（拼不出来回空串）。"""
+    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", (iso or "").strip())
+    if not m:
+        return ""
+    year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return ""
+    return f"{_EN_MONTHS[month - 1]} {day}, {year}"
+
+
+def shift_date(iso: str, days: int) -> str:
+    """``2026-10-16`` 加减 N 天 → ``YYYY-MM-DD``（认不出回空串）。"""
+    try:
+        base = datetime.date.fromisoformat((iso or "").strip())
+    except ValueError:
+        return ""
+    return (base + datetime.timedelta(days=int(days))).isoformat()
+
+
+def _weekday_suffix(iso: str) -> str:
+    """``2026-10-16`` → ``（周五）``（认不出回空串）。"""
+    try:
+        base = datetime.date.fromisoformat((iso or "").strip())
+    except ValueError:
+        return ""
+    return f"（周{_WEEKDAYS_CN[base.weekday()]}）"
+
+
+def is_event_title(title: str) -> bool:
+    """这个标题像不像「一场赛事的页面」（滤掉 ``insource`` 搜索的噪音）。"""
+    text = (title or "").strip()
+    if not text or text.startswith(_NON_EVENT_PREFIXES):
+        return False
+    low = text.lower()
+    return not any(low.endswith(suffix) for suffix in _NON_EVENT_SUFFIXES)
+
+
+def _region_of_title(title: str) -> str:
+    """标题里带的赛区（``DreamLeague/30/Southeast Asia`` → ``Southeast Asia``）。
+
+    标题级赛区**只用来筛页面**（省掉一次 wikitext 请求）；页面里到底有没有
+    该赛区的场次，仍以解析结果为准。
+    """
+    region, _start, _end = _region_match(title or "")
+    return region
+
+
+async def find_daily_pages(
+    client: LiquipediaClient, date: str, *, limit: int = 20
+) -> list[str]:
+    """搜出「这一天有比赛」的赛事页标题（去重保序）。
+
+    **两种日期写法都得搜**：英文长格式与 ISO。实测同一天前者命中 6 页、后者
+    命中 3 页，**不是子集关系**（BLAST 两页都命中，但东南亚 / 西欧 / EPL 只在
+    长格式里）—— 少搜一种就漏赛事。
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for term in (en_date(date), (date or "").strip()):
+        if not term:
+            continue
+        for hit in await client.search(f'insource:"{term}"', limit=limit):
+            if hit in seen or not is_event_title(hit):
+                continue
+            seen.add(hit)
+            out.append(hit)
+    return out
+
+
+def _daily_event(page: str, rows: list[dict[str, str]], pending: list[str]) -> dict[str, Any]:
+    """一个赛事页在某天窗口里的场次 → 渲染用的结构。"""
+    rows.sort(key=lambda r: (str(r.get("date") or ""), str(r.get("time") or "")))
+    return {
+        "page": page,
+        "region": _region_of_title(page),
+        "matches": rows,
+        "pending": pending,
+    }
+
+
+async def collect_daily_schedule(
+    client: LiquipediaClient,
+    *,
+    start: str = "",
+    days: int = 1,
+    region: str = "",
+    max_pages: int = MAX_DAILY_PAGES,
+) -> dict[str, Any]:
+    """跨赛事的日赛程（「今天有什么比赛」「接下来几天」）—— **只走 Liquipedia**。
+
+    ``insource`` 只搜**起始日**，但解析后按 ``[start, start+days)`` 窗口过滤 ——
+    一个赛事页通常含它自己好几天的赛程（BLAST 中国区页 10-16 与 10-17 都在），
+    所以「接下来两天」不需要多搜那几天的日期，省下的都是 2 秒一趟的请求。
+
+    返回 ``{start, end, days, region, events[], pages[], skipped, notes[]}``。
+    """
+    days = max(1, int(days))
+    begin = (start or "").strip() or datetime.date.today().isoformat()
+    end = shift_date(begin, days) or begin
+    region = (region or "").strip()
+
+    result: dict[str, Any] = {
+        "start": begin, "end": end, "days": days, "region": region,
+        "events": [], "pages": [], "skipped": 0, "notes": [],
+    }
+
+    cache_key = f"{begin}|{days}|{region}|{max_pages}"
+    cached = client.cache.get("daily", cache_key, DAILY_CACHE_TTL)
+    if isinstance(cached, dict):
+        result.update(cached)
+        return result
+
+    pages = await find_daily_pages(client, begin)
+    if not pages:
+        result["notes"].append(f"Liquipedia 上没搜到 {begin} 这天有排期的赛事页。")
+        client.cache.set("daily", cache_key, dict(result))
+        return result
+
+    if region:
+        # 用户点名了赛区就**只**给那个赛区：标题里写着别的赛区的、以及压根没写
+        # 赛区的（EPL、NEXUS 这种）都不是他要的。实测「中国区」若把「没写赛区」
+        # 也放过，6 页里只会滤掉 2 页，等于没滤。
+        pages = [p for p in pages if _region_of_title(p) == region]
+        if not pages:
+            result["notes"].append(
+                f"Liquipedia 上没搜到 {begin} 这天标着「{region}」的赛事排期。"
+            )
+            client.cache.set("daily", cache_key, dict(result))
+            return result
+
+    result["pages"] = pages
+    result["skipped"] = max(0, len(pages) - max_pages)
+
+    for page in pages[:max_pages]:
+        wikitext = await client.wikitext(page)
+        if not wikitext:
+            continue
+        rows = [
+            row for row in parse_matches(wikitext)
+            if begin <= str(row.get("date") or "") < end
+        ]
+        if not rows:
+            continue  # 这一页只是「提到了这一天」，当天并没有对阵
+        pending = [d for d in pending_match_dates(wikitext) if begin <= d < end]
+        result["events"].append(_daily_event(page, rows, pending))
+
+    if not result["events"]:
+        result["notes"].append(f"{begin} 这天没解析出任何对阵。")
+
+    client.cache.set("daily", cache_key, dict(result))
+    return result
+
+
+def format_daily_schedule(data: dict[str, Any]) -> str:
+    """渲染日赛程 —— 每个赛事一小节，一张「时间 / 对阵 / 比分」表。"""
+    start = str(data.get("start") or "")
+    days = max(1, int(data.get("days") or 1))
+    end = str(data.get("end") or start)
+    region = str(data.get("region") or "")
+    events = data.get("events") or []
+    notes = [str(n) for n in (data.get("notes") or []) if n]
+
+    if days <= 1:
+        lines = [f"【今日赛程 · {start}{_weekday_suffix(start)}】"]
+    else:
+        last = shift_date(end, -1) or end
+        lines = [f"【赛程 · {start} ~ {last}】"]
+    if region:
+        lines.append(f"_（只看「{region}」）_")
+
+    if not events:
+        lines.append("- 没查到这天的赛程。")
+        lines.extend(f"> {n}" for n in notes)
+        return "\n".join(lines)
+
+    total = sum(len(ev.get("matches") or []) for ev in events)
+    lines.append(
+        f"_口径：来自 Liquipedia 赛事页的**日程**（{len(events)} 个赛事、{total} 场）；"
+        "打完的照赛事页逐局记的胜负写出比分，空着的是**还没打完**。_"
+    )
+
+    wide = days > 1
+    for ev in events:
+        rows = ev.get("matches") or []
+        label = str(ev.get("page") or "")
+        if ev.get("region"):
+            label += f"｜{ev['region']}"
+        lines.append("")
+        lines.append(f"### {label}（{len(rows)} 场）")
+        lines.append("| 日期 | 时间 | 对阵 | 比分/结果 |" if wide else "| 时间 | 对阵 | 比分/结果 |")
+        lines.append("|---|---|---|---|" if wide else "|---|---|---|")
+        for row in rows:
+            clock = str(row.get("time") or "") or "-"
+            zone = str(row.get("tz") or "")
+            vs = f"{row.get('left') or TBD_OPPONENT} vs {row.get('right') or TBD_OPPONENT}"
+            # 打完的场次：赛事页用 ``{{Map}}`` 逐局记着胜负，取它（``score`` 是弃权那种）。
+            score = row.get("score") or row.get("map_score") or "-"
+            if wide:
+                lines.append(f"| {row.get('date') or '-'} | {clock} | {vs} | {score} |")
+            else:
+                lines.append(f"| {clock}{f' {zone}' if zone else ''} | {vs} | {score} |")
+        if ev.get("pending"):
+            pend = "、".join(str(d)[5:] for d in ev["pending"])
+            lines.append(f"_（另有 {len(ev['pending'])} 场已排期、对阵待定（{pend}））_")
+
+    if data.get("skipped"):
+        lines.append("")
+        lines.append(f"_（当天还有 {data['skipped']} 个赛事没展开）_")
+
+    zones = [
+        t for t in dict.fromkeys(
+            str(row.get("tz") or "") for ev in events for row in (ev.get("matches") or [])
+        ) if t
+    ]
+    if zones:
         lines.append(
-            f"- {m.get('date') or '-'}　{m.get('league') or '-'}｜"
-            f"{m.get('radiant') or '-'} vs {m.get('dire') or '-'}{tail}"
+            "_（时区：" + "、".join(_TZ_GLOSS.get(t.lower(), t) for t in zones)
+            + "——是**赛事当地时间**）_"
         )
+    lines.extend(f"> {n}" for n in notes)
     return "\n".join(lines)
 
 
@@ -1694,6 +2228,156 @@ _TITLE_STOPWORDS: frozenset[str] = frozenset(
     {"the", "season", "series", "presented", "by", "edition", "of"}
 )
 
+#: 用户口语里的**赛区词** → Liquipedia 赛事子页面名里用的英文区域名。
+#:
+#: 为什么必须单列：中国区预选赛的页面叫 ``DreamLeague/30/China`` ——
+#: 「中国区」这三个字**只出现在这一层**。别名表里原本一个区域词都没有
+#: （报告根因 2），于是「梦幻联赛 S30 中国区预选赛」这条最自然的说法，
+#: 三条路（直连 / 搜索 / 子页）全断。
+#:
+#: 英文词一律**按词边界**匹配（见 :func:`_region_match`），所以 ``cn`` / ``sea``
+#: 这种短词不会被 ``Season`` 里的 ``sea`` 骗到。
+_REGION_WORDS: dict[str, str] = {
+    "中国区": "China", "中国": "China", "国内": "China",
+    "china": "China", "cn": "China",
+    "东南亚": "Southeast Asia", "southeast asia": "Southeast Asia", "sea": "Southeast Asia",
+    "东欧": "Eastern Europe", "eastern europe": "Eastern Europe", "eeu": "Eastern Europe",
+    "西欧": "Western Europe", "western europe": "Western Europe", "weu": "Western Europe",
+    "南美": "South America", "南美洲": "South America", "south america": "South America",
+    "北美": "North America", "north america": "North America",
+    "中东": "Middle East", "middle east": "Middle East",
+    "独联体": "CIS", "cis": "CIS",
+}
+
+#: 「预选赛」这类**不指向具体赛事**的通用词。
+#:
+#: 用户说「中国区预选赛」而没说哪个赛事时，拿这几个字去搜 Liquipedia 只会搜到
+#: 一堆无关页面（真机实测：``China Qualifier`` 落到了 **2017 年**的
+#: ``ROG MASTERS/2017/China Qualifier``）。把通用词摘掉后如果什么都不剩，
+#: 就该直说「需要知道是哪个赛事的预选赛」，而不是拿一个九年前的赛事充数。
+_GENERIC_QUALIFIERS: tuple[str, ...] = (
+    "封闭预选赛", "公开预选赛", "封闭预选", "公开预选", "预选赛", "预选",
+    "closed qualifier", "open qualifier", "closed qualifiers", "open qualifiers",
+    "qualifiers", "qualifier", "正赛",
+)
+
+#: 赛季写法（在**归一化**后的尾巴上匹配）：``s30`` / ``season30``。
+_SEASON_RE = re.compile(r"(?:^|[^a-z0-9])(?:s|season)(\d{1,2})(?![0-9])")
+#: 中文赛季写法：``第 30 赛季`` / ``30 赛季``。
+_SEASON_CN_RE = re.compile(r"(?:第\s*)?(\d{1,2})\s*赛季")
+#: 罗马数字赛季：``BLAST SLAM IX`` / ``TI X``。Liquipedia 页面名用的是阿拉伯数字
+#: （``BLAST/SLAM/9``），不换这一下，「BLAST SLAM IX 中国区」就少了赛季号。
+_ROMAN_SEASONS: dict[str, int] = {
+    "i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6,
+    "vii": 7, "viii": 8, "ix": 9, "x": 10, "xi": 11, "xii": 12,
+}
+#: 四位数一律当**年份**，不当赛季（``TI 2026`` 的 2026 不是「第 2026 赛季」）。
+_YEAR_LIKE_RE = re.compile(r"(?:19|20)\d{2}")
+
+
+def _region_match(text: str) -> tuple[str, int, int]:
+    """在 ``text`` 里找**最长**的区域词，返回 ``(英文区域名, 起, 止)``。
+
+    取最长是为了让「中国区」赢过「中国」（两级都要能吃住，但结果一致即可）；
+    找不到返回 ``("", 0, 0)``。
+    """
+    raw = text or ""
+    low = raw.lower()
+    best = ("", 0, 0)
+    for word, region in _REGION_WORDS.items():
+        if any("\u4e00" <= ch <= "\u9fff" for ch in word):
+            idx = raw.find(word)
+            if idx < 0:
+                continue
+            span = (region, idx, idx + len(word))
+        else:
+            m = re.search(r"(?<![a-z0-9])" + re.escape(word) + r"(?![a-z0-9])", low)
+            if not m:
+                continue
+            span = (region, m.start(), m.end())
+        if span[2] - span[1] > best[2] - best[1]:
+            best = span
+    return best
+
+
+def _find_region(text: str) -> str:
+    """``text`` 里的区域名（没有则空串）。"""
+    return _region_match(text)[0]
+
+
+def _season_of_text(tail: str) -> str:
+    """从「基干之后剩下的那截」里认出赛季号，返回**十进制字符串**（认不出空串）。
+
+    ``s30`` / ``season 30`` / ``30 赛季`` / ``ix`` / 光秃秃一个 ``30`` 都认。
+    **四位数一律不算赛季**（那是年份，由 :func:`_extract_year` 管）。
+    """
+    text = (tail or "").strip()
+    if not text:
+        return ""
+    m = _SEASON_RE.search(text) or _SEASON_CN_RE.search(text)
+    if m:
+        return str(int(m.group(1)))
+    m = re.fullmatch(r"(\d{1,3})", text)
+    if m and not _YEAR_LIKE_RE.fullmatch(m.group(1)):
+        return str(int(m.group(1)))
+    m = re.fullmatch(r"([ivx]{1,4})", text.lower())
+    if m and m.group(1) in _ROMAN_SEASONS:
+        return str(_ROMAN_SEASONS[m.group(1)])
+    return ""
+
+
+def _season_of_title(title: str) -> int:
+    """页面标题里的赛季号（``DreamLeague/30`` → 30、``DreamLeague/Season 20`` → 20）。
+
+    没有这一项时，排序只看年份；而 ``DreamLeague/30`` 这种**用赛季号命名**的页面
+    一个四位数都没有 ⇒ 年份一律是 0，排序完全交给搜索结果的原始顺序 ——
+    这就是「梦幻联赛」挑到 ``DreamLeague/Season 20`` 的一半原因（报告根因 4）。
+
+    注意 ``/`` 之后必须是**整个尾段**才算：``…/Open Qualifier 1`` 里的 ``1``
+    是场次不是赛季，所以要求尾段形态是 ``<数字>`` 或 ``Season <数字>``。
+    """
+    seg = (title or "").strip().rsplit("/", 1)[-1].strip().lower()
+    if _YEAR_LIKE_RE.fullmatch(seg):
+        return 0
+    m = re.fullmatch(r"(?:season\s*)?(\d{1,3})", seg)
+    return int(m.group(1)) if m else 0
+
+
+def _alias_hit(text: str) -> tuple[str, str]:
+    """中文 / 缩写说法 → ``(命中的原键, 英文基干)``；没命中返回 ``("", "")``。
+
+    **最长键优先 + 只认前缀**，两条都是必须的：
+
+    * 最长优先：``BLAST SLAM IX`` 同时命中 ``blast`` 与 ``blastslam``，
+      不按长度排会得到「BLAST Slam Slam IX」这种脏基干；
+    * 只认前缀：改成「包含匹配」的话，``Berlin Major 2023`` 里的 ``major``
+      会把基干改写成 ``Major``、把 ``Berlin`` 整块丢掉（搜出来的页就不对了）。
+      而真正需要放宽的场景（``梦幻联赛s30``）**本来就是前缀**，尾巴正好是
+      赛季号 —— 前缀 + 尾巴解析已经覆盖，不必再放宽成包含。
+    """
+    norm = _norm(text)
+    if not norm:
+        return "", ""
+    for key in sorted(TOURNAMENT_ALIASES, key=lambda k: -len(_norm(k))):
+        nk = _norm(key)
+        if nk and norm.startswith(nk):
+            return key, TOURNAMENT_ALIASES[key]
+    return "", ""
+
+
+def _search_stem(base: str, year: str, season: str) -> str:
+    """基干 + 赛季/年份 → 搜索词。
+
+    ⚠️ **年份不能重复拼**（2026-10-14 真机事故）：旧版 ``tournament_alias`` 会把
+    年份拼进基干，调用方再补一次，于是发出 ``The International 2026 2026``
+    这种脏搜索词。现在拼装只在这一处发生。
+    """
+    if season:
+        return f"{base} {season}"
+    if year and year not in base:
+        return f"{base} {year}"
+    return base
+
 
 def _norm(text: str) -> str:
     """归一化：去空格 / 下划线 / 点 / 连字符 / **斜杠**，转小写，便于比对。
@@ -1710,6 +2394,25 @@ def _norm(text: str) -> str:
     用户看到的是「没在 Liquipedia 上找到赛事」。
     """
     return re.sub(r"[\s_.\-·・/\\]+", "", (text or "").strip().lower())
+
+
+#: 队名里的**括号注释**（``ZENITH (stack)``、``Team X（临时阵容）``）。
+_PAREN_NOTE_RE = re.compile(r"[\(（][^\)）]*[\)）]")
+
+
+def _norm_loose(text: str) -> str:
+    """比 :func:`_norm` 再宽一档：先把括号注释整块丢掉再归一化。
+
+    实测（2026-10-16，真联赛 20359 = DreamLeague S30 的全球预选赛池）：赛事页把
+    参赛队写成 ``ZENITH (stack)``，OpenDota 写成 ``ZENITH`` —— **同一支队，两种
+    写法**。用严格归一化做「两支队都在参赛名单里」的判断时，这支队在这个赛事下
+    的**全部 7 个系列赛**都被判成「不是本赛事的」整块丢掉（实测：8 场 → 15 场）。
+    括号里是消歧 / 临时阵容说明，不改变「这是哪支队」，所以这一档必须丢掉。
+
+    只用于**队名**比对（赛区切分、两源合并），不要用于页面标题比对 ——
+    标题里的括号常常是有意义的区分（``BLAST/SLAM/9 (China)``）。
+    """
+    return _norm(_PAREN_NOTE_RE.sub("", text or ""))
 
 
 def _title_tokens(text: str) -> frozenset[str]:
@@ -1757,26 +2460,64 @@ def team_alias(query: str) -> str:
     return TEAM_ALIASES.get(_norm(text)) or text
 
 
-def tournament_alias(query: str) -> str:
-    """赛事名的中文 / 缩写 → Liquipedia 上的英文名（没有对照则原样返回）。
+def tournament_parts(query: str) -> tuple[str, str, str, str]:
+    """把用户说法拆成 ``(英文基干, 年份, 赛季号, 赛区)`` —— 四项都可能为空串。
 
-    带年份的说法（「TI 2026」「利雅得大师赛 2026」）也能认：先把年份摘掉查
-    对照表，再把它拼回去。**这一步不能省** —— 少了它，「TI 2026」整串去查表
-    落空，只能靠搜索结果去猜，很容易猜成同名同年的另一个赛事。
+    这是**唯一**的口语 → 页面线索的解析入口（旧版 ``tournament_alias`` 只认整串
+    精确匹配，多打一个 ``s30`` 就全废 —— 用户前两天连试三次失败的直接原因）。拆解顺序：
+
+    1. **年份**：``TI 2026`` → ``2026``（四位数）；
+    2. **赛区**：找出最长的区域词并从原话里摘掉（``梦幻联赛 S30 **中国区**预选赛``）；
+    3. **通用词**：摘掉「预选赛 / 公开预选 / Qualifier」这类不指向具体赛事的词；
+    4. **基干**：剩下的部分按别名表**最长键 + 前缀**匹配；匹配不上就原样当基干
+       （英文全名走的就是这条路，``The International 2026`` 不该被改写成别的）；
+    5. **赛季**：别名键之后剩下的尾巴里找 ``s30`` / ``30 赛季`` / 罗马数字 / 光秃秃数字。
+
+    摘掉区域与通用词是必须的：``中国区 梦幻联赛`` 这种语序（区域在前）会挡住前缀匹配。
     """
     text = (query or "").strip()
     if not text:
-        return ""
-    hit = TOURNAMENT_ALIASES.get(_norm(text))
-    if hit:
-        return hit
+        return "", "", "", ""
     year = _extract_year(text)
-    if year:
-        stripped = _norm(re.sub(r"(19|20)\d{2}", "", text))
-        hit = TOURNAMENT_ALIASES.get(stripped)
-        if hit:
-            return f"{hit} {year}"
-    return text
+
+    region, start, end = _region_match(text)
+    core = (text[:start] + " " + text[end:]).strip() if region else text
+    for word in _GENERIC_QUALIFIERS:
+        if any("\u4e00" <= ch <= "\u9fff" for ch in word):
+            core = core.replace(word, " ")
+        else:
+            core = re.sub(
+                r"(?<![a-z0-9])" + re.escape(word) + r"(?![a-z0-9])", " ", core, flags=re.I
+            )
+    core = re.sub(r"\s+", " ", core).strip(" ,，、-—–/\\").strip()
+
+    if not core:
+        # 只剩「中国区预选赛」这种 —— 没有赛事基干，交给调用方去问清楚。
+        return "", year, "", region
+
+    key, base = _alias_hit(core)
+    if not key:
+        return core, year, "", region
+    tail = _norm(core)[len(_norm(key)):]
+    return base, year, _season_of_text(tail), region
+
+
+def tournament_alias(query: str) -> str:
+    """赛事名的中文 / 缩写 → Liquipedia 上的英文名（没有对照则原样返回）。
+
+    带年份的说法（「TI 2026」「利雅得大师赛 2026」）也能认。现在是
+    :func:`tournament_parts` 的薄壳：基干来自别名表，年份/赛季拼回去。
+    **保留它是因为旧调用点与测试都在用** —— 新代码请直接用 :func:`tournament_parts`，
+    那边把「年份 / 赛季 / 赛区」分开给出，调用方不必再从字符串里反解。
+    """
+    base, year, season, _region = tournament_parts(query)
+    if not base:
+        return (query or "").strip()
+    if season:
+        return f"{base} {season}"
+    if year and year not in base:
+        return f"{base} {year}"
+    return base
 
 
 def _extract_year(text: str) -> str:
@@ -1784,7 +2525,9 @@ def _extract_year(text: str) -> str:
     return m.group(0) if m else ""
 
 
-def pick_page_title(hits: list[str], base: str, year: str = "") -> str:
+def pick_page_title(
+    hits: list[str], base: str, year: str = "", *, must_include: str = ""
+) -> str:
     """从搜索结果里挑出最像目标页面的那个标题；**挑不出来就返回空串**。
 
     规则（三级，逐级放宽，前一级命中就不往下一级走）：
@@ -1795,8 +2538,15 @@ def pick_page_title(hits: list[str], base: str, year: str = "") -> str:
     3. **实义词全中**（:func:`_tokens_by_subset`）—— 治的是「两种写法谁也不含谁」
        的那类，``DreamLeague Season 30`` ↔ ``DreamLeague/30``。
 
-    给了年份就优先含该年份的；最后取年份最大的（「TI」→ 命中 The International
-    2026 / 2025 / …，取 2026），同年则主页面优先于子页面。
+    给了年份就优先含该年份的；最后按 **(年份, 赛季号, 主页面优先)** 取大。
+    赛季号那一档是 2026-10-16 补的：``DreamLeague/30`` 这种用赛季号命名的页面
+    没有任何四位数，只看年份就会与 ``DreamLeague/Season 20`` 并列，排序退化成
+    搜索结果的原始顺序 —— 这正是「梦幻联赛」挑到 20 赛季的原因（报告根因 4）。
+
+    ``must_include``：**必须包含**的一截（赛区词，如 ``China``）。用户点名了赛区时
+    用得上 —— 主赛事页 ``DreamLeague/30`` 与赛区子页 ``DreamLeague/30/China``
+    都能通过前三级的比对，而按「主页面优先」主赛事会赢，于是「中国区预选赛」
+    又被答成「正赛」。点名了赛区就以赛区为准。
 
     有一条**刻意的拒绝**：基干一条都对不上时返回空串，**不拿搜索结果第一条
     凑数**。实测踩过：搜一个根本不存在的赛事，旧逻辑会把「The International
@@ -1805,6 +2555,11 @@ def pick_page_title(hits: list[str], base: str, year: str = "") -> str:
     cands = [h for h in (hits or []) if str(h).strip()]
     if not cands:
         return ""
+    if must_include:
+        want = _norm(must_include)
+        cands = [h for h in cands if want and want in _norm(h)]
+        if not cands:
+            return ""
     low = _norm(base)
     pool = cands
     if low:
@@ -1828,8 +2583,12 @@ def pick_page_title(hits: list[str], base: str, year: str = "") -> str:
         m = re.search(r"(20\d{2})", title)
         return int(m.group(1)) if m else 0
 
-    # 「同一基干的年份页面」优先于「子页面」（子页面名字更长、常带斜杠）
-    pool = sorted(pool, key=lambda t: (_year_of(t), -t.count("/")), reverse=True)
+    # 「同一基干的年份 / 赛季页面」优先于「子页面」（子页面名字更长、常带斜杠）
+    pool = sorted(
+        pool,
+        key=lambda t: (_year_of(t), _season_of_title(t), -t.count("/")),
+        reverse=True,
+    )
     return pool[0]
 
 
@@ -1837,31 +2596,172 @@ async def resolve_tournament_page(client: "LiquipediaClient", query: str) -> tup
     """把「TI」「利雅得大师赛」「The International 2025」解析成赛事页面标题。
 
     返回 ``(页面名, 说明)``；页面名为空表示没找到（说明里带原因，直接给模型看）。
+
+    2026-10-16 起这里多带一层**赛区**处理，分三级：
+
+    1. **直连**：用户给的是页面级写法（含 ``/`` 或本身就是基干）时先直取一次；
+    2. **搜索**：``基干 + 赛季/年份 + 赛区``，并**要求落到的页标题里含该赛区**；
+    3. **退到主赛事页再翻子页**：第一轮没直接命中赛区页时先落主赛事页，
+       再从它的子页里挑出该赛区（``DreamLeague/30`` → ``DreamLeague/30/China``）。
+
+    第 3 级是本次修复的关键一步：旧实现即使拿到了 16 个赛区子页列表，
+    也会被 ``_STAGE_HINTS`` 那把筛子**全扔掉**，然后对用户说「没找到」——
+    而其实只差一句「这个赛事有中国区 / 东南亚 等赛区，你要看哪个」。
     """
     q = (query or "").strip()
     if not q:
         return "", "需要给出赛事名。"
-    year = _extract_year(q)
-    base = tournament_alias(q)
+    base, year, season, region = tournament_parts(q)
 
-    # 只有「没走别名」时才直连一次：走了别名说明用户给的是中文/缩写，
-    # 拿它当页面名必然落空，白花一次请求。
-    if base == q:
+    if not base:
+        if region:
+            return "", (
+                f"「{q}」里只看到赛区（{region}），没有赛事名 —— 得先知道是**哪个赛事**的"
+                "预选赛（例如「梦幻联赛 S30 中国区」）。"
+            )
+        return "", f"没在 Liquipedia 上找到赛事「{q}」对应的页面。"
+
+    # 直连：用户给的是页面级写法时才做。
+    # 走了别名说明给的是中文/缩写，拿它当页面名必然落空（白花一次请求）；
+    # 但带 ``/`` 的（``DreamLeague/30/China``）就是页面名本身，值得先试一下。
+    page_like = base == q or "/" in q
+    if page_like and (not region or _norm(region) in _norm(q)):
         direct = q.replace("_", " ")
         text = await client.wikitext(direct)
         if text and "Infobox league" in text:
             return direct, ""
 
-    # 年份不能重复拼：`tournament_alias` 会把年份拼回别名结果
-    # （「TI 2026」→ `The International 2026`），这里再无脑补一次就会发出
-    # 「The International 2026 2026」这种脏搜索词 —— 真机日志里抓到过。
-    # 只在基干确实不含年份时才补。
-    search_term = base if (not year or year in base) else f"{base} {year}"
-    hits = await client.search(search_term, limit=10)
-    picked = pick_page_title(hits, base, year)
+    # 年份不能重复拼（2026-10-14 真机事故）：拼装统一交给 :func:`_search_stem`。
+    stem = _search_stem(base, year, season)
+    terms: list[str] = [f"{stem} {region}", stem] if region else [stem]
+    picked = ""
+    for term in dict.fromkeys(terms):
+        hits = await client.search(term, limit=10)
+        picked = pick_page_title(hits, stem, year, must_include=region)
+        if picked:
+            break
+
+    # 只给了**系列名**（「梦幻联赛」「PGL」）而没给赛季 / 年份时，站点搜索落到的
+    # 往往是老命名的赛季页（真机：「梦幻联赛」→ ``DreamLeague/Season 23``，
+    # 2021 年的那一届），而当前赛季叫 ``DreamLeague/30``。改用**系列主页的子页
+    # 列表**挑最新一届，并把「这是按最新一届解析的」说给模型听。
+    series_only = not region and not season and not year
+    if series_only and (not picked or "season" in picked.lower()):
+        latest = await _pick_from_series(client, q, year)
+        if latest:
+            return latest, (
+                f"「{q}」没有说赛季，这里按**最新一届**（{latest}）解析。"
+                "用户要的若是别的届次，让他带上赛季号（如「梦幻联赛 S30」）。"
+            )
     if picked:
         return picked, ""
+
+    if region:
+        # 退一步：先落主赛事页，再从它的子页里挑这个赛区。
+        try:
+            hits = await client.search(stem, limit=10)
+        except EsportsError as e:
+            return "", f"搜索赛事「{q}」失败（{e}）。"
+        parent = pick_page_title(hits, stem, year)
+        if parent:
+            try:
+                subs = await client.subpages(parent, limit=100)
+            except EsportsError:
+                subs = []
+            sub = _region_subpage(subs, region)
+            if sub:
+                return sub, ""
+            available = _region_subpages(subs)
+            if available:
+                return "", (
+                    f"「{q}」没有直接匹配到页面；该赛事（{parent}）下面有这些赛区："
+                    + "、".join(sorted(available))
+                    + "。先向用户确认要看哪个赛区，或让他给更完整的赛事名。"
+                )
+            return "", f"在 Liquipedia 上没找到「{parent}」的「{region}」子页面。"
+
+    if series_only:
+        latest = await _pick_from_series(client, q, year)
+        if latest:
+            return latest, (
+                f"「{q}」没找到直接对应的页面，这里按**最新一届**（{latest}）解析。"
+                "用户要的若是别的届次，让他带上赛季号（如「梦幻联赛 S30」）。"
+            )
     return "", f"没在 Liquipedia 上找到赛事「{q}」对应的页面。"
+
+
+async def _pick_from_series(
+    client: "LiquipediaClient", query: str, year: str = ""
+) -> str:
+    """只给了系列名时，从**系列主页的子页面列表**里挑最新的一届。
+
+    为什么不能只靠搜索：``DreamLeague`` 这个系列主页下挂着 ``/27`` ``/28``
+    ``/29`` ``/30`` 与 ``/Season 20`` ``/Season 23`` 两套命名，而站点的相关性
+    排序把老命名的几页排在前面 —— 于是「梦幻联赛」永远答成 2021 年的那一届。
+    子页列表是**完整**的，按赛季号取最大即可。
+
+    匹配基干时要把 ``Season`` 摘掉（``DreamLeague Season`` → ``DreamLeague``）：
+    主赛事页叫 ``DreamLeague/30``，**不含** ``Season`` 这个词，带着它做前缀匹配
+    只会命中 ``DreamLeague/Season 20`` 那一套老页面，等于没改。
+
+    拿不到系列主页（或它没有子页）就返回空串，调用方保留原来的落页结果 ——
+    这条是**锦上添花**，绝不允许它把已经对上的答案带偏。
+    """
+    key, base = _alias_hit(query)
+    if not key:
+        return ""
+    series = re.sub(r"\s*(?:season|series)\s*$", "", base, flags=re.I).strip() or base
+    try:
+        hits = await client.search(series, limit=10)
+    except EsportsError:
+        return ""
+    want = _norm(series)
+    parent = next((h for h in hits if "/" not in h and _norm(h) == want), "")
+    if not parent:
+        parent = next(
+            (h for h in hits if "/" not in h and _norm(h).startswith(want)), ""
+        )
+    if not parent:
+        return ""
+    try:
+        subs = await client.subpages(parent, limit=200)
+    except EsportsError:
+        return ""
+    numbered = [s for s in subs if _season_of_title(s)]
+    if not numbered:
+        return ""
+    return pick_page_title(numbered, series, year)
+
+
+def _region_subpage(titles: list[str], region: str) -> str:
+    """子页列表里含该赛区的那个（没有则空串）。"""
+    want = _norm(region)
+    if not want:
+        return ""
+    for title in titles or []:
+        if want in _norm(title):
+            return title
+    return ""
+
+
+def _region_subpages(titles: list[str]) -> set[str]:
+    """子页列表里出现的**赛区**（用于「这个赛事有哪几个赛区」这句话）。
+
+    只看标题的**最后一段**且要求整段相等 —— ``.../China`` ✓、
+    ``.../China/Open Qualifier 1``（尾段是 ``Open Qualifier 1``）✗。
+    """
+    out: set[str] = set()
+    for title in titles or []:
+        seg = (title or "").strip().rsplit("/", 1)[-1].strip().lower()
+        if not seg:
+            continue
+        for word, region in _REGION_WORDS.items():
+            if any("\u4e00" <= ch <= "\u9fff" for ch in word):
+                continue
+            if seg == word:
+                out.add(region)
+                break
+    return out
 
 
 async def resolve_team_page(client: "LiquipediaClient", query: str) -> tuple[str, str]:
@@ -1927,6 +2827,9 @@ async def collect_tournament(
         "tables": [],
         "swiss": {},
         "matches": [],
+        "pending_dates": [],
+        "regions": [],
+        "leagueid": "",
         "notes": [],
     }
     page, note = await resolve_tournament_page(client, query)
@@ -1934,6 +2837,13 @@ async def collect_tournament(
         result["notes"].append(note or "没找到赛事页面。")
         return result
     result["page"] = page
+    # ⚠️ **落页成功时也要带说明**（2026-10-16 实机验收抓到）。说明是「这个页是
+    # 怎么挑出来的」：只给系列名（「梦幻联赛」）时按**最新一届**解析，落到的是
+    # ``DreamLeague/32``（2027 年那届）—— 不把这句话交给模型，用户会把它当成
+    # 自己问的那一届。原来 note 只在 ``not page`` 那条路上被用，落页成功时静默
+    # 丢掉，于是解析层写好的说明**一条都到不了用户眼前**。
+    if note:
+        result["notes"].append(note)
 
     # ⚠️ 取主页正文要**兜住限流**（P1-7，2026-10-14 审查）。
     #
@@ -1994,6 +2904,24 @@ async def collect_tournament(
         except EsportsError as e:
             subs = []
             result["notes"].append(f"子页面列举失败（{e}）。")
+
+        # ⚠️ **拿到了线索却自己扔掉**，是这条路以前最可惜的一处（报告根因 3）：
+        # ``DreamLeague/30`` 下面 16 个子页标题全都取回来了，
+        # 然后被 ``_usable_subpages`` 的赛段关键字筛子**全扔掉**，
+        # 最后只对模型说一句「没有对阵表」。
+        #
+        # 这里只把**赛区名字**告诉模型，**不自动取** —— 拿一个别的赛区的 bracket
+        # 混进本赛事的赛程，比不取更糟（会把 SEA 的比赛说成中国区的）。
+        regions = sorted(_region_subpages(subs))
+        if regions:
+            result["regions"] = regions
+            result["notes"].append(
+                "这个赛事下面按**赛区**分了子页面："
+                + "、".join(regions)
+                + "。上面给的是当前这一页的内容；用户问的是某个赛区的预选赛时，"
+                "把赛区名跟赛事名一起说（如「梦幻联赛 S30 中国区」）就能落到那个赛区页。"
+            )
+
         failed_subs: list[str] = []
         for sub in _usable_subpages(subs)[:max_subpages]:
             if sub.replace("_", " ") == page:
@@ -2027,8 +2955,24 @@ async def collect_tournament(
             "该赛事用瑞士轮，逐队名次由实时积分表给出（需要渲染页面），"
             "这里只能给到出线区间。"
         )
+    # 半骨架（有日期、对手未定）**不能**渲染成「- vs -」的假对阵，
+    # 但也不能一字不提 —— 「明天还有几场」本身就是赛程的一部分答案。
+    #
+    # ⚠️ 措辞必须说「**两个**对手都还没决出」，不能写「这一天没列进表里」：
+    # 实机（BLAST 中国区）同一天既有「待定 vs Yakult Brothers」这种**单边已定**
+    # 的行进了表（对手写「待定」），也有好几场两边都空的 —— 写「没列进上面的
+    # 赛程表」就和表里那一行当场打架。
+    pending = pending_match_dates(wikitext)
+    if pending:
+        result["pending_dates"] = pending
+        result["notes"].append(
+            "另有已排期、但**两个对手都还没决出**的场次，日期：" + "、".join(pending)
+            + "（同一天可能有别的场次已定了对手、列在上面的表里；这些不是没排期）。"
+        )
     if not matches:
-        result["notes"].append("该赛事页没有可直接解析的对阵表（尚未排期或对阵在渲染页里）。")
+        result["notes"].append(
+            "该赛事页没有可直接解析的对阵表（尚未排期，或对阵在渲染页 / 外部表格里）。"
+        )
 
     result.update(
         {
@@ -2038,6 +2982,7 @@ async def collect_tournament(
             "tables": tables,
             "swiss": swiss,
             "matches": matches,
+            "leagueid": str(info.get("leagueid") or "").strip(),
         }
     )
     return result
@@ -2314,6 +3259,236 @@ def od_pro_match_rows(rows: list[dict[str, Any]], *, limit: int = 20) -> list[di
                 "radiant": str(radiant).strip(),
                 "dire": str(dire).strip(),
                 "score": score,
+                "leagueid": row.get("leagueid"),
+                "match_id": row.get("match_id"),
             }
         )
+    return out
+
+
+# ======================================================================
+# 跨源拼装：赛事页的「赛程」+ 对局库的「结果」
+# ======================================================================
+#
+# 用户要的四件事里，「是哪个比赛的预选 / 有哪些队」在 Liquipedia，
+# 「赛程」Liquipedia 有（未开打就挂着），「结果」只有 OpenDota 有。
+# 下面这几个函数把两边拼成同一张表。
+
+
+def _pair_key(left: Any, right: Any) -> frozenset[str]:
+    """对阵的「无向键」：两边队名归一化后的集合（与左右顺序无关）。
+
+    用 :func:`_norm_loose` 而不是 :func:`_norm`：赛事页写 ``ZENITH (stack)``、
+    对局库写 ``ZENITH`` —— 不放宽的话同一场会被当成两行（页面那行没有比分、
+    库里那行又挂不上），表里就出现「同名两行、一行没比分」。实测见
+    :func:`_norm_loose` 的注释。
+    """
+    a, b = _norm_loose(str(left or "")), _norm_loose(str(right or ""))
+    if not a or not b or a == b:
+        return frozenset()
+    return frozenset((a, b))
+
+
+def _dates_close(left: Any, right: Any) -> bool:
+    """两个 ``YYYY-MM-DD`` 是否相差不超过一天（任一边不是日期时放行）。"""
+    try:
+        a = time.strptime(str(left), "%Y-%m-%d")
+        b = time.strptime(str(right), "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return True
+    return abs(time.mktime(a) - time.mktime(b)) <= 86400 * 1.5
+
+
+def merge_schedule(
+    matches: list[dict[str, Any]], results: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], int]:
+    """赛事页赛程 + OpenDota 结果 → **一张表**（按日期时间排序）。
+
+    合并键是「归一化后的队名集合」（与左右顺序无关）+ 日期（允许差一天 ——
+    两边的日期口径可能差一个时区）。
+
+    **比分以赛事页为准**（``{{Map}}`` 逐局 winner 数出来的，见
+    :func:`_series_from_maps`），赛事页那场没有比分时**才**用对局库兜底。
+    上一版是反过来的（对局库覆盖赛事页），在「赛事页自己就数得出」这件事
+    被发现之后就站不住了：wiki 更早（志愿者赛后立刻填）、还带 ``matchid``。
+
+    ``source`` 记着这一行的比分**从哪来**（``wiki`` / ``opendota``），
+    渲染层据此交代口径 —— 不标的话两种来源的时间口径不同（wiki 带页面时区、
+    对局库是插件本地时间）却长得一样。
+
+    返回 ``(行, 只出现在对局库里的结果数)``。后者必须如实交代：不交代的话
+    「表里 N 行」会被当成「这个赛事只有 N 场」。
+    """
+    rows: list[dict[str, Any]] = []
+    used: set[int] = set()
+    for m in matches or []:
+        # 赛事页的比分有两个来源：``score=``（弃权 FF/W）与 ``{{Map}}`` 数出来的。
+        # 两者不会同时出现（弃权场没有 Map），取先有的那个。
+        wiki_score = str(m.get("score") or m.get("map_score") or "")
+        row = {
+            "date": m.get("date") or "-",
+            "time": m.get("time") or "",
+            "tz": m.get("tz") or "",
+            "left": m.get("left") or "-",
+            "right": m.get("right") or "-",
+            "score": wiki_score,
+            "source": "wiki" if wiki_score else "",
+        }
+        key = _pair_key(row["left"], row["right"])
+        if key:
+            for i, r in enumerate(results or []):
+                if i in used or _pair_key(r.get("left"), r.get("right")) != key:
+                    continue
+                if not _dates_close(row["date"], r.get("date")):
+                    continue
+                # **wiki 优先。**赛事页已有比分就**不拿对局库覆盖**；只在
+                # 赛事页没有时才填上，并把来源记成 opendota。
+                if not row["score"] and r.get("score"):
+                    row["score"] = r.get("score")
+                    row["source"] = "opendota"
+                # 时刻仍然只在赛事页没写时才用对局库的（页面带时区，库里是本地时间）。
+                row["time"] = row["time"] or (r.get("time") or "")
+                row["date"] = row["date"] if row["date"] != "-" else (r.get("date") or "-")
+                # 匹配上就算「已用」—— 哪怕比分是 wiki 给的，这条对局库记录也已经
+                # 体现在表里了，不能再到 extra 里重复一遍。
+                used.add(i)
+                break
+        rows.append(row)
+    extra = 0
+    for i, r in enumerate(results or []):
+        if i in used:
+            continue
+        extra += 1
+        rows.append(
+            {
+                "date": r.get("date") or "-",
+                "time": r.get("time") or "",
+                "tz": "",
+                "left": r.get("left") or "-",
+                "right": r.get("right") or "-",
+                "score": r.get("score") or "",
+                # 赛事页没列这一场，比分只能来自对局库。
+                "source": "opendota",
+            }
+        )
+    rows.sort(key=lambda r: (str(r.get("date") or "9999"), str(r.get("time") or "99:99")))
+    return rows, extra
+
+
+def od_team_name_index(rows: list[dict[str, Any]]) -> dict[int, str]:
+    """``/proMatches`` 的行 → ``team_id → 队名``。
+
+    为什么需要它：``/leagues/{id}/matches`` **队名恒为 null**（实测 253 行里
+    非空的有 0 个），只有 ``team_id``；而 ``/proMatches`` 的行两样都带 ——
+    「队名」只能从这里换回来。
+    """
+    out: dict[int, str] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        for side in ("radiant", "dire"):
+            tid = row.get(f"{side}_team_id")
+            name = str(row.get(f"{side}_name") or "").strip()
+            if tid is None or not name:
+                continue
+            try:
+                key = int(tid)
+            except (TypeError, ValueError):
+                continue
+            out.setdefault(key, name)
+    return out
+
+
+def od_league_series(
+    matches: list[dict[str, Any]],
+    *,
+    team_ids: dict[int, str] | None = None,
+    team_names: set[str] | None = None,
+    since: float = 0.0,
+    until: float = 0.0,
+) -> list[dict[str, Any]]:
+    """``/leagues/{id}/matches`` → **按 series 归并**的「赛程 + 比分」。
+
+    三个实测的坑（报告 §7 方案 C）：
+
+    * 队名恒为 ``null``，只能用 ``team_id`` 去 :func:`od_team_name_index` 换；
+    * 同一个 ``leagueid`` 覆盖**全部赛区**（``DreamLeague Season 30 Qualifiers``
+      是 SEA / 中国 / 东欧 … 合体），要用赛事页给出的参赛队名单求交集才能切出
+      这一块 —— **切不出来就一条都不给**，绝不把别的赛区的对局当成它的；
+
+    切分用的是 :func:`_norm_loose`（丢掉 ``ZENITH (stack)`` 这类括号注释）而不是
+    严格归一化：实测严格档会把该队整个漏掉（8 场 → 15 场，见 :func:`_norm_loose`）。
+    判定口径是「**两支队都在名单里**」而不是「至少一支在」—— 后者会把
+    ``10-12 Imperial Power vs Crescent`` 这种界外的对局也捞进来（实测差 1 场，
+    那场在赛事 sdate 之前，只因为给了 ±1 天窗口才落进范围）。
+    * 库里只有**打完并且被收录**的对局（实测滞后约 2.4 小时），所以这条路径
+      天然只能补「结果」，补不了「尚未开打的赛程」。
+
+    按 ``series_id`` 归并的理由：一个 Bo3 在库里是 3 行，平铺出来「赛程」会变成
+    三倍长且看不出谁赢了哪一场；归并后一局系列赛一行、比分是**局分**。
+    """
+    ids = dict(team_ids or {})
+    names = {_norm_loose(n) for n in (team_names or set()) if _norm_loose(n)}
+    groups: dict[Any, list[dict[str, Any]]] = {}
+    for row in matches or []:
+        if not isinstance(row, dict):
+            continue
+        ts = row.get("start_time")
+        if isinstance(ts, (int, float)) and ts > 0:
+            if since and ts < since - 86400:
+                continue
+            if until and ts > until + 86400:
+                continue
+        try:
+            r_id = int(row.get("radiant_team_id") or 0)
+            d_id = int(row.get("dire_team_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        left, right = ids.get(r_id, ""), ids.get(d_id, "")
+        if not (left and right):
+            # 队名换不出来的行一律丢 —— 宁缺毋滥，绝不拿 id 当队名渲染。
+            continue
+        if names and not {_norm_loose(left), _norm_loose(right)} <= names:
+            continue
+        groups.setdefault(row.get("series_id") or row.get("match_id"), []).append(row)
+
+    out: list[dict[str, Any]] = []
+    for games in groups.values():
+        first = games[0]
+        try:
+            r_id = int(first.get("radiant_team_id") or 0)
+            d_id = int(first.get("dire_team_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        wins: dict[int, int] = {}
+        for game in games:
+            # ⚠️ 不能只在 ``radiant_win`` 为真时记一局 —— 天辉输了的那局，
+            # 赢的是**夜魇**，整条跳过等于把这一局的胜利凭空抹掉（实测：一个
+            # 1-1 的 Bo2 会被渲染成 1-0）。谁赢就把分记给谁。
+            try:
+                rid = int(game.get("radiant_team_id") or 0)
+                did = int(game.get("dire_team_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            winner = rid if bool(game.get("radiant_win")) else did
+            if winner:
+                wins[winner] = wins.get(winner, 0) + 1
+        stamps = [float(g.get("start_time") or 0) for g in games]
+        ts = min(stamps) if stamps else 0.0
+        when = (
+            time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts > 0 else ""
+        )
+        date, _, clock = when.partition(" ")
+        out.append(
+            {
+                "date": date or "-",
+                "time": clock,
+                "left": ids.get(r_id, ""),
+                "right": ids.get(d_id, ""),
+                "score": f"{wins.get(r_id, 0)}-{wins.get(d_id, 0)}",
+                "games": len(games),
+                "ts": ts,
+            }
+        )
+    out.sort(key=lambda r: r.get("ts") or 0)
     return out

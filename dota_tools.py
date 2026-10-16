@@ -83,7 +83,10 @@ MAX_OUTPUT_CHARS = 2000
 #: 而绝大多数工具的输出远用不到 2000。渲染顺序也配合做了调整（见
 #: :func:`dota_esports.format_tournament`：参赛队伍放最后）。
 _OUTPUT_LIMITS: dict[str, int] = {
-    "query_tournament": 2600,
+    # 3200（原 2600）：2026-10-16 加「赛程 + 比分」表格后，一场 8 队 24 行的赛事
+    # 光表就 ~900 字，2600 会把「参赛队 / 名次」整块挤掉 —— 而那几块正是用户
+    # 要判断的东西。只抬这一个工具，不抬 MAX_OUTPUT_CHARS（那是全局成本）。
+    "query_tournament": 3200,
     "query_esports_team": 2400,
     "query_transfers": 2200,
 }
@@ -281,8 +284,12 @@ _TOURNAMENT_PROP = {
     "type": "string",
     "description": (
         "赛事名，照用户原话填（中文 / 缩写 / 英文都行，如「TI 2026」「利雅得大师赛」"
-        "「梦幻联赛」「The International 2025」）。**不要自己翻译或补全**成你以为的英文名，"
-        "工具内部有对照表。用户没提具体赛事（只问「最近有什么职业比赛」）时留空。"
+        "「梦幻联赛s30」「BLAST SLAM IX 中国区」）。**不要自己翻译或补全**成你以为的英文名，"
+        "工具内部有对照表，也认赛季号（s30 / 第 30 赛季）与赛区词（中国区 / 东南亚 / 东欧…）。"
+        "用户问「今天 / 现在 / 接下来有什么比赛」或「最近有什么职业比赛」而说不出赛事名时"
+        "**留空** —— 那条路会列出当天全部赛事的日程（**含还没开打的**）。"
+        "用户只说了赛区而没说赛事（「那个中国区预选赛」）时填赛区词（「中国区」），"
+        "工具会按该赛区给出当天的赛程。"
     ),
 }
 
@@ -441,18 +448,35 @@ def build_tool_specs(*, include_write: bool = True) -> list[dict]:
             "query_tournament",
             "查**职业赛事**信息：赛事状态（未开始 / 进行中 / 已结束）与日期、级别、主办、"
             "线下线上、奖池、参赛队伍（含各队阵容）、名次与奖金分配、小组积分榜与出线形势、"
-            "赛程对阵。问「TI 什么时候打」「XX 赛事谁参加了」「最后谁夺冠 / 前三名是谁」"
-            "「积分榜怎么样」「XX 队出线形势」「接下来有哪些比赛」时用。"
-            "**不填赛事名**时会返回近期职业比赛一览（最近结束的职业对局），"
-            "适合回答「最近有什么职业比赛」。\n"
-            "**四条边界**：① 数据来自社区维护的 Dota2 赛事 wiki（Liquipedia），"
+            "**赛程与结果（日期 + 时刻 + 对阵 + 比分，一张表）**；"
+            "**不填赛事名时给「今天 / 接下来有什么比赛」（跨赛事的日程表，含还没开打的）**。"
+            "问「TI 什么时候打」「XX 赛事谁参加了」「最后谁夺冠 / 前三名是谁」"
+            "「积分榜怎么样」「XX 队出线形势」「接下来有哪些比赛」「今天几点打」"
+            "「今天有什么比赛」「现在在打什么」时用。\n"
+            "**赛事名照用户原话填**，可以带赛季与赛区，工具内部会翻成页面名："
+            "赛季写法 ``梦幻联赛s30`` / ``BLAST SLAM IX`` 都认；"
+            "赛区写法 ``中国区`` / ``东南亚`` / ``东欧`` / ``南美`` / ``西欧`` 都认"
+            "（预选赛常常按赛区分页，带上赛区才落得到那一页）。\n"
+            "**用户问「今天 / 现在 / 接下来有什么比赛」而说不出赛事名时，`query` 留空**"
+            "—— 那条路按 Liquipedia 的日程列出当天**全部**赛事（含还没开打的），"
+            "**不要自己猜一个赛事名去试**（猜错的代价是答非所问）。"
+            "用户顺带说了赛区（「今天在打的那个中国区预选」）就把赛区词填进 `query`"
+            "（``中国区``），工具会按赛区筛出当天的赛程。\n"
+            "**五条边界**：① 数据来自社区维护的 Dota2 赛事 wiki（Liquipedia），"
             "**不是官方**，且**限流很紧**（同一时间只能查一个赛事）；查不到就如实说没取到，"
             "**不要用记忆里的赛果替它作答**；② **不要编比分 / 不要编名次** —— "
             "工具没给的名次与比分一律说没有；「名次与奖金分配」那一块是**按名次区间划分的"
             "奖金档位，不指名战队**，别把某一档说成「某队拿了第几」；"
-            "③ 「某队能否出线」只能基于**积分榜上该队的位置"
-            "与赛事定义的晋级区**来判断，问的是**形势**而不是保证，别下结论式断言；"
-            "④ 未开赛的赛事常常还没有排期，此时如实说「对阵尚未排出」。",
+            "③ 赛程表里比分那一列是 ``-`` 时，意思是**还没打完 / 两边都还没记**，"
+            "**不是 0 分、也不是输了**；赛程与比分**都以赛事页为准**"
+            "（页面未开打就挂着赛程，打完则逐局记下胜负）——"
+            "只有当赛事页那一场还没记结果时，才用对局库补上，此时该行没有时区、"
+            "时刻是插件本地时间；"
+            "④ 「某队能否出线」只能基于**积分榜上该队的位置与赛事定义的晋级区**来判断，"
+            "问的是**形势**而不是保证，别下结论式断言；"
+            "⑤ 未开赛的赛事常常还没有排期，此时如实说「对阵尚未排出」；"
+            "对阵表里某一方写着 ``待定``，意思是**那一方等前一场决出**（另一方是确定的），"
+            "照实转述，**不要**把它当成「对手叫待定」或「这场没对手」。",
             {"query": _TOURNAMENT_PROP},
             [],
         ),
@@ -1482,27 +1506,204 @@ async def _safe_data(coro: Awaitable[Any], ctx: ToolContext) -> tuple[Any, str]:
 
 
 
+#: ``/proMatches`` 最多往回翻几页（每页约 100 场）来建「队 ID → 队名」对照。
+#:
+#: 为什么要翻页：``/leagues/{id}/matches`` **队名恒为 null**，只有 team_id；
+#: 而 ``/proMatches`` 的行两样都带。实测一页约覆盖两个月，翻到赛事开始日期
+#: 通常 1~2 页就够；6 页是硬上限（防止查一个远古赛事时把预算烧光）。
+MAX_PRO_MATCH_PAGES = 6
+
+
+async def _league_team_names(
+    ctx: "ToolContext", needed: set[int], since_ts: float
+) -> tuple[dict[int, str], str]:
+    """``/proMatches`` 翻页建 ``team_id → 队名``；返回 ``(映射, 说明)``。
+
+    停止条件有三个，命中任一即停：**需要的 ID 全齐了** / 已经翻回赛事开始日期
+    之前 / 撞到页数上限。第一个条件是为了**少发请求** —— 一场赛事的参赛队只有
+    个位数，通常第一页就齐了。
+    """
+    names: dict[int, str] = {}
+    cursor: int | None = None
+    pages = 0
+    note = ""
+    while pages < MAX_PRO_MATCH_PAGES:
+        rows, why = await _safe_data(
+            ctx.api.get_pro_matches(limit=100, before_match_id=cursor), ctx
+        )
+        if not isinstance(rows, list) or not rows:
+            note = why or ""
+            break
+        pages += 1
+        for team_id, name in dota_esports.od_team_name_index(rows).items():
+            names.setdefault(team_id, name)
+        if needed and needed <= set(names):
+            break
+        stamps = [r.get("start_time") for r in rows if isinstance(r.get("start_time"), (int, float))]
+        earliest = min(stamps) if stamps else 0
+        if since_ts and earliest and earliest < since_ts - 3 * 86400:
+            break
+        try:
+            cursor = min(int(r["match_id"]) for r in rows if r.get("match_id"))
+        except (TypeError, ValueError, KeyError):
+            break
+    return names, note
+
+
+async def _tournament_results(
+    ctx: "ToolContext", data: dict
+) -> tuple[list[dict], list[str]]:
+    """从对局库给这个赛事**兜底**，返回 ``(结果行, 说明)``。
+
+    赛程与比分**以赛事页为准** —— 页面自己就逐局记着胜负（见
+    :func:`dota_esports._series_from_maps`）。这里只解决两种缺口：赛事页**还没记**
+    结果的那几场，以及赛事页**压根没列**出的对局（后者由 :func:`merge_schedule`
+    单独计数交代）。:func:`merge_schedule` 保证已经给出的比分不会被这里覆盖。
+
+    两步（报告 §7 方案 C 实测可行的那条路）：
+
+    1. ``/leagues/{league_id}/matches`` 一次拿全部对局；
+    2. 用赛事页给出的**参赛队名单**求交集切出这个赛区的那些对局 —— 因为同一个
+       ``leagueid`` 会把多个赛区合在一起（``DreamLeague Season 30 Qualifiers``
+       就是 SEA / 中国 / 东欧 … 合体）。
+
+    **切不出来就不给结果**，绝不把别的赛区的对局当成这个赛事的；这一点宁可
+    说「对不上」也不能猜 —— 猜出来的比分会被模型当成事实讲给用户。
+    """
+    league_id = str(data.get("leagueid") or "").strip()
+    if not league_id:
+        return [], [
+            "这个赛事页里没有 OpenDota 的联赛编号，**比分 / 结果**这一块取不到"
+            "（上面的赛程是社区 wiki 的排期，照常可用）。"
+        ]
+    rows, why = await _safe_data(ctx.api.get_league_matches(int(league_id)), ctx)
+    if not isinstance(rows, list) or not rows:
+        return [], [f"OpenDota 那边这个联赛的对局没取到（{why or '空结果'}）。"]
+
+    info = data.get("info") or {}
+    since = dota_esports.date_to_ts(dota_esports.parse_date(str(info.get("sdate") or "")))
+    until = dota_esports.date_to_ts(dota_esports.parse_date(str(info.get("edate") or "")))
+    team_names = {
+        str(t.get("name") or "").strip()
+        for t in (data.get("teams") or [])
+        if str(t.get("name") or "").strip()
+    }
+    needed: set[int] = set()
+    for row in rows:
+        stamp = row.get("start_time")
+        if since and isinstance(stamp, (int, float)) and stamp < since - 86400:
+            continue
+        if until and isinstance(stamp, (int, float)) and stamp > until + 86400:
+            continue
+        for side in ("radiant", "dire"):
+            try:
+                needed.add(int(row.get(f"{side}_team_id") or 0))
+            except (TypeError, ValueError):
+                continue
+    needed.discard(0)
+    team_ids, _page_note = await _league_team_names(ctx, needed, since)
+
+    series = dota_esports.od_league_series(
+        rows, team_ids=team_ids, team_names=team_names, since=since, until=until
+    )
+    if series:
+        return series, []
+    if not team_names:
+        return [], [
+            "赛事页没有参赛队名单，切不出这个赛区的对局 —— **不给比分**，"
+            "免得把同一个联赛里别的赛区的比赛算到这里。"
+        ]
+    return [], [
+        f"联赛里共 {len(rows)} 场，但没有一场能同时对上本赛事的参赛队名单 ——"
+        "可能还没开打、也可能是 OpenDota 把多个赛区合在一个联赛名下切不开；"
+        "**这里不给比分**，赛程以赛事页为准。"
+    ]
+
+
+#: 「今天 / 接下来」赛程末尾的引导句。
+_SCHEDULE_TAIL = (
+    "\n> 想看某个赛事的**完整赛程与比分**，直接说赛事名"
+    "（如「BLAST SLAM IX 中国区」）。"
+)
+
+
+async def _today_schedule(ctx: "ToolContext", *, region: str = "", days: int = 2) -> str:
+    """「今天 / 接下来有什么比赛」—— Liquipedia 的**日程池**，跨赛事。
+
+    这条路**默认不走 OpenDota**。``/proMatches`` 是**结果池**（滞后约 2.4 小时、
+    只有已结束的对局），结构上答不了「正在打 / 还没打」这件事：2026-10-16 真机，
+    用户问「今天正在打的中国区预选赛」，模型连问两轮拿到的都是东南亚 / 西欧的
+    **已结束**对局，一场中国区都没有 —— 于是开始猜赛事名，三次全错。
+    Liquipedia 的赛事页则把**没开打**的比赛也挂着，``insource`` 搜索还能一次
+    列出当天的全部赛事页（实测 6 页，含用户问的 BLAST 中国区）。
+
+    降级是**明示的**：只有 Liquipedia 一条都没给出时才退回结果池 —— 不是为凑数，
+    是让用户知道「今天确实有比赛，只是都打完了」（口径由结果池自己写出来）。
+    """
+    if ctx.esports is None:
+        return _ESPORTS_OFF
+    data, note = await _esports_guard(
+        dota_esports.collect_daily_schedule(ctx.esports, days=days, region=region),
+        ctx, tool="query_tournament",
+    )
+    data = data if isinstance(data, dict) else {}
+    notes: list[str] = [str(n) for n in (data.get("notes") or []) if n]
+    if note:
+        notes.append(note)
+    data["notes"] = notes
+    if data.get("events"):
+        return dota_esports.format_daily_schedule(data) + _SCHEDULE_TAIL
+    if region or note:
+        # ① 用户点名了赛区 ② 数据源本身有问题 —— 都不拿结果池搪塞
+        return dota_esports.format_daily_schedule(data)
+    # ③ Liquipedia 没搜到排期：明示降级到「已收录（已打完）的战果」
+    return await _recent_pro_matches(ctx)
+
+
+async def _recent_pro_matches(ctx: "ToolContext") -> str:
+    """**降级路径**：Liquipedia 没给出排期时，退回「已收录（= 已打完）的战果」。
+
+    这条路是 OpenDota 的**结果池**（滞后约 2.4 小时、只有已结束的对局），
+    所以**只能**由 :func:`_today_schedule` 在明知今日无排期时调用 —— 它长得像
+    「今天有什么比赛」的标准答案，不标注口径，模型就会把「今天没别的比赛了」
+    当成事实讲给用户（报告方案 B-10）。
+    """
+    rows, note = await _safe_data(ctx.api.get_pro_matches(limit=200), ctx)
+    if note and ctx.esports is None:
+        return _ESPORTS_OFF
+    rendered = dota_esports.format_pro_matches(
+        dota_esports.od_pro_match_rows(rows if isinstance(rows, list) else [], limit=12)
+    )
+    if not rows:
+        rendered += f"\n> {note or '近期职业比赛没取到。'}"
+    rendered += (
+        "\n> Liquipedia 上没搜到今天/明天的排期，上面这些是 OpenDota 里"
+        "**已经打完**的对局。想知道某个赛事的赛程 / 名次 / 积分榜，说赛事名即可"
+        "（如「TI 2026」「梦幻联赛 S30 中国区」）。"
+    )
+    return rendered
+
+
 async def _tool_query_tournament(args: dict, ctx: ToolContext) -> str:
     """赛事信息：不填赛事名时退回「近期职业比赛一览」。"""
     query = str(args.get("query") or "").strip()
 
-    # ① 没给赛事名 —— 用 OpenDota 的近期职业比赛顶上（这块不依赖 Liquipedia）
+    # ① 没给赛事名 —— 「今天 / 接下来有什么比赛」（Liquipedia 日程池，跨赛事）
     if not query:
-        rows, note = await _safe_data(ctx.api.get_pro_matches(limit=40), ctx)
-        if note and ctx.esports is None:
-            return _ESPORTS_OFF
-        rendered = dota_esports.format_pro_matches(
-            dota_esports.od_pro_match_rows(rows if isinstance(rows, list) else [], limit=12)
-        )
-        if not rows:
-            rendered += f"\n> {note or '近期职业比赛没取到。'}"
-        rendered += (
-            "\n> 这是最近结束的职业对局。想知道某个赛事的赛程 / 名次 / 积分榜，"
-            "说赛事名即可（如「TI 2026」）。"
-        )
-        return rendered
+        return await _today_schedule(ctx)
 
-    # ② 指定赛事
+    # ② 只给了赛区、没有赛事基干（「那个中国区预选赛」）——
+    #    不再干巴巴地反问，直接按赛区给出**今天的赛程**（用户要的就是这个）
+    base, _year, _season, region = dota_esports.tournament_parts(query)
+    if not base:
+        if region:
+            return await _today_schedule(ctx, region=region, days=1)
+        return (
+            "需要先知道是哪个赛事。给个赛事名（「TI 2026」「BLAST Slam 9 中国区」），"
+            "或者说个赛区（「中国区」）我按今天的赛程找。"
+        )
+
+    # ③ 指定赛事
     if ctx.esports is None:
         return _ESPORTS_OFF
     data, note = await _esports_guard(
@@ -1516,6 +1717,11 @@ async def _tool_query_tournament(args: dict, ctx: ToolContext) -> str:
         head = f"没查到赛事「{query}」的页面。"
         return "\n".join([head] + [f"> {n}" for n in notes])
 
+    # ④ 用对局库兜底：赛事页**自己就逐局记着胜负**（比分以它为准），
+    #    只有它还没记的那几场、以及赛事页压根没列的对局，才从这里补。
+    results, extra_notes = await _tournament_results(ctx, data)
+    notes.extend(extra_notes)
+
     return dota_esports.format_tournament(
         query=query,
         page=str(data.get("page") or ""),
@@ -1525,6 +1731,7 @@ async def _tool_query_tournament(args: dict, ctx: ToolContext) -> str:
         tables=data.get("tables") or [],
         swiss=data.get("swiss") or {},
         matches=data.get("matches") or [],
+        results=results,
         notes=notes,
     )
 
@@ -2114,8 +2321,29 @@ TOOL_GUIDE = """=== 你可以调用工具查数据、也可以调用工具改设
   讲给用户的，一律不讲；用户追问「要等多久」，就答「说不好，得那边解封才行」。
 - **不要编比分、不要编名次、不要编转会。**工具没给出的具体数字一律说「没取到」。
   名单里没有某个选手，只能说「这份列表里没有他的记录」，**不要说成「他没转会」**。
+- **赛程表**是「日期 | 时间 | 对阵 | 比分/结果」四列，这是回答「打了几场 / 几点打 /
+  谁赢了」的唯一依据：
+  · 比分那一列是 ``-`` 时，意思是**还没打完或还没被 OpenDota 收录** ——
+    **不是 0 分、不是「输了」、也不是「没这个比赛」**；
+  · 谁赢只看比分的前后（先写的是一方的局分），**不要**按队名或印象反推；
+  · 时刻后面带 ``CST`` / ``CEST`` 这类缩写时，那是**页面标注的时区**（工具会给出
+    中文释义），不是用户本地时间；没标的行来自 OpenDota，是本地时间。用户说
+    「怎么是中午」这类对不上时间的话时，先说明时区口径，**不要**改口成别的时间。
+- **赛事名要带上赛季与赛区。**预选赛常常按赛区单独一页（「梦幻联赛 S30 中国区」），
+  只说系列名（「梦幻联赛」）时工具会按**最新一届**解析并把这件事写出来；
+  用户要的若是别的届次或别的赛区，让他补上（「梦幻联赛 S30 中国区」）。
+- **「今天 / 现在 / 接下来有什么比赛」走 `query_tournament` 留空 `query` 那条路。**
+  它按 Liquipedia 的**日程**列出当天**全部**赛事，**含还没开打的**（时刻、对阵、
+  时区都有）—— 这正是「正在打什么」「今天几点打」的答案，别再答「查不到」。
+  用户顺带说了赛区（「今天在打的那个中国区预选」）就把赛区词填进 `query`
+  （「中国区」），工具按该赛区筛当天的赛程。
+  **说不出赛事名时不要自己猜一个去试**（真机记录：模型猜了 BetBoom / ESL One /
+  TI 2026，三次全错）—— 空 `query` 或赛区词就是为这个问题准备的入口。
+  只有 Liquipedia 一条排期都没有时，工具才退回 OpenDota 的**已结束**对局，
+  并自己写明口径 —— 那时照实转述「这些是已经打完的」。
 - 赛事名/队名**照用户原话填**，不要自己翻译或补全（内部有中文对照表与搜索）。
-  用户只问「最近有什么职业比赛」而没提具体赛事时，`query_tournament` **留空 query**。
+- 对阵表里某一方写着 `待定`，说的是**那一方等前一场决出**（另一方已确定）——
+  照实转述，**不要**讲成「这场没有对手」，也不要自己补一个队名进去。
 - 「**某队能否出线**」问的是**形势**：只能基于积分榜上该队的位置与赛事定义的晋级区
   来说明（在晋级区 / 在淘汰区 / 边缘），**不要**下断言式的保证，也不要把
   「晋级区」讲成「已经出线」。
