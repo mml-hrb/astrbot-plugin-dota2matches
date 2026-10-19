@@ -1027,6 +1027,7 @@ class Dota2Plugin(Star):
         focus_ids: list[int],
         focus_names: dict[int, str],
         platform: str = "",
+        owner: asyncio.Task | None = None,
     ) -> str:
         """``_start_parse_task`` 的核心部分（不依赖 event，供工具路径复用）。
 
@@ -1035,12 +1036,23 @@ class Dota2Plugin(Star):
         路径共用它，而不是在工具侧再写一份（两套等的节拍迟早会不一致）。
 
         Returns:
-            三态字符串（P1-10，2026-10-14 审查）：
+            四态字符串（P1-10，2026-10-14 审查）：
 
             * ``"started"`` —— 已排入，正常等待。
+            * ``"inline"`` —— **调用者自己就是那个等待任务**（见 ``owner``），
+              不要再嵌套一层；由调用者直接 ``await _parse_and_analyze``。
             * ``"duplicate"`` —— **同一场比赛已经有等待任务在跑**。
             * ``"saturated"`` —— 全局等待任务数已达 :data:`MAX_PARSE_TASKS`。
             * ``"error"`` —— 没有运行中的事件循环等内部错误。
+
+        Args:
+            owner: 调用者自己的 ``asyncio.Task``（工具路径会传）。
+                ``_nlu_trigger_async`` 先把外层任务登记进 ``_parse_tasks``
+                再调这里，所以按 key 查到的 ``existing`` **就是调用者本人**。
+                不把它认出来，就会自己撞自己 —— 返回 ``"duplicate"``，
+                调用方发一句「已经在等待解析了」就退出，**从头到尾没有提交过
+                解析申请**（v2.8.2 起自然语言复盘未解析的局全废，
+                2026-10-19 比赛 9047564208 实机暴露）。
 
         ⚠️ 为什么必须区分（原来只返回 ``bool``）：两种失败被合并成一个 ``False``，
         调用方（指令路径 ``d2_match``、工具路径 ``_nlu_trigger_async``）一律按
@@ -1055,18 +1067,33 @@ class Dota2Plugin(Star):
         key = self._parse_task_key(umo, match_id, uid)
 
         existing = self._parse_tasks.get(key)
-        if existing is not None and not existing.done():
+        # 槽位是不是**调用者自己**占着的？工具路径会先把外层任务登记进来，
+        # 所以这里的 existing 很可能就是 owner 本人（不能算「别人在跑」）。
+        owns_slot = owner is not None and existing is owner
+        if existing is not None and not existing.done() and not owns_slot:
             logger.info(
                 f"[dota2] 比赛 {match_id} 已有等待任务在跑（{umo}），"
                 "本次不再重复排入"
             )
             return "duplicate"
-        if len(self._parse_tasks) >= MAX_PARSE_TASKS:
+        # 上限要减掉「自己占的那个位」，否则工具路径永远觉得自己是第 N+1 个
+        taken = len(self._parse_tasks) - (1 if owns_slot else 0)
+        if taken >= MAX_PARSE_TASKS:
             logger.warning(
                 f"[dota2] 等待解析的任务已达上限（{MAX_PARSE_TASKS}），"
                 f"拒绝 {match_id} 的等待请求"
             )
             return "saturated"
+
+        if owns_slot:
+            # 槽位已经由调用者占住，而它自己就是要跑等待流水线的那个任务：
+            # **不能再嵌套一层** —— 新任务会覆盖登记表，而外层任务结束时
+            # 的 done_callback 又会把这个新任务的登记一起 pop 掉，
+            # 于是「谁在等」彻底失准（terminate 也取消不到它）。
+            logger.info(
+                f"[dota2] 比赛 {match_id} 由当前任务直接等待解析（不嵌套），{umo}"
+            )
+            return "inline"
 
         try:
             loop = asyncio.get_running_loop()
@@ -3078,8 +3105,14 @@ class Dota2Plugin(Star):
                 match_id=match_id,
                 focus_ids=focus_ids,
                 focus_names=focus_names,
+                # 本任务已经被 `_nlu_trigger_async` 登记进 `_parse_tasks` 了，
+                # 传进去让 `_spawn_parse_task` 认出「占着槽位的是我自己」。
+                # 不传就会自己撞自己：返回 duplicate → 只发一句
+                # 「已经在等待解析了」→ 整条流水线根本没启动过
+                # （v2.8.2 起自然语言复盘未解析的局全废，2026-10-19 实机暴露）。
+                owner=asyncio.current_task(),
             )
-            if spawn == "started":
+            if spawn in ("started", "inline"):
                 options = self._parse_wait_options()
                 minutes = max(1, round(int(options["timeout"]) / 60))
                 fallback_hint = (
@@ -3095,6 +3128,16 @@ class Dota2Plugin(Star):
                     f"开始等待（最多 {minutes} 分钟，{fallback_hint}）。\n"
                     "报告出来后会自动发到本会话，可以先忙别的。",
                 )
+                if spawn == "inline":
+                    # 本任务就是那个等待任务：原地等，等完直接出报告并推送。
+                    # 走 `_parse_and_analyze` 而不是另写一份，节拍与指令路径完全一致。
+                    await self._parse_and_analyze(
+                        umo=umo,
+                        uid=uid,
+                        match_id=int(match_id),
+                        focus_ids=[int(i) for i in focus_ids],
+                        focus_names={int(k): str(v) for k, v in focus_names.items()},
+                    )
                 return
             if spawn == "duplicate":
                 # 同 P1-10：重复请求**不能**走下面那条降级路径 ——
