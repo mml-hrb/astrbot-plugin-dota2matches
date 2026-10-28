@@ -43,6 +43,7 @@ try:  # 插件目录被作为包加载时的相对导入
         dota_nlu,
         dota_parse,
         dota_pool,
+        dota_router,
         dota_schedule,
         dota_tools,
         dota_zh,
@@ -101,6 +102,7 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
     import dota_nlu  # type: ignore[no-redef]
     import dota_parse  # type: ignore[no-redef]
     import dota_pool  # type: ignore[no-redef]
+    import dota_router  # type: ignore[no-redef]
     import dota_schedule  # type: ignore[no-redef]
     import dota_tools  # type: ignore[no-redef]
     import dota_zh  # type: ignore[no-redef]
@@ -415,6 +417,17 @@ class NluGate(NamedTuple):
     #: （引用为什么算点名、怎么判，见 :func:`_extract_quote` 与
     #: :meth:`_nlu_should_handle`。）
     addressed: bool = False
+    #: 是否还要过一次**话题归属判定**才能决定接不接（``nlu_topic_router`` 开启时）。
+    #:
+    #: 为什么把判定拆到闸门外面：判定要调模型（约 0.5 秒），而闸门是同步的、
+    #: 被多处直接调用与测试。让闸门只回答「这条消息**够格**参与判定吗」，
+    #: 真正的模型调用放在 :meth:`_nlu_topic_is_mine` 里由入口 await ——
+    #: 闸门的签名与既有行为都不用动。
+    #:
+    #: 为真时 ``addressed`` 还没定，调用方必须先 await 判定，再把结果当作
+    #: 「是否点名」。判成「不是我的」就直接放行，**不要**记历史（否则群聊
+    #: 闲聊会污染会话语境，那是 P1-11 修过的问题）。
+    topic_pending: bool = False
 
 
 #: 配置中未填写系统提示词时的兜底内容。
@@ -914,7 +927,12 @@ class Dota2Plugin(Star):
         #: 由插件实例持有、跨会话复用；里面只放**纯数据**，快照对象每次新建
         #: —— 同一个账号在 A 群是「本人」、在 B 群是「被监听」，
         #: 直接把快照对象缓存起来会让两个会话互相污染。
-        self._chat_cache: dict[tuple[int, int], tuple[float, list[dict]]] = {}
+        #: 闲聊 / 工具共用的战绩缓存。键在**无筛选**时是 ``(account_id, limit)``
+        #: （与 :func:`dota_chat.collect_chat_context` 一致，两边才能互相复用）；
+        #: 带筛选时多一段筛选指纹 ``(account_id, limit, "hero_id=96|win=1")``。
+        #: 不分开的话，「所有英雄」的缓存会把「只看斧王」的查询顶掉 —— 用户拿到
+        #: 一份看起来正常、实际是全英雄的成绩。
+        self._chat_cache: dict[tuple, tuple[float, list[dict]]] = {}
         #: 正在等待解析的后台任务：``{(umo, match_id, sender_id): task}``
         #: 等待解析最长要十分钟，绝不能把 handler 挂在那里——AstrBot 的流水线
         #: 是洋葱模型，handler 每 yield 一次后续阶段就整体跑一遍。改为后台
@@ -2239,6 +2257,41 @@ class Dota2Plugin(Star):
         text = str(raw or "").strip()
         return text or NLU_DEFAULT_KEYWORD
 
+    def _wake_prefixes(self) -> tuple[str, ...]:
+        """全局唤醒前缀（AstrBot ``wake_prefix``，默认 ``/``）。"""
+        try:
+            raw = self.context.get_config().get("wake_prefix") or ["/"]
+        except Exception:  # noqa: BLE001
+            return ("/",)
+        if isinstance(raw, str):
+            raw = [raw]
+        prefixes = tuple(str(p) for p in raw if p)
+        return prefixes or ("/",)
+
+    def _nlu_is_command(self, event: AstrMessageEvent, text: str) -> bool:
+        """这条消息是不是「指令」，应当整个让给命令 handler。
+
+        ``text`` 自带前缀的那种好认（:data:`NLU_SKIP_PREFIXES`），难认的是
+        **前缀已经被框架剥掉的那种**：``waking_check/stage.py`` 在命中
+        ``wake_prefix``（默认 ``/``）时会把前缀从 ``event.message_str`` 里切掉，
+        于是插件看到的只有「帮助」——``NLU_SKIP_PREFIXES`` 里的 ``/``
+        对这类消息**永远命中不了**。
+
+        2026-10-23 实机踩到：群里发 ``/帮助``，剥成「帮助」后被当成自然语言
+        送进话题判定，白等 3 秒超时，用户看到的就是「指令被新逻辑拦住了」。
+
+        原始文本还在 ``event.message_obj.message_str`` 里，用它认。拿不到
+        （或压根没被剥过）就当「不是指令」按原路走 —— 反过来会把私聊里
+        的自然语言整条丢掉，那是更糟的失败方向。
+        """
+        if text.startswith(NLU_SKIP_PREFIXES):
+            return True
+        raw = str(getattr(getattr(event, "message_obj", None), "message_str", "") or "")
+        raw = raw.lstrip()
+        if not raw or raw == text:
+            return False
+        return raw.startswith(self._wake_prefixes())
+
     # ------------------------------------------------------------------
     # 会话语境（供「这一盘」这类指代消歧）
     # ------------------------------------------------------------------
@@ -2480,6 +2533,26 @@ class Dota2Plugin(Star):
         任一个就不再重复要求 @，避免双重门槛。反过来，只有 @ 而没点名的
         消息会被第 3 步挡掉。
 
+        **话题路由模式（``nlu_topic_router=true``）会重写第 3、4 步**，目的是
+        「私聊不用打唤醒词，群聊仍然只回 @ 的消息」：
+
+        ====================  ==========================  ==========
+        场景                  处理                        成本
+        ====================  ==========================  ==========
+        唤醒词 / 引用          直接接，不判定              0
+        群聊、没 @、没引用      直接放行                    0
+        群聊、@ 了             过话题判定                  ~190 tok
+        私聊                   过话题判定                  ~190 tok
+        ====================  ==========================  ==========
+
+        群聊那一行是「0 成本」不是「顺手省的」：``event_message_type(ALL)``
+        的 filter 只看消息类型不看唤醒，所以**群友的每条闲聊都会进到这里**。
+        不先挡住，每条群消息都要花一次模型判定。
+
+        判定本身**不在这里做**（这里要异步调模型，而本方法被多处同步调用与
+        测试直接调用）。这里只返回 ``topic_pending=True``，由入口
+        :meth:`d2_natural` await :meth:`_nlu_topic_is_mine`。
+
         引用为什么算点名：用户对着一份简报按「回复」再说话，本身就是把话
         说给插件听，而且那份简报里的比赛 ID / 焦点玩家正是他要用的东西。
         框架层那句「回复机器人即视为唤醒」只认 ``Reply.sender_id``，而
@@ -2494,6 +2567,11 @@ class Dota2Plugin(Star):
         「闲聊兜底」（由插件带数据回答）。关掉唤醒词限制
         （``nlu_require_keyword=false``）且没引用时它恒为假，插件就不会去
         抢答任何一条闲聊 —— 这是**故意的**安全一侧。
+
+        ``topic_pending`` 为真时 ``addressed`` 尚未定：调用方必须先 await
+        :meth:`_nlu_topic_is_mine`，判成「不是我的」就直接放行，且**不要记
+        会话历史** —— 群聊里别人的话被持久化、再回灌给模型，是 P1-11 修过的
+        事故。
         """
         if not self.cfg("nlu_enabled", True):
             return None
@@ -2502,14 +2580,31 @@ class Dota2Plugin(Star):
         # 意思就是「就这条」。以前这里直接返回 None，这类消息会被整个丢掉。
         if not text and not quoted_for_bot:
             return None
-        # 指令类消息交给命令 handler，这里不截胡
-        if text.startswith(NLU_SKIP_PREFIXES):
+        # 指令类消息交给命令 handler，这里不截胡。
+        # 注意这里必须用 `_nlu_is_command` 而不是直接判前缀：``/`` 这类
+        # ``wake_prefix`` 在到达插件之前就被框架剥掉了（详见该方法注释）。
+        if self._nlu_is_command(event, text):
+            logger.debug(f"[dota2] 指令消息，放行：{text[:30]}")
             return None
 
         # ---- 点名闸门（唤醒词 / 引用本插件的消息） ----
+        #: 话题路由模式：不强制唤醒词，改由「这条消息是不是在问 Dota2」决定接不接。
+        #: 详见 :meth:`_nlu_topic_is_mine` 与 ``dota_router`` 模块。
+        router_on = bool(self.cfg("nlu_topic_router", False))
         keyword_matched = False
         effective = text
-        if self.cfg("nlu_require_keyword", True):
+        if router_on:
+            # 路由模式下唤醒词不再是门槛，但它一旦出现**仍要剥掉**：
+            # 留着会让模型看到一句顶着「dota2助手」的话，也会进历史。
+            keyword_matched, effective = dota_nlu.strip_wake_keyword(
+                text, self._nlu_keyword()
+            )
+            if effective.startswith(dota_nlu.NLU_STRIP_CMD_PREFIXES):
+                return None
+            if keyword_matched and not effective and not quoted_for_bot:
+                # 只叫了名字、没说要什么：不猜，留给默认大模型
+                return None
+        elif self.cfg("nlu_require_keyword", True):
             keyword_matched, effective = dota_nlu.strip_wake_keyword(
                 text, self._nlu_keyword()
             )
@@ -2523,7 +2618,10 @@ class Dota2Plugin(Star):
             if effective.startswith(dota_nlu.NLU_STRIP_CMD_PREFIXES):
                 return None
 
-        addressed = keyword_matched or quoted_for_bot
+        # 「明确点名」：写了唤醒词，或引用了本插件发过的消息。
+        # 这两种信号在路由模式下也**直接放行**，不必再过模型判定 ——
+        # 用户已经用最没有歧义的方式说「这话是给你的」。
+        explicit = keyword_matched or quoted_for_bot
 
         # 群聊 / 私聊判断：用消息类型与 umo 双重判断，兼容各适配器。
         # get_message_type 在少数自定义 Event 上可能不存在，因此做了容错。
@@ -2533,6 +2631,37 @@ class Dota2Plugin(Star):
         except Exception:  # noqa: BLE001
             message_type = ""
         is_group = "GROUP_MESSAGE" in message_type or "GroupMessage" in umo
+
+        if router_on:
+            # 群聊里没点名 ⇒ 直接放行，**一分钱不花**。
+            #
+            # 这一步是路由模式能成立的前提：AstrBot 的 `event_message_type(ALL)`
+            # 不管有没有唤醒都会把消息送到插件（`EventMessageTypeFilter` 只看
+            # 消息类型），所以群友的闲聊**每条都会进到这里**。不在这一行挡住，
+            # 每条群消息都要过一次模型判定（约 190 token + 0.5 秒）。
+            if is_group and not explicit and self.cfg("nlu_group_require_at", True):
+                try:
+                    if not event.is_at_or_wake_command:
+                        return None
+                except AttributeError:
+                    return None
+            if explicit:
+                return NluGate(
+                    text=effective,
+                    keyword_matched=keyword_matched,
+                    addressed=True,
+                )
+            # 私聊，或群聊里被 @ 了：**交给话题判定**（调用方 await）。
+            # 群聊 @ 了也要判 —— @ 只说明「在跟机器人说话」，没说明在说 Dota2；
+            # 群里 @ 它问「帮我找本漫画」时，不判就会被插件接走然后答不上来。
+            return NluGate(
+                text=effective,
+                keyword_matched=False,
+                addressed=False,
+                topic_pending=True,
+            )
+
+        addressed = explicit
         if is_group and self.cfg("nlu_group_require_at", True) and not addressed:
             # 群里必须 @ 机器人（或使用唤醒前缀，此时 message_str 里已带前缀）。
             # 这条限制能挡掉绝大多数「群里别人随口一说就被插件抢答」的情况。
@@ -2546,6 +2675,189 @@ class Dota2Plugin(Star):
             keyword_matched=keyword_matched,
             addressed=addressed,
         )
+
+    def _nlu_prev_turn(self, umo: str) -> tuple[str, str]:
+        """取「本插件在这个会话的上一次说话」：上一轮用户问的 + 助手答的。
+
+        为什么不是「群里上一条消息」：群里别人正在聊别的，上一条可能是
+        「今晚吃啥」，拿它去理解「这个怎么下载」里的「这个」会直接判错。
+        这里只取**插件自己参与过的轮次**，指代才落在同一场对话里。
+
+        Returns:
+            ``(上一轮用户的话, 上一轮助手的回复)``，取不到的为空串。
+        """
+        try:
+            turns = self.history.messages(str(umo), drop_tail_user=False)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[dota2] 取上一轮对话失败：{e}")
+            return "", ""
+        prev_user = ""
+        prev_bot = ""
+        for turn in reversed(turns):
+            if not isinstance(turn, dict):
+                continue
+            role = str(turn.get("role") or "")
+            content = str(turn.get("content") or "")
+            if role == "assistant" and not prev_bot:
+                prev_bot = content
+            elif role == "user" and not prev_user:
+                prev_user = content
+            if prev_user and prev_bot:
+                break
+        return prev_user, prev_bot
+
+    async def _nlu_topic_is_mine(self, umo: str, text: str) -> bool:
+        """话题归属判定：这条消息是不是在问 Dota2。**只判自己，不判归谁。**
+
+        闸门（:meth:`_nlu_should_handle`）只回答「这条消息够格参与判定吗」，
+        真正花钱的那一步在这里。
+
+        判定顺序：
+
+        1. **规则层**：命中 :data:`dota_router.HINT_WORDS` 里的高置信词
+           （「天梯」「补刀」「复盘」…）直接判「是我的」，**0 token**。
+           只做正向短路 —— 没命中不等于不是，必须继续问模型。
+        2. **模型层**：二分类，prompt 里只有能力范围 + 上一轮原文 + 当前句，
+           **不含任何插件清单**。这是刻意的：不用知道别的插件叫什么，装多少
+           插件都不涨成本，也不用维护名单。
+
+        失败语义一律是「不是我的」（放行）：
+
+        * 模型拿不到 / 调用报错 / 超时；
+        * 模型回了看不懂的东西（含「（无输出）」这类占位符）。
+
+        方向为什么偏向放行而不是接管：误接一次要走完整链路（17 个工具 schema
+        全部装上，约 11.8k token），是判错一次（约 190 token）的 **60 倍**；
+        而漏接最坏只是交给默认大模型泛泛答一句。超时也一样 —— 与其在 3 秒后
+        突然插一句话，不如不说。
+
+        Returns:
+            真 = 这条归插件；假 = 放行给别人。
+        """
+        question = (text or "").strip()
+        if not question:
+            return False
+
+        # ---- 1. 规则层：0 成本 ----
+        if dota_router.rule_says_mine(question):
+            logger.info(f"[dota2] 话题判定=是（关键词）: {question[:30]}")
+            return True
+
+        # ---- 2. 模型层 ----
+        try:
+            provider = await resolve_provider(
+                self.context,
+                umo,
+                str(self.cfg("llm_provider_id", "") or ""),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[dota2] 话题判定拿不到模型，放行：{e}")
+            return False
+        if provider is None:
+            logger.warning("[dota2] 话题判定没有可用模型，放行本条")
+            return False
+
+        prev_user, prev_bot = self._nlu_prev_turn(umo)
+        prompt = dota_router.build_user_prompt(
+            question,
+            prev_user=prev_user,
+            prev_bot=prev_bot,
+        )
+        try:
+            timeout = float(self.cfg("nlu_topic_timeout", 3.0) or 3.0)
+        except (TypeError, ValueError):
+            timeout = 3.0
+        if timeout <= 0:
+            timeout = 3.0
+
+        raw = ""
+        try:
+            raw = await self._nlu_topic_ask(provider, prompt, timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[dota2] 话题判定超时 {timeout:.1f}s，放行：{question[:30]}"
+            )
+            return False
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[dota2] 话题判定失败，放行：{e}")
+            return False
+
+        verdict = dota_router.parse_verdict(raw)
+        if verdict is None:
+            logger.warning(f"[dota2] 话题判定看不懂输出 {raw[:20]!r}，放行")
+            return False
+        logger.info(
+            f"[dota2] 话题判定={'是' if verdict else '否'}：{question[:30]}"
+        )
+        return verdict
+
+    async def _nlu_topic_ask(self, provider: Any, prompt: str, timeout: float) -> str:
+        """问模型一次「这句话是不是在问 Dota2」，返回原始输出。
+
+        **为什么优先走 ``provider.client`` 而不是 ``provider.text_chat``**：
+
+        框架的 ``_prepare_chat_payload`` 把 ``**kwargs`` 收下之后**直接丢弃**，
+        没有任何按次传参的口子，所以「关思考」这种请求级参数传不进
+        ``text_chat``。而 ``qwen3.7-flash`` 这类模型**默认开思考**，实测同一句
+        判定：不关 6.0 秒 / 510 输出 token，关掉 0.35 秒 / 1 token —— 差 17 倍。
+        3 秒超时下必然全灭（2026-10-23 线上 3 小时里 4 次模型判定 4 次超时，
+        判定层等于没开）。
+
+        关思考的字段各家叫法不同（通义系是 ``enable_thinking``），只能通过
+        ``extra_body`` 透传。三级降级，任何一级不通都不影响功能：
+
+        1. ``provider.client`` 直连 + ``extra_body`` 关思考（快）；
+        2. 直连报错 / 返回空 → 退回 ``provider.text_chat``（慢，但不依赖私有属性）；
+        3. 全都不通 → 由调用方按「放行」处理。
+
+        Raises:
+            asyncio.TimeoutError: 交给调用方统一判「放行」。
+        """
+        messages = [
+            {"role": "system", "content": dota_router.TOPIC_SYSTEM},
+            {"role": "user", "content": prompt},
+        ]
+        client = getattr(provider, "client", None)
+        try:
+            model = str(provider.get_model() or "")
+        except Exception:  # noqa: BLE001
+            model = ""
+        if client is not None and model:
+            try:
+                resp = await asyncio.wait_for(
+                    client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        temperature=0,
+                        max_tokens=8,
+                        extra_body={"enable_thinking": False},
+                    ),
+                    timeout=timeout,
+                )
+                text = str(resp.choices[0].message.content or "").strip()
+                if text:
+                    return text
+                logger.debug("[dota2] 话题判定直连返回空，回退 text_chat")
+            except asyncio.TimeoutError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"[dota2] 话题判定直连失败，回退 text_chat：{e}")
+
+        try:
+            response = await asyncio.wait_for(
+                provider.text_chat(
+                    prompt=prompt,
+                    system_prompt=dota_router.TOPIC_SYSTEM,
+                ),
+                timeout=timeout,
+            )
+        except TypeError:
+            # 老版 AstrBot 的 text_chat 不认 system_prompt（与 call_llm 的降级一致）
+            response = await asyncio.wait_for(
+                provider.text_chat(prompt=prompt),
+                timeout=timeout,
+            )
+        return str(getattr(response, "completion_text", "") or "")
 
     def _nlu_session_players(self, umo: str) -> list[dict]:
         """本会话里「有名字的人」：已绑定 + 已监听，按 account_id 去重。
@@ -2683,24 +2995,49 @@ class Dota2Plugin(Star):
         return chain
 
 
-    async def _fetch_chat_matches(self, account_id: int, limit: int) -> list[dict]:
+    @staticmethod
+    def _match_filter_key(filters: dict) -> str:
+        """筛选条件的稳定指纹（缓存键用）。
+
+        排序后再拼：``{"win": 1, "hero_id": 96}`` 与 ``{"hero_id": 96, "win": 1}``
+        必须落到同一个键，否则同一份查询会因为字典顺序不同各缓存一遍。
+        """
+        return "|".join(f"{key}={filters[key]}" for key in sorted(filters))
+
+    async def _fetch_chat_matches(
+        self,
+        account_id: int,
+        limit: int,
+        filters: dict | None = None,
+    ) -> list[dict]:
         """拉近期对局，**复用闲聊兜底的缓存**。
 
         工具与预取经常查同一个账号（「钢板最近怎么样」会先被预取一次，
         模型再调一次 query_matches）—— 共用一份缓存才不会把同一个账号
-        查两遍。缓存里只放纯数据，key 与 :func:`dota_chat.collect_chat_context`
-        保持一致：``(account_id, limit)``。
+        查两遍。缓存里只放纯数据，**无筛选**时的 key 与
+        :func:`dota_chat.collect_chat_context` 保持一致：``(account_id, limit)``。
+
+        ``filters`` 是给数据源的筛选（``hero_id`` / ``win`` / ``lose`` /
+        ``game_mode`` / ``lobby_type``）。带筛选时键上多挂一段指纹，与无筛选的
+        缓存**互不覆盖** —— 这是「只看斧王」不会拿到全英雄成绩的前提。
         """
         account = int(account_id or 0)
         size = max(1, int(limit or 1))
         if not account:
             raise OpenDotaError("没有指定玩家账号。")
-        key = (account, size)
+        clean = {
+            key: value for key, value in (filters or {}).items() if value is not None
+        }
+        key: tuple = (
+            (account, size)
+            if not clean
+            else (account, size, self._match_filter_key(clean))
+        )
         now = time.time()
         entry = self._chat_cache.get(key)
         if entry and now - entry[0] < dota_chat.DEFAULT_CACHE_TTL:
             return [row for row in entry[1] if isinstance(row, dict)]
-        result = await self.api.get_player_matches_enriched(account, size)
+        result = await self.api.get_player_matches_enriched(account, size, **clean)
         matches = result[0] if isinstance(result, tuple) else result
         rows = [row for row in (matches or []) if isinstance(row, dict)]
         if rows:
@@ -3724,6 +4061,17 @@ class Dota2Plugin(Star):
         )
         if gate is None:
             return
+
+        addressed = gate.addressed
+        if gate.topic_pending:
+            # 话题路由模式：闸门只放了「够格参与判定」的消息进来，真正决定
+            # 接不接的是这一步。判成「不是我的」就原样放行 —— 这里**必须**
+            # 在记历史之前 return：把群聊里别人的话记进会话语境，下一轮会
+            # 原样回灌给模型（P1-11 修过的事故）。
+            addressed = await self._nlu_topic_is_mine(umo, gate.text)
+            if not addressed:
+                return
+
         effective = gate.text
 
         # 通过闸门 ⇒ 这条消息确实是给插件的，从这一刻起才记进会话语境。
@@ -3758,11 +4106,11 @@ class Dota2Plugin(Star):
         # 唤醒词 / @ 闸门（决定要不要理会这条消息）、确认 / 取消词
         # （协议回复）、以及 `/d2` 指令前缀。
         #
-        # 要求 `addressed`：**明确点名**插件的信号 —— 写了唤醒词，或者
-        # 引用了插件自己的发言。没有它（即 `nlu_require_keyword=false`
-        # 且只 @ 了机器人）时不能走这条路 —— 那等于让插件接管所有 @ 消息，
+        # 要求 `addressed`：**确认这条消息是给插件的** —— 写了唤醒词、
+        # 引用了插件自己的发言，或者（话题路由模式下）判定为 Dota2 话题。
+        # 三者都没有就不能走这条路 —— 那等于让插件接管所有 @ 消息，
         # 抢答风险太大。
-        if gate.addressed and self.cfg("nlu_chat_fallback", True):
+        if addressed and self.cfg("nlu_chat_fallback", True):
             reply, pending_prompts = await self._nlu_agent_reply(
                 event, self._nlu_effective_question(effective, quoted_text),
                 quoted=quoted_text,

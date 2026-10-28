@@ -436,10 +436,23 @@ class OpenDotaClient:
         lose: int | None = None,
         hero_id: int | None = None,
         significant: int = 0,
+        game_mode: int | None = None,
+        lobby_type: int | None = None,
     ) -> list[dict]:
         """按时间倒序获取玩家最近的比赛列表。
 
+        筛选口径（2026-10-27 实测，账号 297901780）：
+
+        * ``limit`` 作用在**过滤之后** —— ``hero_id=X, limit=10`` 是「某英雄最近 10 场」，
+          不是「最近 10 场里的某英雄」。想表达后者只能自己取多了再筛。
+        * 带筛选时会**往前翻历史凑满 limit**，所以「某英雄 + 最近 N 天」不能只靠它，
+          时间维度仍得在调用方按 ``start_time`` 过滤。
+        * ``game_mode`` / ``lobby_type`` 都只接受**单个值**：想查「除 Turbo 外全部」
+          这类口径，接口没有对应参数，不要用假值凑。
+
         Args:
+            game_mode: 游戏模式编号（22=全阵营选择，23=Turbo）。实测有效。
+            lobby_type: 大厅类型编号（0=普通，7=天梯）。实测有效。
             significant: OpenDota 的「显著性」过滤，**默认 0（所有模式）**。
 
                 - ``significant=1``（OpenDota 接口默认）：只返回常规竞技模式
@@ -462,6 +475,8 @@ class OpenDotaClient:
                 "win": win,
                 "lose": lose,
                 "hero_id": hero_id,
+                "game_mode": game_mode,
+                "lobby_type": lobby_type,
                 "significant": int(significant),
             },
         )
@@ -484,7 +499,7 @@ class OpenDotaClient:
         ]
 
     async def get_player_matches_enriched(
-        self, account_id: int, limit: int = 20
+        self, account_id: int, limit: int = 20, **filters: Any
     ) -> tuple[list[dict], int]:
         """获取玩家**真正的最近 N 场**（所有模式），并尽可能补全经济类字段。
 
@@ -509,10 +524,18 @@ class OpenDotaClient:
 
         Returns:
             ``(比赛列表, 带经济字段的场次数)`` —— 列表按开始时间倒序。
+
+        ``**filters`` 原样转给 :meth:`get_player_matches`（``win`` / ``lose`` /
+        ``hero_id`` / ``game_mode`` / ``lobby_type``）。带筛选时补字段这一步
+        **照样能做**：``recentMatches`` 取的是全英雄的 20 场，按 ``match_id``
+        合并，只会命中同一场比赛，不会把别的英雄的行混进来 —— 命不中就少几个
+        经济字段，不会错。
         """
         limit = max(1, int(limit))
         # significant=0：包含所有模式（Turbo 等），这才是「真正最近打了什么」
-        matches = await self.get_player_matches(account_id, limit=limit, significant=0)
+        matches = await self.get_player_matches(
+            account_id, limit=limit, significant=0, **filters
+        )
 
         try:
             recent = await self.get_recent_matches(account_id)
@@ -1067,12 +1090,14 @@ class DataSource(Protocol):
         lose: int | None = None,
         hero_id: int | None = None,
         significant: int = 0,
+        game_mode: int | None = None,
+        lobby_type: int | None = None,
     ) -> list[dict]:
-        """玩家比赛列表（可带胜负 / 英雄 / 显著场次过滤）。"""
+        """玩家比赛列表（可带胜负 / 英雄 / 模式 / 大厅 / 显著场次过滤）。"""
         ...
 
     async def get_player_matches_enriched(
-        self, account_id: int, limit: int = 20
+        self, account_id: int, limit: int = 20, **filters: Any
     ) -> tuple[list[dict], int]:
         """带补充信息的比赛列表，返回 ``(场次, 总数)``。"""
         ...
@@ -1222,9 +1247,11 @@ class FallbackDataSource:
             lose: int | None = None,
             hero_id: int | None = None,
             significant: int = 0,
+            game_mode: int | None = None,
+            lobby_type: int | None = None,
         ) -> list[dict]: ...
         async def get_player_matches_enriched(
-            self, account_id: int, limit: int = 20
+            self, account_id: int, limit: int = 20, **filters: Any
         ) -> tuple[list[dict], int]: ...
         async def get_player_peers(self, account_id: int) -> list[dict]: ...
         async def get_player_totals(

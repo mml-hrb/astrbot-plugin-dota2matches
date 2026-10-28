@@ -108,6 +108,34 @@ DEFAULT_TOOL_TIMEOUT = 180.0
 #: 战绩类工具一次最多取多少场
 MAX_MATCHES_PER_CALL = 50
 
+#: ``mode`` 参数 → OpenDota ``game_mode`` 编号。
+#:
+#: **只有两个值**，因为接口只接受**单个** game_mode：玩家嘴里常见的
+#: 「除 Turbo 以外的局」没有任何参数能表达（2026-10-27 实测，文档里也没有），
+#: 硬编一个 ``all_except_turbo`` 出来就是假实现 —— 要么漏掉别的模式，
+#: 要么把 Turbo 一起放进来，两种都是错的。
+#: 22 = 全阵营选择（日常说的「普通局」），23 = Turbo。
+MODE_VALUES: dict[str, int] = {
+    "normal": 22,
+    "turbo": 23,
+}
+
+#: ``lobby`` 参数 → OpenDota ``lobby_type`` 编号。0 = 普通匹配，7 = 天梯。
+LOBBY_VALUES: dict[str, int] = {
+    "normal": 0,
+    "ranked": 7,
+}
+
+#: ``result`` 参数 → 传给数据源的键名（``win`` / ``lose``）。值恒为 1。
+RESULT_VALUES: dict[str, str] = {
+    "win": "win",
+    "lose": "lose",
+}
+
+#: 筛选口径的中文说法（渲染「本次筛选」那一行用）
+_MODE_ZH: dict[int, str] = {22: "全阵营选择", 23: "Turbo"}
+_LOBBY_ZH: dict[int, str] = {0: "普通匹配", 7: "天梯"}
+
 #: ``compare_players`` 一次最多比几个人。六七个是群规模，再多也没人真要看，
 #: 反而会把调用预算烧光（每人一次取数）。
 MAX_COMPARE_PLAYERS = 8
@@ -165,9 +193,17 @@ class ToolContext:
     #: 本会话可查的玩家列表（本地数据，不联网）：
     #: ``[{"name", "account_id", "relation"}]``
     session_players: Callable[[], list[dict]]
-    #: ``await fetch_matches(account_id, limit)``：近期对局，**带缓存**
-    #: （与闲聊兜底共用同一份缓存，避免同一个账号被拉两遍）
-    fetch_matches: Callable[[int, int], Awaitable[list[dict]]]
+    #: ``await fetch_matches(account_id, limit, filters=None)``：近期对局，**带缓存**
+    #: （与闲聊兜底共用同一份缓存，避免同一个账号被拉两遍）。
+    #:
+    #: ``filters`` 是给数据源的筛选关键字（``hero_id`` / ``win`` / ``lose`` /
+    #: ``game_mode`` / ``lobby_type``），``None`` 表示不筛。**实现方必须把筛选
+    #: 并进缓存键**：不并的话，「所有英雄」的缓存会把「只看斧王」的查询顶掉，
+    #: 用户拿到一份看起来正常、实际是全英雄的成绩。
+    #:
+    #: 用 ``Callable[..., ...]`` 而不是写死三参：不带筛选时仍按老的两参调用，
+    #: 离线单测里的简易 context 不必跟着改。
+    fetch_matches: Callable[..., Awaitable[list[dict]]]
     #: ``await items()``：道具常量表（``dname`` 已中文化），带缓存。
     #: 为 ``None``（离线单测里的简化 context）时，工具退回 ``api.get_items()``，
     #: 至少能拿到名字，不会把出装整段渲染成 ``-``。
@@ -325,12 +361,20 @@ def build_tool_specs(*, include_write: bool = True) -> list[dict]:
             "位置 / 模式）加汇总统计（胜率、场均 KDA、GPM、位置分布、组队情况）。"
             "问「他最近打得怎么样」「谁最菜」时用。只查一个人，多个人要分别调用。"
             "用户**明确说了时间范围**（「这三天」「最近一周」「昨天」）时必须填 "
-            "days 或 day_offset，否则你会把好几天前的局当成这段时间的成绩。",
+            "days 或 day_offset，否则你会把好几天前的局当成这段时间的成绩。"
+            "用户**点名了英雄 / 只看赢的 / 只看 Turbo / 只看天梯**时填对应的"
+            " hero / result / mode / lobby —— 这四个都是服务端筛选，"
+            "填了之后 count 指的是「**符合这些条件的**最近 N 场」。",
             {
                 "player": _PLAYER_PROP,
                 "count": {
                     "type": "integer",
-                    "description": "查最近几场，默认 10，最多 50。",
+                    "description": (
+                        "查最近几场，默认 10，最多 50。"
+                        "**带了 hero / result / mode / lobby 时**，它指的是"
+                        "「符合那些条件的最近 N 场」（比如「斧王的最近 10 场」），"
+                        "不是「最近 10 场里再挑斧王」。"
+                    ),
                 },
                 "days": {
                     "type": "integer",
@@ -349,6 +393,41 @@ def build_tool_specs(*, include_write: bool = True) -> list[dict]:
                         "那一整天按**凌晨 4 点**起算（熬夜打到凌晨的局算前一天）。"
                         "用户说「昨天」就填 1、「前天」填 2。**「昨天」必须用它**，"
                         "不能用 days（days=1 是今天，会把昨天整天漏掉）。"
+                    ),
+                },
+                "hero": {
+                    "type": "string",
+                    "description": (
+                        "只看**某个英雄**的对局，照用户原话填（「斧王」「juggernaut」"
+                        "「96」都行，工具里会认中文名 / 英文名 / 英雄 ID）。"
+                        "用户问「我斧王打得怎么样」「这个英雄最近几场」「敌法我胜率多少」"
+                        "时填。**不填 = 所有英雄**。"
+                    ),
+                },
+                "result": {
+                    "type": "string",
+                    "enum": ["win", "lose"],
+                    "description": (
+                        "只看赢（win）或只看输（lose）。用户问「我最近赢的那几场」"
+                        "「输的几把都是怎么输的」时填。不填 = 胜负都算。"
+                    ),
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["normal", "turbo"],
+                    "description": (
+                        "只看某一种游戏模式：normal=全阵营选择（日常说的「普通局」）、"
+                        "turbo=加速模式。**只有这两个值** —— 接口只能按单个模式筛，"
+                        "没有「除 Turbo 以外的全部」这种口径，用户这么问时不要瞎填，"
+                        "改用不填 + 在回答里说明加速局会混进来。"
+                    ),
+                },
+                "lobby": {
+                    "type": "string",
+                    "enum": ["ranked", "normal"],
+                    "description": (
+                        "只看天梯（ranked）还是普通匹配（normal）。"
+                        "用户说「天梯最近怎么样」「非排位的局」时填。"
                     ),
                 },
             },
@@ -791,6 +870,86 @@ def _time_args(
     return count, window
 
 
+async def _fetch(
+    ctx: ToolContext,
+    account_id: int,
+    limit: int,
+    filters: dict[str, int] | None = None,
+) -> list[dict]:
+    """取近期对局。**不带筛选时按两参调用**，兼容离线单测里的简易 context。"""
+    if filters:
+        return await ctx.fetch_matches(account_id, limit, filters)
+    return await ctx.fetch_matches(account_id, limit)
+
+
+async def _match_filters(
+    args: dict, ctx: ToolContext
+) -> tuple[dict[str, int], str, list[str]]:
+    """把 ``hero`` / ``result`` / ``mode`` / ``lobby`` 解析成数据源参数。
+
+    Returns:
+        ``(filters, note, problems)``
+
+        * ``filters`` —— 直接展开给 ``fetch_matches`` 的关键字
+          （``hero_id`` / ``win`` / ``lose`` / ``game_mode`` / ``lobby_type``）；
+        * ``note`` —— 给人看的口径说明（「英雄 斧王 · 只算胜局」），空串 = 没筛选；
+        * ``problems`` —— **认不出的取值**。非空时调用方必须停手，不能当没填：
+
+          把「斧王」猜成别的英雄、或者悄悄退回全英雄，用户拿到的都是一份
+          跟他问的不一样的数据，而且看起来完全像真的 —— 这比直接说「没认出来」
+          糟得多。同理，接口只支持单个模式，模型要是填了不认识的模式，
+          也不能悄悄忽略。
+    """
+    filters: dict[str, int] = {}
+    parts: list[str] = []
+    problems: list[str] = []
+
+    raw_hero = str(args.get("hero") or "").strip()
+    if raw_hero:
+        try:
+            heroes = await _guarded(ctx.heroes(), ctx)
+        except Exception as e:  # noqa: BLE001 - 拿不到英雄表就没法按英雄筛
+            heroes = None
+            problems.append(f"取不到英雄表（{type(e).__name__}），没法按英雄筛")
+            logger.warning(f"[dota2] query_matches 取英雄表失败：{e}")
+        if heroes is not None:
+            hit = dota_hero_playstyle.resolve_hero(heroes, raw_hero)
+            if hit is None:
+                problems.append(f"认不出英雄「{raw_hero}」")
+            else:
+                filters["hero_id"] = int(hit[0])
+                parts.append(f"英雄 {hit[1]}")
+
+    raw_result = str(args.get("result") or "").strip().lower()
+    if raw_result:
+        key = RESULT_VALUES.get(raw_result)
+        if key is None:
+            problems.append(f"result 只能填 win / lose，收到「{raw_result}」")
+        else:
+            filters[key] = 1
+            parts.append("只算胜局" if key == "win" else "只算败局")
+
+    raw_mode = str(args.get("mode") or "").strip().lower()
+    if raw_mode:
+        mode = MODE_VALUES.get(raw_mode)
+        if mode is None:
+            problems.append(f"mode 只能填 normal / turbo，收到「{raw_mode}」")
+        else:
+            filters["game_mode"] = mode
+            parts.append(f"模式 {_MODE_ZH[mode]}")
+
+    raw_lobby = str(args.get("lobby") or "").strip().lower()
+    if raw_lobby:
+        lobby = LOBBY_VALUES.get(raw_lobby)
+        if lobby is None:
+            problems.append(f"lobby 只能填 ranked / normal，收到「{raw_lobby}」")
+        else:
+            filters["lobby_type"] = lobby
+            parts.append(f"大厅 {_LOBBY_ZH[lobby]}")
+
+    return filters, " · ".join(parts), problems
+
+
 def _window_blank_note(
     name: str,
     window: "dota_chat.TimeWindow",
@@ -930,8 +1089,25 @@ async def _tool_query_matches(args: dict, ctx: ToolContext) -> str:
     # ``days``（「最近 N 天」，含今天）；都没给 = 不限时间（按最近 N 场统计）。
     # 有窗口时 :func:`_time_args` 会自动放宽取数场次（否则会答出假否定）。
     count, window = _time_args(args, ctx)
-    matches = await _guarded(ctx.fetch_matches(account_id, count), ctx)
+    filters, filter_note, problems = await _match_filters(args, ctx)
+    if problems:
+        # 条件认不出就**停手**：带着半份条件去查，回来的数据跟用户问的不是一回事，
+        # 而它看起来完全像真的。宁可让模型换个说法再调一次。
+        return (
+            "这次没查："
+            + "；".join(problems)
+            + "。请把认不出的条件去掉或换成能认的写法（英雄可用中文名 / 英文名 / "
+            "英雄 ID；result 填 win 或 lose；mode 填 normal 或 turbo；lobby 填 "
+            "ranked 或 normal），**不要**当成没填继续查。"
+        )
+    matches = await _guarded(_fetch(ctx, account_id, count, filters), ctx)
     if not matches:
+        if filter_note:
+            return (
+                f"{name} 没有符合条件的对局（筛选：{filter_note}）。\n"
+                "**这不代表他没打过** —— 只是按这些条件筛下来没有记录。"
+                "如实说「按这些条件没查到」，不要写成「他最近没打」。"
+            )
         return (
             f"{name} 最近没有可用的对局记录"
             "（可能未公开比赛数据，或这段时间没打）。"
@@ -940,7 +1116,10 @@ async def _tool_query_matches(args: dict, ctx: ToolContext) -> str:
     if window is not None:
         scoped = dota_chat.scope_matches(matches, window)
         if not scoped:
-            return _window_blank_note(name, window, matches, ctx.now or None)
+            note = _window_blank_note(name, window, matches, ctx.now or None)
+            if filter_note:
+                note += f"\n（本次筛选条件：{filter_note}）"
+            return note
         scope_note = (
             f"（统计口径：{window.describe()}——手上最近 {len(matches)} 场里"
             f"有 {len(scoped)} 场落在范围内，其余 {len(matches) - len(scoped)} 场不计）"
@@ -953,8 +1132,15 @@ async def _tool_query_matches(args: dict, ctx: ToolContext) -> str:
         if window is not None
         else f"=== {name} 最近 {len(matches)} 场 ==="
     )
-    blocks = [
-        head,
+    blocks = [head]
+    if filter_note:
+        # 这一行是给模型看的口径声明：不说清，「最近 N 场」会被它读成全量近况，
+        # 进而拿一份「只看斧王」的成绩去评价这个人整体的状态。
+        blocks.append(
+            f"【筛选】{filter_note} —— 上面这句「最近 {len(matches)} 场」指的是"
+            "**符合该条件的**场次，不是他全部的对局。"
+        )
+    blocks += [
         format_summary_block(summary, heroes),
         "",
         format_match_list(name, account_id, matches, heroes, title="逐场明细"),

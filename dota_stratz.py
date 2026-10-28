@@ -730,11 +730,19 @@ class StratzClient:
         lose: int | None = None,
         hero_id: int | None = None,
         significant: int = 0,
+        game_mode: int | None = None,
+        lobby_type: int | None = None,
     ) -> list[dict]:
         """按时间倒序获取玩家最近比赛（OpenDota ``/players/{id}/matches`` 形状）。
 
         ``significant`` 参数在 STRATZ 侧没有对应概念（STRATZ 默认就包含所有
         模式，包括 Turbo），因此这里接受但忽略，保持接口签名一致。
+
+        ``game_mode`` / ``lobby_type`` 收的是 **OpenDota 编号**（22=全阵营选择、
+        23=Turbo、0=普通、7=天梯），STRATZ 侧对应的 GraphQL 字段是
+        ``gameModeIds`` / ``lobbyTypeIds``。2026-10-27 实测：按编号直接传就
+        生效，返回行的 ``gameMode`` / ``lobbyType`` 与筛选值一一对应
+        （22 → ``ALL_PICK_RANKED``、23 → ``TURBO``、0 → ``UNRANKED``、7 → ``RANKED``）。
         """
         take = max(1, min(int(limit), 100))
         request_parts = [f"take: {take}", f"skip: {max(0, int(offset))}"]
@@ -745,6 +753,10 @@ class StratzClient:
             request_parts.append("isVictory: false")
         if hero_id:
             request_parts.append(f"heroIds: [{int(hero_id)}]")
+        if game_mode is not None:
+            request_parts.append(f"gameModeIds: [{int(game_mode)}]")
+        if lobby_type is not None:
+            request_parts.append(f"lobbyTypeIds: [{int(lobby_type)}]")
         request = "{ " + ", ".join(request_parts) + " }"
 
         data = await self._gql(
@@ -811,16 +823,18 @@ class StratzClient:
         return rows[: max(1, int(limit))]
 
     async def get_player_matches_enriched(
-        self, account_id: int, limit: int = 20
+        self, account_id: int, limit: int = 20, **filters: Any
     ) -> tuple[list[dict], int]:
         """获取玩家真正的最近 N 场（所有模式），并返回带经济字段的场次数。
 
         STRATZ 一次查询就同时返回基础字段与经济字段，因此这里天然不存在
         OpenDota 那种「20 场以上没有经济数据」的限制 —— 这是 STRATZ 作为
         主数据源的主要收益之一。
+
+        ``**filters`` 原样转给 :meth:`get_player_matches`，与 OpenDota 侧签名一致。
         """
         limit = max(1, int(limit))
-        matches = await self.get_player_matches(account_id, limit=limit)
+        matches = await self.get_player_matches(account_id, limit=limit, **filters)
         matches = matches[:limit]
         enriched = sum(1 for m in matches if m.get("gold_per_min") is not None)
         return matches, enriched
