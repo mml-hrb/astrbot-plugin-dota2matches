@@ -70,21 +70,37 @@ LANE_ROLES: dict[int, str] = {
 }
 
 #: STRATZ 的 ``position`` 枚举 → 中文「几号位」。
-#: STRATZ 直连时每个玩家都带这个字段，是判断阵容分工最直接的依据。
 #:
-#: OpenDota 侧**也有**一个等价物：``position_est``（整数 1~5）。这一点曾经被
-#: 误判成「OpenDota 只有 lane_role」，于是报告里只剩「优势路(Safe Lane) lane=1」
-#: 这种话 —— 而优势路上同时站着 1 号位和 5 号位，等于没说。样本
-#: ``8995536921`` 里两个字段的对照足以确认 ``position_est`` 就是号位估算：
-#: 净经济 40.9k / 补刀 174 的 Sniper 是 ``position_est=1``，而同一路（lane_role=1）
-#: 插了 9 假眼 16 真眼、补刀只有 17 的 Grimstroke 是 ``position_est=5``；
-#: 中路两人（lane_role=2）都是 ``position_est=2``。渲染见 :func:`_lane_text`。
+#: 只作**第二顺位**使用：号位的主口径是 :func:`infer_positions`（分路 +
+#: 第 10 分钟补刀），因为两个数据源给的号位都是推算出来的，实测会错。
+#:
+#: ⚠️ **不要再用 OpenDota 的 ``position_est`` 当号位**。它是按经济/补刀倒推的
+#: 估算，加速模式下「辅助经济高于大哥」是常态，直接判反。实测 match
+#: ``9073189779``：力丸走优势路、第 10 分钟补刀 8（同路大哥 54），
+#: ``position_est`` 却是 3 —— 报告于是写成「三号位」，而同一行还写着
+#: 「优势路(Safe Lane)」，自相矛盾。模型取前半句、丢掉「（数据源估算）」，
+#: 最终结论就错了。
+#:
+#: 括号里**不再绑定分路**（「1号位=优势路」在换线版本里不成立）。
 POSITION_TEXT: dict[str, str] = {
-    "POSITION_1": "1号位（核心/优势路）",
+    "POSITION_1": "1号位（核心）",
     "POSITION_2": "2号位（中单）",
-    "POSITION_3": "3号位（劣势路）",
-    "POSITION_4": "4号位（游走/打架辅助）",
+    "POSITION_3": "3号位（对抗路核心）",
+    "POSITION_4": "4号位（游走辅助）",
     "POSITION_5": "5号位（保人辅助）",
+}
+
+#: 号位推断用的补刀采样点（第几分钟）。选 10 分钟是因为此时对线期刚结束、
+#: 双人路还没拆开，同一条路上谁在吃线一眼能看出来。
+POSITION_LH_MINUTE = 10
+
+#: 1~5 号位的中文短名（推断结果用，不带分路暗示）。
+POSITION_NAMES: dict[int, str] = {
+    1: "1号位（核心）",
+    2: "2号位（中单）",
+    3: "3号位（对抗路核心）",
+    4: "4号位（游走辅助）",
+    5: "5号位（保人辅助）",
 }
 
 # ----------------------------------------------------------------------
@@ -1954,10 +1970,15 @@ def _player_row(
     if party and party > 1:
         extras.append(f"组队 {party} 人")
 
+    # 号位短标（表格里不展开，详细口径见「=== 号位与分路 ===」）。
+    # 未解析局推不出来就整段不写，绝不拿 position_est 补一个。
+    pos = _as_int(player.get("_pos"))
+    pos_tag = f"[{pos}号位] " if pos in POSITION_NAMES else ""
+
     lines = [
         (
             f"{side} | {name}"
-            f"{'(→焦点)' if player.get('_focus') else ''} | {hname(heroes, player.get('hero_id'))} "
+            f"{'(→焦点)' if player.get('_focus') else ''} | {pos_tag}{hname(heroes, player.get('hero_id'))} "
             f"Lv{player.get('level', '-')} | {kda} KDA{fmt_float(player.get('_kda', 0))} "
             f"| 净经济{net} GPM{player.get('gold_per_min', '-')}/XPM{player.get('xp_per_min', '-')} "
             f"| 补刀{player.get('last_hits', '-')}/{player.get('denies', '-')} "
@@ -2000,21 +2021,145 @@ def lane_efficiency_text(player: dict) -> str:
     return "-"
 
 
+def last_hits_at(player: dict, minute: int = POSITION_LH_MINUTE) -> int | None:
+    """第 N 分钟的累计补刀（OpenDota ``lh_t`` 曲线）。
+
+    ``lh_t`` 是**逐分钟累计值**，索引即分钟（``lh_t[10]`` = 第 10 分钟结束时
+    的补刀数）。只有解析过的对局才有这个数组；未解析局返回 ``None`` ——
+    这时宁可不判号位，也不要编一个。
+    """
+    curve = player.get("lh_t")
+    if not isinstance(curve, list) or not curve:
+        return None
+    index = minute if minute < len(curve) else len(curve) - 1
+    value = curve[index]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
+def infer_positions(players: list[dict]) -> None:
+    """按「分路 + 第 10 分钟补刀」推断 1~5 号位，就地写 ``_pos`` / ``_lh10``。
+
+    口径（用户定，2026-11-04）：**分路决定候选，补刀决定核心/辅助**。
+
+    * 中路（``lane_role=2``）→ 2 号位；
+    * 优势路（``lane_role=1``）里补刀多的 → 1 号位，其余 → 5 号位；
+    * 劣势路（``lane_role=3``）里补刀多的 → 3 号位，其余 → 4 号位；
+    * 野区（``lane_role=4``）判不出是 1 还是 3，不猜；
+    * 缺 ``lane_role`` 或 ``lh_t`` 就不猜。
+
+    **未解析局一个号位都给不出来**：实测 ``match 9019193878``（``version=None``）
+    里 10 名玩家的 ``lane_role`` / ``lane`` / ``position_est`` / ``lh_t``
+    全是 ``None`` —— OpenDota 对未解析局只给 KDA、经济、装备这些基础字段。
+    所以这里不会有「至少给个中单 2 号位」的情况：连中路的 ``lane_role=2``
+    都拿不到，全员落在「号位未知」。中路那条分支的前提是**分路已经拿到**，
+    只是缺补刀曲线。
+
+    为什么不信数据源：``position_est`` 是按经济倒推的，加速模式下辅助经济
+    经常高于大哥（用户实测反馈），5 号位会被判成 3 号位；STRATZ 的
+    ``position`` 同样是模型推算，且插件在 :func:`dota_stratz._normalize_player`
+    里早把它压成 ``lane_role`` 丢掉了。比同一条路上两个人的补刀，
+    跟经济膨胀无关，这也是唯一拿得到原始证据的口径。
+
+    组内只有一个人时没有对比对象，退化成「跟他同队最高补刀比」：
+    达到 60% 及以上算核心，否则算辅助。
+    """
+    # 先清一遍，避免上一次渲染的残留（player dict 可能被复用）
+    for player in players:
+        player["_pos"] = None
+        player["_lh10"] = last_hits_at(player)
+
+    by_side: dict[int, list[dict]] = {0: [], 1: []}
+    groups: dict[tuple[int, int], list[dict]] = {}
+    for player in players:
+        slot = _as_int(player.get("player_slot"))
+        if slot is None:
+            continue
+        side = 0 if slot < 128 else 1
+        by_side[side].append(player)
+        lane_role = _as_int(player.get("lane_role"))
+        if lane_role is None:
+            continue
+        groups.setdefault((side, lane_role), []).append(player)
+
+    def _rank_key(player: dict) -> tuple[bool, int, bool]:
+        """补刀降序；缺数据的排最后；补刀相同时游走的那个靠后（当辅助）。"""
+        lh = _as_int(player.get("_lh10"))
+        return (lh is None, -(lh or 0), bool(player.get("is_roaming")))
+
+    def _team_peak(side: int, exclude: dict | None = None) -> int | None:
+        """同队最高的 10 分钟补刀（排除自己，避免「自己跟自己比」恒成立）。"""
+        values: list[int] = []
+        for teammate in by_side[side]:
+            if teammate is exclude:
+                continue
+            value = _as_int(teammate.get("_lh10"))
+            if value is not None:
+                values.append(value)
+        return max(values) if values else None
+
+    for (side, lane_role), members in groups.items():
+        # 只拿有补刀数据的人参与比较。未解析局全员没有 lh_t，这里就是空的 ——
+        # 绝不能因为「组里有两个人」就按表的顺序硬分一个核心出来。
+        known = [m for m in members if _as_int(m.get("_lh10")) is not None]
+        known.sort(key=_rank_key)
+
+        if lane_role == 2:
+            # 中路的结构性事实：这条路上站的是中单，不需要补刀佐证。
+            # 前提是**已经拿到 lane_role**（未解析局连这个都没有，走不到这里）。
+            # 同队出现第二个「中路」时（换线残留），才按补刀分核心/辅助。
+            if known:
+                known[0]["_pos"] = 2
+                for extra in known[1:]:
+                    extra["_pos"] = 4
+            elif len(members) == 1:
+                members[0]["_pos"] = 2
+            continue
+
+        if lane_role == 4:
+            # 野区：分不出是 1 号位打野还是 4 号位拉野，不猜。
+            continue
+
+        core_pos, support_pos = (1, 5) if lane_role == 1 else (3, 4)
+
+        if len(known) >= 2:
+            known[0]["_pos"] = core_pos
+            for support in known[1:]:
+                support["_pos"] = support_pos
+            continue
+
+        # 单人路（或同组只有一个人有数据）：跟同队其他最高的补刀比
+        for only in known:
+            lh = _as_int(only.get("_lh10"))
+            peak = _team_peak(side, exclude=only)
+            if lh is not None and peak:
+                only["_pos"] = core_pos if lh >= peak * 0.6 else support_pos
+
+
 def _lane_text(player: dict) -> str:
+    """位置描述：**号位在前、分路在后，两者分开写，不互相换算**。
+
+    号位优先用 :func:`infer_positions` 写进来的 ``_pos``（分路 + 10 分钟补刀），
+    其次才是数据源直给的 ``position`` 枚举。取不到就明说「号位未知」，
+    **绝不再拿 ``position_est`` 顶** —— 那正是「五号位力丸被写成三号位」的源头。
+    """
+    parts: list[str] = []
+    pos = _as_int(player.get("_pos"))
+    if pos in POSITION_NAMES:
+        lh10 = player.get("_lh10")
+        suffix = f"（10分钟补刀 {lh10}）" if lh10 is not None else ""
+        parts.append(POSITION_NAMES[pos] + suffix)
+    else:
+        raw = str(player.get("position") or "").upper()
+        if raw in POSITION_TEXT:
+            parts.append(POSITION_TEXT[raw] + "（数据源直给）")
+        else:
+            parts.append("号位未知")
     role = player.get("lane_role")
-    lane = player.get("lane")
-    parts = []
-    position = POSITION_TEXT.get(str(player.get("position") or "").upper())
-    if not position:
-        # OpenDota 的 position_est（1~5）是号位估算，STRATZ 直连时才有的
-        # ``position`` 只是同一个东西的另一种写法，两者取到哪个用哪个。
-        estimate = _as_int(player.get("position_est"))
-        if estimate is not None and 1 <= estimate <= 5:
-            position = POSITION_TEXT[f"POSITION_{estimate}"] + "（数据源估算）"
-    if position:
-        parts.append(position)
     if role:
-        parts.append(LANE_ROLES.get(int(role), f"位置{role}"))
+        parts.append("分路 " + LANE_ROLES.get(int(role), f"位置{role}"))
+    lane = player.get("lane")
     if lane:
         parts.append(f"lane={lane}")
     if player.get("is_roaming"):
@@ -2114,6 +2259,10 @@ def build_match_data_text(
     item_index = ItemIndex(items)
     ability_map = ability_names if ability_names is not None else abilities
     players = [p for p in (match.get("players") or []) if isinstance(p, dict)]
+
+    # 号位必须在渲染前统一算一次：推断要跨十个人比较同路补刀，
+    # 单个 player dict 自己是看不出「这条路上谁补刀多」的。
+    infer_positions(players)
 
     radiant = [p for p in players if is_radiant(p.get("player_slot"))]
     dire = [p for p in players if not is_radiant(p.get("player_slot"))]
@@ -2271,9 +2420,18 @@ def build_match_data_text(
     for player in sorted(players, key=lambda p: int(p.get("player_slot") or 0)):
         lines.append(_player_row(player, heroes, item_index))
 
-    # 分路
+    # 号位与分路：号位是推断出来的，必须把口径一并写给模型，
+    # 否则它会拿「分路」自己二次换算成号位（这正是上一版出错的路径）。
     lines.append("")
-    lines.append("=== 分路信息 ===")
+    lines.append("=== 号位与分路 ===")
+    lines.append(
+        "口径: 号位按「分路 + 第 10 分钟补刀」推断 —— 同一条路上补刀多的"
+        "是核心（优势路=1号位 / 劣势路=3号位），补刀少的是辅助"
+        "（优势路=5号位 / 劣势路=4号位），中路=2号位。"
+        "**分路不等于号位**：一条优势路上同时站着 1 号和 5 号，"
+        "不要把「优势路」直接说成 1 号位，也不要拿分路反推号位；"
+        "写「号位未知」的场次就照实说不知道。"
+    )
     for player in players:
         detail = _lane_text(player)
         efficiency = lane_efficiency_text(player)
@@ -2628,7 +2786,7 @@ def _focus_detail_lines(
     if any(value != "-" for _label, value in ward_fields):
         lines.append(" ".join(f"{label} {value}" for label, value in ward_fields))
     lines.append(
-        f"分路: {_lane_text(focus)}　"
+        f"位置: {_lane_text(focus)}　"
         f"补刀效率 {lane_efficiency_text(focus)}"
     )
     # 操作频率：APM 高通常意味着更主动（也可能只是无效操作），交给模型结合

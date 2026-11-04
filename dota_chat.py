@@ -219,12 +219,39 @@ WEEKDAY_NAMES = ("周一", "周二", "周三", "周四", "周五", "周六", "�
 #: Turbo 的经济增长约为常规局的两倍，GPM/正补天然偏高，混在一起算平均值
 #: 会把「爱打 Turbo 的人」直接抬成「最强者」，所以单独标注出来。
 GAME_MODE_TURBO = 23
+
+#: 视为「常规模式」的编号 —— 不挂标签。
+#:
+#: ``1``（All Pick）与 ``22``（Ranked All Pick，天梯全选）是同一个玩法，
+#: 常规局不该每条明细后面都坠一个「全阵营选择」；``0`` 是数据缺失，
+#: 挂个「模式0」纯属噪音。:func:`mode_label` 只负责标**非常规**模式。
+REGULAR_GAME_MODES: frozenset[int] = frozenset({0, 1, 22})
+
+#: ``game_mode`` 编号 → 中文标签。**只放非常规模式**。
+#:
+#: 与 :data:`dota_format.GAME_MODES` 分工不同：那份是逐场明细用的**完整英文表**
+#: （照抄 OpenDota 的 ``game_mode.json``，常规模式也在里面）；这份只挑
+#: 「需要提醒用户」的非常规模式，给闲聊摘要用。改编号前先对照那份原表，
+#: 别凭印象填 —— 下面这两个坑都是这么来的。
+#:
+#: 编号以 Valve 的 ``DOTA_GameMode`` 与 OpenDota 的 ``game_mode.json`` 为准。
+#: 这里踩过一次坑，别再翻回去：
+#:
+#: * ``22`` 曾被标成「全阵营随机」，但 22 是 ``ALL_DRAFT``（天梯全选），
+#:   和 ``1`` 同属常规模式 —— 真正的「全随机」是 ``5``；
+#: * ``4`` 曾被标成「单中模式」，但 4 是 ``Single Draft``（单选，从三个英雄里
+#:   挑一个），「单中」是 ``21``（``1v1 Mid``）。
 GAME_MODE_LABELS: dict[int, str] = {
-    23: "Turbo",
-    22: "全阵营随机",
-    4: "单中模式",
     2: "队长模式",
     3: "随机征召",
+    4: "单选模式",
+    5: "全阵营随机",
+    16: "队长征召",
+    18: "技能征召",
+    20: "全阵营死亡随机",
+    21: "单中模式",
+    23: "Turbo",
+    24: "变异模式",
 }
 
 DEFAULT_CHAT_SYSTEM_PROMPT = (
@@ -663,7 +690,7 @@ def row_win(match: dict) -> bool | None:
 def mode_label(match: dict) -> str:
     """非常规游戏模式的短标签（常规模式返回空串）。"""
     mode = _as_int(match.get("game_mode"))
-    if mode is None or mode in (1, 0):
+    if mode is None or mode in REGULAR_GAME_MODES:
         return ""
     return GAME_MODE_LABELS.get(mode, f"模式{mode}")
 
@@ -696,7 +723,14 @@ LANE_ROLE_LABELS: dict[int, str] = {
 def position_label(match: dict) -> str:
     """取这场比赛里该玩家打的位置；**取不到返回空串，不许猜**。
 
-    顺序：``position``（1~5 号位）→ ``lane_role``（分路）。
+    顺序：``position``（1~5 号位，只有 STRATZ 直连给）→ ``lane_role``（分路）。
+
+    ⚠️ **第二顺位返回的是分路，不是号位，所以必须带「（分路）」后缀**。
+    玩家近期战绩列表接口（``/players/{id}/matches``）不带逐分钟补刀曲线，
+    没法用 :func:`dota_format.infer_positions` 的口径推号位，只能退到分路粒度。
+    以前这里直接把「优势路」当位置返回，下游就把它读成「1 号位」——
+    而一条优势路上同时站着 1 号和 5 号，这是实打实的误判来源。
+    要号位就得走单场详情的推断（分路 + 第 10 分钟补刀）。
 
     取不到位置是常态而不是异常：未解析的比赛、早期版本的对局、
     以及后备数据源（OpenDota 的玩家对局列表）都可能没有这个字段。
@@ -708,7 +742,7 @@ def position_label(match: dict) -> str:
         return POSITION_LABELS[raw]
     lane_role = _as_int(match.get("lane_role"))
     if lane_role is not None and lane_role in LANE_ROLE_LABELS:
-        return LANE_ROLE_LABELS[lane_role]
+        return LANE_ROLE_LABELS[lane_role] + "（分路）"
     return ""
 
 
@@ -901,7 +935,10 @@ class PlayerSnapshot:
 
     @property
     def position_counts(self) -> list[tuple[str, int]]:
-        """近期各位置的场次，按场次从多到少（取不到位置的场次不计入）。
+        """近期各位置/分路的场次，按场次从多到少（取不到位置的场次不计入）。
+
+        ⚠️ 列表接口没有逐分钟补刀曲线，这里最多只能给到**分路**粒度，
+        所以标签会带「（分路）」后缀。别拿这个当号位分布用。
 
         注意它可能与 :attr:`games` 不相等 —— 差值就是「位置未知」的场次。
         提示词里会把这个差值说明白，免得模型把「10 场里只认出 6 场」

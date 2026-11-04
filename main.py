@@ -6600,9 +6600,10 @@ class Dota2Plugin(Star):
 
         client = self._dedicated_client()
         if client is not None:
+            started = time.time()
             try:
                 max_tokens = int(self.cfg("llm_max_tokens", 0) or 0)
-                return await client.chat(
+                text = await client.chat(
                     system_prompt,
                     prompt,
                     temperature=float(self.cfg("llm_temperature", 0.7) or 0),
@@ -6612,6 +6613,16 @@ class Dota2Plugin(Star):
                 logger.error(f"[dota2] 专用模型调用失败（{client.endpoint}）：{e}")
             except Exception as e:  # noqa: BLE001
                 logger.error(f"[dota2] 专用模型调用出现异常：{e}", exc_info=True)
+            else:
+                # **成功也要留痕**。这里原来只 return，一声不响 —— 事后查
+                # 「这份战报到底走了哪条 key」时，日志里只有入口那轮的默认模型，
+                # 看起来像全程都在用默认 key（2026-10-24 排查就卡在这）。
+                logger.info(
+                    f"[dota2] 分析正文已生成（通道=专用模型 "
+                    f"{getattr(client, 'model', '') or '未命名'} · "
+                    f"{len(text or '')} 字 · {time.time() - started:.1f}s）"
+                )
+                return text
 
             if not self.cfg("llm_fallback_on_error", True):
                 logger.warning("[dota2] 已关闭回退，本次不做 AI 分析")
@@ -6626,11 +6637,18 @@ class Dota2Plugin(Star):
         if provider is None:
             logger.warning("[dota2] 没有可用的模型提供商，跳过 AI 分析")
             return None
+        started = time.time()
         try:
-            return await call_llm(provider, system_prompt, prompt)
+            text = await call_llm(provider, system_prompt, prompt)
         except Exception as e:  # noqa: BLE001
             logger.error(f"[dota2] 调用大模型失败: {e}", exc_info=True)
             return None
+        # 回退成功同样要留痕 —— 只有这样「专用通道没走成」才在日志里可见。
+        logger.info(
+            f"[dota2] 分析正文已生成（通道=回退 AstrBot 默认模型 · "
+            f"{len(text or '')} 字 · {time.time() - started:.1f}s）"
+        )
+        return text
 
     async def _generate_report(
         self, event: AstrMessageEvent, prompt: str

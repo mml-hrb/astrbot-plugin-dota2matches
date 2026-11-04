@@ -2406,12 +2406,21 @@ async def run_tool(name: str, arguments: Any, ctx: ToolContext) -> str:
     return out
 
 
+#: 参数摘要里**每个值**最多留多少字符。
+#:
+#: 原来是 16，对 `focus` 这种「多值塞一个字符串」的参数太短：`focus` 是
+#: 用「、」分隔的焦点玩家列表，截到 16 连第一个人名都露不全，排障时等于
+#: 看不出真实入参（2026-10-24 就因此把截断后的值当成完整参数，误判成
+#: 「焦点被悄悄带偏」）。放宽到 48 能看清头几个名字，一行 trace 仍可控。
+ARG_PREVIEW_LIMIT = 48
+
+
 def _brief_args(args: dict) -> str:
     parts = []
     for key, value in args.items():
         text = str(value or "").strip()
         if text:
-            parts.append(f"{key}={text[:16]}")
+            parts.append(f"{key}={text[:ARG_PREVIEW_LIMIT]}")
     return ", ".join(parts)
 
 
