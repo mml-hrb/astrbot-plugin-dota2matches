@@ -1043,6 +1043,270 @@ def gold_adv_metrics(match: dict) -> dict[str, Any] | None:
     }
 
 
+#: 团战里值得单独点名的**技能**片段（小写匹配技能内部名）。
+#:
+#: 这是筛子不是白名单：只用来从「这波团所有人放的所有技能」里挑出控制、
+#: 切入、保命这几类，纯输出小技能不占篇幅。漏判的代价是少提一句，
+#: 误判的代价是多占一行 prompt —— 所以宁可宽一点。
+#:
+#: 为什么不做「技能类型」的精确判断：OpenDota 只给技能内部名，没有
+#: is_control / is_ultimate 标注；STRATZ 的常量表也没有可靠字段。
+#: 与其维护一张 120 个英雄的表，不如按名字筛，剩下的交给模型判断。
+#:
+#: ⚠️ 关键词按**子串**匹配，所以要避开英雄名前缀：``doom`` 会把
+#: ``doom_bringer_devour`` / ``doom_bringer_scorched_earth`` 一起捞进来，
+#: 写成 ``_doom`` 才只命中大招 ``doom_bringer_doom``。
+FIGHT_KEY_ABILITY_HINTS: tuple[str, ...] = (
+    # 硬控 / 沉默 / 减速类
+    "stun", "impale", "hex", "root", "silence", "sleep", "fear", "leash",
+    "cyclone", "chronosphere", "black_hole", "ravage", "echo_slam",
+    "fiends_grip", "reverse_polarity", "vacuum", "hook", "arrow", "net",
+    "entangle", "shackle", "nightmare", "dream_coil", "deafening_blast",
+    "ice_path", "frostbite", "cold_feet", "berserkers_call", "_doom",
+    "culling_blade", "finger_of_death", "laguna_blade", "reaper_scythe",
+    "sonic_wave", "nether_blast", "soul_assumption", "last_word",
+    "static_storm", "tornado", "emp", "global_silence", "shrapnel",
+    # 切入 / 逃生 / 拉扯
+    "blink", "leap", "charge", "skewer", "shukuchi", "scurry", "pounce",
+    "burrowstrike", "waveform", "ball_lightning", "relocate", "sprout",
+)
+
+#: 团战里值得点名的**主动道具**（先手 / 保命 / 视野）。
+FIGHT_KEY_ITEM_HINTS: tuple[str, ...] = (
+    "blink", "black_king_bar", "bkb", "cyclone", "manta", "ghost", "lotus",
+    "glimmer", "force_staff", "hurricane_pike", "pipe", "crimson_guard",
+    "guardian_greaves", "mekansm", "solar_crest", "sheepstick", "orchid",
+    "bloodthorn", "nullifier", "atos", "diffusal", "heavens_halberd",
+    "smoke_of_deceit", "dust", "ward_dispenser", "gem", "refresher",
+    "aeon_disk", "satanic",
+)
+
+#: 团战附近算「相关视野」的最大距离（地图网格，整张图约 0~255）。
+FIGHT_VISION_RADIUS = 45
+
+#: 视野窗口：团战开打前多少秒开始算（团战本身通常几十秒）。
+FIGHT_VISION_WINDOW = 30
+
+
+def _matches_hint(name: Any, hints: tuple[str, ...]) -> bool:
+    """技能/道具内部名是否命中关键词表；空表视为「全部命中」。"""
+    if not hints:
+        return True
+    raw = str(name or "").lower()
+    return bool(raw) and any(h in raw for h in hints)
+
+
+def _key_uses(data: Any, hints: tuple[str, ...], limit: int) -> list[tuple[str, int]]:
+    """``{技能/道具名: 次数}`` → 命中关键词的前 ``limit`` 项（次数降序）。
+
+    只保留次数为正的项：``ability_uses`` 里偶尔会出现 0 次占位，
+    列出来会让模型误以为「他试过但没放出来」。
+    """
+    if not isinstance(data, dict):
+        return []
+    rows: list[tuple[str, int]] = []
+    for key, value in data.items():
+        if not _matches_hint(key, hints):
+            continue
+        count = _as_int(value)
+        if not count:
+            continue
+        rows.append((ability_label(key), count))
+    rows.sort(key=lambda item: (-item[1], item[0]))
+    return rows[:limit]
+
+
+def _fight_center(fight: dict) -> tuple[float, float] | None:
+    """用本波团所有阵亡坐标的均值当「交战中心」。
+
+    ``deaths_pos`` 的形状是 ``{x: {y: 次数}}``（两层嵌套），偶尔也会有
+    ``{x: y}`` 的扁平写法，两种都兼容。一个都没死（团战只消耗没死人）时
+    返回 ``None``，此时退化到用眼位坐标本身，不做距离过滤。
+    """
+    xs: list[float] = []
+    ys: list[float] = []
+    for entry in fight.get("players") or []:
+        if not isinstance(entry, dict):
+            continue
+        pos = entry.get("deaths_pos")
+        if not isinstance(pos, dict):
+            continue
+        for raw_x, inner in pos.items():
+            try:
+                x = float(raw_x)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(inner, dict):
+                for raw_y, count in inner.items():
+                    try:
+                        y = float(raw_y)
+                    except (TypeError, ValueError):
+                        continue
+                    times = max(1, _as_int(count) or 1)
+                    xs.extend([x] * times)
+                    ys.extend([y] * times)
+            else:
+                try:
+                    y = float(inner)
+                except (TypeError, ValueError):
+                    continue
+                xs.append(x)
+                ys.append(y)
+    if not xs:
+        return None
+    return (sum(xs) / len(xs), sum(ys) / len(ys))
+
+
+def _map_zone(x: float, y: float) -> str:
+    """把地图坐标粗分成「天辉侧 / 夜魇侧 / 地图中部」。
+
+    Dota 的网格坐标约 0~255：天辉基地在左下（约 60,60），夜魇在右上
+    （约 195,195）。**按到两个基地的距离分**，比按 ``x + y`` 阈值稳 ——
+    实测中路团战的死亡点 ``x + y`` 落在 218~328 之间，用阈值划分会把
+    几乎全部团战都判成「中部」，这个字段就白给了。
+
+    阈值 85 是「基地周围一片」的量级：再大就把河道也吞进去，再小则
+    连高地团都判不出来。**只用来给模型一个方位感**，不是精确区域名。
+    """
+    radiant = ((x - 60) ** 2 + (y - 60) ** 2) ** 0.5
+    dire = ((x - 195) ** 2 + (y - 195) ** 2) ** 0.5
+    if radiant <= 85 and radiant < dire:
+        return "天辉侧"
+    if dire <= 85 and dire < radiant:
+        return "夜魇侧"
+    return "地图中部"
+
+
+def _fight_actions(
+    fight: dict,
+    ordered_players: list[dict],
+    heroes: dict[int, dict],
+    focus_set: set[int],
+    *,
+    limit: int = 5,
+) -> list[str]:
+    """这波团里值得点名的技能 / 道具。
+
+    **焦点玩家全给**（技能 3 项 + 道具 2 项，不筛），因为复盘的重点就是他
+    做了什么；**其他人只给命中控制/切入/保命关键词的**（技能 2 项、道具 1 项），
+    否则十个人各列五个技能会把数据块刷爆，重点反而被淹掉。
+
+    输出形如 ``天辉 Hoodwink: bushwhack×3、scurry×2、道具·famango×1``。
+    道具带 ``道具·`` 前缀，是因为 ``ability_uses`` 里也可能出现物品名，
+    不区分的话模型会把「用了魔棒」当成「放了个技能」。
+    """
+    focus_rows: list[str] = []
+    other_rows: list[tuple[int, str]] = []
+
+    for slot, entry in enumerate(fight.get("players") or []):
+        if not isinstance(entry, dict):
+            continue
+        owner = ordered_players[slot] if slot < len(ordered_players) else {}
+        hero = hname(heroes, owner.get("hero_id")) if owner else ""
+        if not hero:
+            continue
+        side = "天辉" if slot < 5 else "夜魇"
+        account = _as_int(owner.get("account_id")) or 0
+        is_focus = account in focus_set
+
+        abilities = _key_uses(
+            entry.get("ability_uses"),
+            () if is_focus else FIGHT_KEY_ABILITY_HINTS,
+            3 if is_focus else 2,
+        )
+        items = _key_uses(
+            entry.get("item_uses"),
+            () if is_focus else FIGHT_KEY_ITEM_HINTS,
+            2 if is_focus else 1,
+        )
+        if not abilities and not items:
+            continue
+
+        bits = [f"{label}×{count}" for label, count in abilities]
+        bits += [f"道具·{label}×{count}" for label, count in items]
+        text = f"{side} {hero}: " + "、".join(bits)
+
+        if is_focus:
+            focus_rows.append(text)
+        else:
+            weight = sum(count for _, count in abilities + items)
+            other_rows.append((weight, text))
+
+    other_rows.sort(key=lambda item: (-item[0], item[1]))
+    ordered = focus_rows + [text for _, text in other_rows]
+    return ordered[:limit]
+
+
+def _vision_notes(
+    players: list[dict],
+    start: int,
+    end: int,
+    heroes: dict[int, dict],
+    center: tuple[float, float] | None,
+    *,
+    window: int = FIGHT_VISION_WINDOW,
+    limit: int = 5,
+) -> list[str]:
+    """团战窗口内（开打前 ``window`` 秒 ~ 团战结束）的插眼 / 排眼动作。
+
+    为什么这个有用：``obs_log`` / ``sen_log`` 带**时间 + 坐标**，
+    ``obs_left_log`` / ``sen_left_log`` 带**是谁排的**（``attackername``）。
+    按团战窗口一切，就能看出「这波团开打前一分钟，有没有人提前做视野 /
+    对面有没有把眼排掉」—— 这是伤害数字完全体现不出来的信息。
+
+    只保留团战附近的动作（``FIGHT_VISION_RADIUS`` 以内）：否则一场比赛里
+    全图插眼都会挤进每一波团，反而淹没重点。拿不到中心点时不做距离过滤。
+    """
+    rows: list[tuple[int, str]] = []
+    for player in players:
+        if not isinstance(player, dict):
+            continue
+        hero = hname(heroes, player.get("hero_id"))
+        for key, kind, removed in (
+            ("obs_log", "真眼", False),
+            ("sen_log", "假眼", False),
+            ("obs_left_log", "真眼", True),
+            ("sen_left_log", "假眼", True),
+        ):
+            for event in player.get(key) or []:
+                if not isinstance(event, dict):
+                    continue
+                when = _as_int(event.get("time"))
+                if when is None or not (start - window <= when <= end):
+                    continue
+                x = event.get("x")
+                y = event.get("y")
+                distance = None
+                if center and x is not None and y is not None:
+                    try:
+                        distance = (
+                            (float(x) - center[0]) ** 2
+                            + (float(y) - center[1]) ** 2
+                        ) ** 0.5
+                    except (TypeError, ValueError):
+                        distance = None
+                    if distance is not None and distance > FIGHT_VISION_RADIUS:
+                        continue
+                offset = when - start
+                clock = "开打前 %ds" % abs(offset) if offset < 0 else "开打后 %ds" % offset
+                if removed:
+                    killer = hname_by_npc(heroes, event.get("attackername"))
+                    # attackername 常常就是插眼者自己（眼自然到期 / 自己收掉），
+                    # 写「被自己排掉」会显得荒谬，这种情况只报「消失」。
+                    if killer and killer != hero:
+                        note = f"{clock} {hero} 的{kind}被 {killer} 排掉"
+                    else:
+                        note = f"{clock} {hero} 的{kind}到期消失"
+                else:
+                    note = f"{clock} {hero} 插{kind}"
+                if distance is not None:
+                    note += f"（距交战 {distance:.0f} 格）"
+                rows.append((when, note))
+    # 按**时间**排序，不是按字符串：否则「开打后」会排在「开打前」前面。
+    rows.sort(key=lambda item: (item[0], item[1]))
+    return [text for _, text in rows[:limit]]
+
+
 def summarize_teamfights(
     teamfights: list[dict],
     limit: int = 12,
@@ -1061,11 +1325,21 @@ def summarize_teamfights(
         focus_ids: 焦点玩家，会在每次团战里单独列出他们的贡献。
         focus_names: ``{account_id: 昵称}``。
 
-    每场团战输出主行（时间、阵亡人数、双方经济）＋可选的两条细节：
-    「谁死了」与「焦点玩家做了什么」。解析产物里 ``teamfights[].players``
-    本来就带 ``damage`` / ``healing`` / ``killed`` / ``deaths`` / ``gold_delta``
-    / ``xp_delta``，早期版本只把它们求和成一条经济数字，白白丢掉了
-    「这场团战谁在打输出、谁先死」这类最关键的复盘证据。
+    每场团战输出主行（时间、阵亡人数、双方经济）＋可选的细节：
+    「阵亡名单」「焦点玩家贡献」「交战区域」「关键动作」「视野」。
+
+    解析产物里 ``teamfights[].players`` 本来就带 ``damage`` / ``healing`` /
+    ``killed`` / ``deaths`` / ``gold_delta`` / ``xp_delta``，还带
+    ``ability_uses`` / ``item_uses`` / ``deaths_pos`` —— 早期版本只把前几项
+    求和成一条经济数字，把「这波团他放了什么技能、用了什么道具、死在哪」
+    这些纯看伤害看不出来的东西全扔了。
+
+    三样新细节的边界（必须让模型知道，见 ``dota_analyzer`` 的口径约束）：
+
+    * ``ability_uses`` 只有**次数**，没有出手顺序、也没有「打中了谁」；
+    * 视野来自 ``obs_log`` / ``sen_log`` 的**时间 + 坐标**，按团战窗口
+      对齐，只说明「有人在某时某地插/排了眼」，不等于「视野压制」；
+    * 交战区域是阵亡坐标的均值，只能给方位感，不是精确落点。
     """
     heroes = heroes or {}
     ordered_players = sorted(
@@ -1083,6 +1357,8 @@ def summarize_teamfights(
             break
         start = fmt_clock(fight.get("start"))
         end = fmt_clock(fight.get("end"))
+        raw_start = _as_int(fight.get("start"))
+        raw_end = _as_int(fight.get("end"))
         deaths = fight.get("deaths", 0)
         fighters = fight.get("players") or []
         radiant_gold = 0
@@ -1163,6 +1439,12 @@ def summarize_teamfights(
             f"（天辉 {radiant_deaths} / 夜魇 {dire_deaths}）· "
             f"天辉合计经济 {radiant_gold:+d} / 夜魇 {dire_gold:+d}"
         )
+        center = _fight_center(fight)
+        if center:
+            rows.append(
+                f"   交战区域: {_map_zone(*center)}"
+                f"（阵亡点中心约 {center[0]:.0f},{center[1]:.0f}）"
+            )
         if radiant_dead_names or dire_dead_names:
             dead_bits = []
             if radiant_dead_names:
@@ -1172,6 +1454,15 @@ def summarize_teamfights(
             rows.append("   阵亡: " + "；".join(dead_bits))
         for note in focus_notes:
             rows.append(f"   焦点贡献: {note}")
+        actions = _fight_actions(fight, ordered_players, heroes, focus_set)
+        if actions:
+            rows.append("   关键动作: " + "；".join(actions))
+        if raw_start is not None and raw_end is not None:
+            vision = _vision_notes(
+                ordered_players, raw_start, raw_end, heroes, center
+            )
+            if vision:
+                rows.append("   视野: " + "；".join(vision))
     return rows
 
 

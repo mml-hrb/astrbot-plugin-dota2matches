@@ -174,7 +174,7 @@ MAX_TOOL_FAILURES = 2
 MIN_MATCH_ID = 1_000_000_000
 
 #: 慢工具的 ``kind``（对应 :attr:`ToolContext.trigger_async` 的第一个参数）。
-ASYNC_KINDS: tuple[str, ...] = ("match_detail", "parse")
+ASYNC_KINDS: tuple[str, ...] = ("match_detail", "parse", "teamfight")
 
 
 @dataclass
@@ -643,6 +643,36 @@ def build_tool_specs(*, include_write: bool = True) -> list[dict]:
             },
             ["match_id"],
         ),
+        _spec(
+            "analyze_teamfight",
+            "对**某一波团战**做录像级深度复盘：能看到技能命中与施放顺序、控制的实际"
+            "持续时长、双方血量与蓝量轨迹、相对位置、眼位。"
+            "这些是普通战报（只看伤害击杀）看不出来的。"
+            "只有用户**点名要看某一波团**时才用 —— 例如「分析第 7 波」「看看 10 分钟"
+            "那波团为什么输」「第 3 波我打得怎么样」。编号来自复盘报告末尾的候选清单"
+            "（「本场值得单独深挖的团战」），不要自己编一个编号。"
+            "这个动作要下载并解析录像，通常 1–3 分钟，所以工具只**发起**并立刻返回，"
+            "复盘正文稍后由插件直接发到本会话。"
+            "如果用户没说第几波，先用 query_match_detail 出报告、让他从候选清单里挑。",
+            {
+                "match_id": {
+                    "type": "integer",
+                    "description": "比赛 ID（8~10 位数字）。用户说「这波」「刚才那场」时，"
+                                   "从会话上下文里取，不要编。",
+                },
+                "fight_index": {
+                    "type": "integer",
+                    "description": "第几波团（从 1 开始，对应候选清单里的「第 N 波」）。"
+                                   "用户说「第 7 波」就填 7。",
+                },
+                "focus": {
+                    "type": "string",
+                    "description": "可选：以谁为主视角复盘（昵称 / 32 位账号 ID）。"
+                                   "用户说「看看我这波打得怎么样」时填他本人。",
+                },
+            },
+            ["match_id", "fight_index"],
+        ),
         # ---------------- 写操作：只登记，必须用户确认 ----------------
         _spec(
             "manage_binding",
@@ -774,6 +804,7 @@ TOOL_READ_NAMES: tuple[str, ...] = (
 TOOL_ASYNC_NAMES: tuple[str, ...] = (
     "query_match_detail",
     "request_match_parse",
+    "analyze_teamfight",
 )
 
 #: **写操作**工具：只登记待确认动作，**绝不直接执行**。
@@ -2124,6 +2155,26 @@ async def _tool_request_match_parse(args: dict, ctx: ToolContext) -> str:
     return await _async_or_refuse(ctx, "parse", {"match_id": match_id})
 
 
+async def _tool_analyze_teamfight(args: dict, ctx: ToolContext) -> str:
+    match_id, why = _match_id_arg(args)
+    if match_id is None:
+        return why
+    index = _clamp_int(args.get("fight_index"), default=0, low=0, high=60)
+    if index <= 0:
+        # 不给编号等于没被告知是哪一波。这里**不猜**：猜错了要花 1–3 分钟
+        # 解析录像，还会给用户一份「不是你要的那波」的复盘。
+        return (
+            "需要指定「第几波团」（fight_index，从 1 开始）。"
+            "用户没说是哪一波的话，先用 query_match_detail 出一份复盘，"
+            "报告末尾的「值得单独深挖的团战」里有编号，让他挑一个。"
+        )
+    params: dict = {"match_id": match_id, "fight_index": index}
+    focus = str(args.get("focus") or "").strip()
+    if focus:
+        params["focus"] = focus
+    return await _async_or_refuse(ctx, "teamfight", params)
+
+
 # ---------------------------------------------------------------- 写操作
 
 
@@ -2325,6 +2376,7 @@ _DISPATCH: dict[str, Callable[[dict, ToolContext], Awaitable[str]]] = {
     "query_schedules": _tool_query_schedules,
     "query_match_detail": _tool_query_match_detail,
     "request_match_parse": _tool_request_match_parse,
+    "analyze_teamfight": _tool_analyze_teamfight,
     "manage_binding": _tool_manage_binding,
     "manage_watch": _tool_manage_watch,
     "manage_schedule": _tool_manage_schedule,

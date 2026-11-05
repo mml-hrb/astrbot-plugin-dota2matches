@@ -43,6 +43,8 @@ try:  # 插件目录被作为包加载时的相对导入
         dota_nlu,
         dota_parse,
         dota_pool,
+        dota_replay,
+        dota_replay_parse,
         dota_router,
         dota_schedule,
         dota_tools,
@@ -102,6 +104,8 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
     import dota_nlu  # type: ignore[no-redef]
     import dota_parse  # type: ignore[no-redef]
     import dota_pool  # type: ignore[no-redef]
+    import dota_replay  # type: ignore[no-redef]
+    import dota_replay_parse  # type: ignore[no-redef]
     import dota_router  # type: ignore[no-redef]
     import dota_schedule  # type: ignore[no-redef]
     import dota_tools  # type: ignore[no-redef]
@@ -258,6 +262,34 @@ DEFAULT_PARSE_MAX_CONCURRENT = 3
 #: 后台解析任务的登记表容量上限：超过后拒绝新的等待请求，
 #: 避免群里刷屏式提交把内存和配额一起吃光。
 MAX_PARSE_TASKS = 50
+
+#: 文转图的硬超时（秒）。超时后本次改发纯文本。
+#: 框架的 ``render_t2i`` 会逐个端点重试、每个端点吃满 aiohttp 默认的 5 分钟，
+#: 且 ``except BaseException`` 兜住取消 —— 不设这个上限时，一份 6700 字的战报
+#: 可以卡在出图上十几分钟，用户那边只看到一条标题（2026-11-05 实机事故）。
+#:
+#: ⚠️ **不要往下调**。曾经设成 45 秒，结果「慢」被当成了「失败」：实测一份
+#: 6743 字的战报要 **5~7 分钟**才能出图（端点池里第一个端点自己就吃掉 5 分钟），
+#: 于是**每一份**正常报告都超时回退成文本 —— 用户看到的就是「图片功能没了」
+#: （2026-11-05 用户第二次反馈）。慢是可以接受的，关键是别让用户对着
+#: 「报告已生成」干等，所以真正要修的是**发送顺序**，不是这个上限。
+#: 现在的等待期由调用方先发一句「正在排版成图片」，见 :meth:`_deliver_report`。
+IMAGE_RENDER_TIMEOUT = 480.0
+
+#: 图片体积上限（KB）。超过就不发了：QQ 官方通道是「读文件 → base64 → 上传」，
+#: 超大图会被平台拒收**且不抛异常**，最后表现为「图没来、正文也没来」。
+IMAGE_MAX_KB = 4096.0
+
+
+def _discard_task_result(task: "asyncio.Task[object]") -> None:
+    """吞掉被放弃任务的异常/取消，避免事件循环报「never retrieved」。
+
+    只用于 :meth:`_render_image` 超时后那个还在后台跑的渲染任务。
+    """
+    try:
+        task.exception()
+    except (asyncio.CancelledError, Exception):  # noqa: BLE001 - 目的就是全吞
+        pass
 
 
 def _fmt_clock(seconds: float) -> str:
@@ -941,6 +973,16 @@ class Dota2Plugin(Star):
         #: 等待解析的并发闸门：同时等待的场次上限由配置决定
         self._parse_sem: asyncio.Semaphore | None = None
         self._parse_sem_size = 0
+        #: 录像解析的**单线**队列（见 :mod:`dota_replay`）。
+        #:
+        #: 为什么必须串行：云端容器内存上限 900 MiB，AstrBot 本体已占约
+        #: 385 MiB，单场解析峰值约 160 MiB。一场很宽裕，两场并发就被 OOM
+        #: kill —— 而容器里的 PID 1 就是 AstrBot 自己，被杀等于整个机器人
+        #: 下线。所以**任何**录像解析任务都必须从这里排队，不许另起进程。
+        self.replay_queue = dota_replay.ReplayQueue()
+        #: 录像深挖的后台任务：``{key: task}``。与「等待解析」分开两张表，
+        #: 因为它们的并发约束不同 —— 等待解析受信号量限制，录像解析受队列限制。
+        self._replay_tasks: dict[str, asyncio.Task] = {}
         #: AstrBot「未来任务」的桥接器（见 :mod:`dota_cron`）。
         #:
         #: 时间型任务一律建在 AstrBot 的任务库里（``basic`` 任务），好处是
@@ -995,6 +1037,15 @@ class Dota2Plugin(Star):
 
     def _parse_task_key(self, umo: str, match_id: int, uid: str) -> tuple[str, int, str]:
         return (str(umo), int(match_id), str(uid))
+
+    def _fight_task_key(self, umo: str, match_id: int, index: int) -> str:
+        """单波团战任务的去重 key：谁 + 哪一场 + 第几波。
+
+        **指令路径与工具路径必须都走这里**。两边各拼各的字符串（一个
+        `f"{umo}|{mid}|{idx}"`、一个元组），key 就永远不相等，同一波会被排两次：
+        第二份报告还要再下载、再解析一遍录像，云端单线队列被白白占住几分钟。
+        """
+        return f"{umo}|{int(match_id)}|{int(index)}"
 
     def _start_parse_task(
         self,
@@ -1395,27 +1446,20 @@ class Dota2Plugin(Star):
         )
         report = await self._generate_report_for_umo(umo, prompt)
 
-        await self._parse_notify(umo, headline)
         if report:
-            image_url = await self._render_image(report)
-            if image_url:
-                try:
-                    await self._send(umo, MessageChain().file_image(image_url))
-                    return
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(f"[dota2] 推送复盘图片失败，回退为文本：{e}")
-            # 走统一分块出口。**行为变化**（第三批一并做掉）：原先这里是裸循环，
-            # 某一块抛异常会冒泡出 `_parse_and_analyze` —— 而它是个
-            # `loop.create_task` 出来的后台任务，done_callback 只负责把登记表里
-            # 的 key 摘掉，异常最终只会变成一条「Task exception was never
-            # retrieved」，同时**后面几块报告全部丢失**。现在改成逐块隔离 +
-            # 带块号的 error 日志，与指令路径（`_send_to_session`）一致。
-            await self._send_chunked(umo, report, label="复盘")
+            # 清单先并进正文，图片版与文本版才是同一份战报。
+            report = self._append_fight_candidates(
+                report, match, focus_ids, focus_names, heroes
+            )
+            # 标题不再单独先发：先发就等于告诉用户「好了」，然后要对着
+            # 5~7 分钟的出图干等（2026-11-05 用户原话）。
+            await self._deliver_report(umo, headline, report, label="复盘")
             return
 
         # 兜底路径自己要拿渲染常量（原先靠上游算好的局部变量，
         # 而那两个变量在收进 _build_match_prompt 时被一起搬走了 —— 见
         # _match_render_constants 的说明）。
+        await self._parse_notify(umo, headline)
         abilities, curve_ids = await self._match_render_constants(match, focus_ids)
         raw = (
             "⚠️ 未启用大模型分析或模型不可用，以下为从数据源获取的完整原始数据：\n\n"
@@ -1427,6 +1471,11 @@ class Dota2Plugin(Star):
                 abilities=abilities,
                 curve_ids=curve_ids,
             )
+        )
+        # 模型不可用时也照样给清单：它不依赖模型，而且「等这么久却连哪波
+        # 都点不了」比一份简略的原文更让人难受。
+        raw = self._append_fight_candidates(
+            raw, match, focus_ids, focus_names, heroes
         )
         # 同上：裸循环换成统一分块出口（逐块隔离 + 带块号的日志）。
         await self._send_chunked(umo, raw, label="原文")
@@ -1882,14 +1931,215 @@ class Dota2Plugin(Star):
         return chunks
 
     async def _render_image(self, text: str) -> str | None:
-        """把报告渲染成图片；未启用或失败时返回 None。"""
+        """把报告渲染成图片；未启用或失败时返回 None。
+
+        ⚠️ **必须传 ``return_url=False``**，让它返回**本地文件路径**。两个原因，
+        都是实测出来的（2026-11-05）：
+
+        1. ``text_to_image()`` 默认 ``return_url=True``，返回的是 t2i 服务的
+           静态资源 URL。而 QQ 官方适配器拿到 URL 后是**自己下载再转 base64**
+           发出去的，它用的是 aiohttp 默认 UA —— 实测那个 UA 会被 t2i 的
+           WAF 直接挂住（不是 403，是**超时**）：
+
+               UA=(默认)        → TimeoutError
+               UA=AstrBot/1.0   → HTTP 200 image/jpeg
+               UA=Mozilla/5.0   → HTTP 200 image/jpeg
+
+           ``return_url=False`` 走的是 ``POST /generate`` 直接取二进制，
+           不经过静态资源那条 WAF 规则，实测成功落盘。
+
+        2. 本地路径也顺带避开了「URL 被当路径」那一整类错误
+           （见 :meth:`_send_image`）。
+
+        ⚠️ **必须有硬超时**（2026-11-05 实机事故）。框架的 ``render_t2i`` 是
+        「逐个端点重试，每个端点最多等 aiohttp 的默认 5 分钟」，而它在
+        ``except BaseException`` 里还兜一层本地渲染 —— 单次调用可以挂十几分钟
+        都不返回。调用方（:meth:`_analyze_match_data`）是**先发标题、再出图、
+        最后发正文**，于是用户看到的就是「只收到一条战报头，正文再也没来」：
+
+            15:51:53 分析正文已生成（6743 字）
+            15:56:54 Endpoint https://t2i.soulter.top/text2img failed, trying next...
+            （正文始终没发出去）
+
+        所以这里用 ``asyncio.wait(timeout=...)`` 而不是直接 await：到点就走文本，
+        渲染任务丢在后台自行结束（它吞 CancelledError，``cancel()`` 拦不住，
+        只能不等它）。宁可以后补一张图，也不能让 6700 字的战报卡死在一张图上。
+        """
         if not self.cfg("analysis_as_image", True):
             return None
+
+        async def _call_t2i() -> str:
+            try:
+                return await self.text_to_image(text, return_url=False)
+            except TypeError:
+                # 极旧版本没有这个关键字参数：退回默认行为，靠 `_send_image`
+                # 按前缀分派来兜住 URL，不要让图片功能整个消失。
+                return await self.text_to_image(text)
+
+        started = time.time()
+        task = asyncio.ensure_future(_call_t2i())
+        done, _pending = await asyncio.wait({task}, timeout=IMAGE_RENDER_TIMEOUT)
+        if not done:
+            task.cancel()
+            # 取消后底层可能仍在跑（`render_t2i` 的 except BaseException 会
+            # 吞掉 CancelledError 继续走本地渲染）。挂一个回调把异常吃掉，
+            # 否则事件循环会打一条「Task exception was never retrieved」。
+            task.add_done_callback(_discard_task_result)
+            logger.warning(
+                f"[dota2] 文转图超过 {IMAGE_RENDER_TIMEOUT:.0f} 秒仍未返回，"
+                "本次改发纯文本（t2i 端点卡住不该拖住战报正文）"
+            )
+            return None
+
         try:
-            return await self.text_to_image(text)
+            path = task.result()
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[dota2] 文本转图片失败，回退为纯文本发送: {e}")
             return None
+
+        if not isinstance(path, str) or not path:
+            logger.warning(f"[dota2] 文转图返回了非路径值 {path!r}，改发纯文本")
+            return None
+
+        size_kb = 0.0
+        if not path.startswith("http"):
+            try:
+                size_kb = os.path.getsize(path) / 1024.0
+            except OSError as e:
+                logger.warning(f"[dota2] 文转图产物不存在（{path}）：{e}，改发纯文本")
+                return None
+            if size_kb <= 0:
+                logger.warning(f"[dota2] 文转图产物是空文件（{path}），改发纯文本")
+                return None
+            if size_kb > IMAGE_MAX_KB:
+                # QQ 官方通道是「下载/读取 → base64 → 上传」，超大图会被平台
+                # 拒收且不报错（见 `_send_image` 的返回值说明），不如直接发文本。
+                logger.warning(
+                    f"[dota2] 文转图产物 {size_kb:.0f} KB 超过上限 "
+                    f"{IMAGE_MAX_KB:.0f} KB，改发纯文本"
+                )
+                return None
+            self._prune_render_temp(os.path.dirname(path))
+
+        logger.info(
+            f"[dota2] 战报图片已生成（{size_kb:.0f} KB · {time.time() - started:.1f}s）"
+        )
+        return path
+
+    def _prune_render_temp(self, temp_dir: str, keep_hours: float = 2.0) -> None:
+        """清掉自己渲染出来的旧临时图。
+
+        ``return_url=False`` 会让框架把图落到 ``data/temp/io_temp_img_*.jpg``，
+        而**框架不清理**（实测 11-02 的文件还在）。每份报告一张，几百 KB 到
+        2 MB，长期跑会慢慢吃盘。
+
+        只删 ``io_temp_img_`` 这个框架固定前缀、且超过 ``keep_hours`` 的：
+        2 小时内的留着 —— 图片可能正在被流水线发送，删早了会发不出去。
+        任何异常都不抛：清缓存失败不该影响出图。
+        """
+        try:
+            now = time.time()
+            for name in os.listdir(temp_dir):
+                if not name.startswith("io_temp_img_"):
+                    continue
+                full = os.path.join(temp_dir, name)
+                try:
+                    if now - os.path.getmtime(full) > keep_hours * 3600:
+                        os.remove(full)
+                except OSError:
+                    continue
+        except OSError:
+            return
+
+    async def _send_image(self, umo: str, url_or_path: str) -> bool:
+        """把 t2i 的产物发到会话（后台任务用，没有 event 可依赖）。
+
+        Returns:
+            **明确的送达**才返回 True。平台返回非 True（含 ``None``）都算没送达 ——
+            QQ 官方适配器在图片上传被拒时是「不抛异常、返回 None」的，调用方
+            必须据此回退文本，否则那份战报就永远丢了（2026-11-05 实机事故：
+            用户只收到标题，正文再没出现）。
+
+        ⚠️ **不要直接写 ``MessageChain().file_image(x)``**。``file_image`` 是
+        *本地文件路径* 语义 —— 它内部执行 ``Path(x).resolve().as_uri()``。
+        而 ``text_to_image()`` 默认 ``return_url=True``，吐出来的是
+        ``https://t2i.xxx/text2img/data/rendered_xxx.jpeg``。把 URL 交给
+        ``file_image`` 会被当成相对路径解析：
+
+            Path("https://t2i.xxx/a.jpeg").resolve()
+              → /AstrBot/https:/t2i.xxx/a.jpeg
+              → file:///AstrBot/https%3A/t2i.xxx/a.jpeg
+
+        于是框架报 ``image file URI does not point to an existing file``，
+        插件回退成文本。**最坑的是它「有时能成」**：``render_t2i`` 的网络
+        策略失败时会 fallback 到本地渲染、返回真正的文件路径，这时
+        ``file_image`` 恰好是对的 —— 看起来就像「图片服务不稳定」，
+        实际是自己把 URL 当路径用（2026-11-05 查清）。
+
+        现在 ``_render_image`` 已经固定走本地路径，这里的前缀分派是**兜底**：
+        ``text_to_image`` 的返回值本来就是二选一，判据与框架
+        ``event.image_result`` 保持一致。
+        """
+        if url_or_path.startswith("http"):
+            chain = MessageChain().url_image(url_or_path)
+        else:
+            chain = MessageChain().file_image(url_or_path)
+        result = await self._send(umo, chain)
+        if result is not True:
+            logger.warning(
+                f"[dota2] 战报图片未确认送达（平台返回 {result!r}），改发文本"
+            )
+            return False
+        return True
+
+    async def _deliver_report(
+        self,
+        umo: str,
+        headline: str,
+        report: str,
+        *,
+        label: str = "复盘",
+        progress: str = "🖼 正在把战报排版成图片（可能要几分钟），好了直接发出来…",
+    ) -> bool:
+        """后台任务出口：**先生图，图好了再连标题一起发**。
+
+        Returns:
+            发出了图片版返回 True；回退成文本返回 False。
+
+        ⚠️ **所有后台复盘出口都必须走这里**（等解析完 / 降级 / 自然语言 /
+        定时复查 / 团战复盘）。这些出口原先各写一份「先发标题、再渲染、
+        再发正文」，只要顺序还是「先标题」，t2i 一慢就变成「标题到了、
+        正文半天不来」，从用户视角就是丢消息（2026-11-05 两次实机反馈）。
+
+        之所以不是「渲染失败就立刻发文本」：``_render_image`` 自己带硬超时
+        （:data:`IMAGE_RENDER_TIMEOUT`），它会如实返回 None，这里只管
+        「有图就发图、没图就发文本」，不再重复判断。
+        """
+        if not report:
+            return False
+
+        image_path = None
+        if self.cfg("analysis_as_image", True):
+            # 渲染期间先吱一声：5~7 分钟一句话都没有，用户会以为任务死了。
+            # 措辞刻意写「正在排版成图片」而不是「报告已生成」——
+            # 后者听起来像下一秒就到，正好是用户抱怨的那句。
+            if progress:
+                await self._parse_notify(umo, progress)
+            image_path = await self._render_image(report)
+
+        if headline:
+            await self._parse_notify(umo, headline)
+
+        if image_path:
+            try:
+                if await self._send_image(umo, image_path):
+                    return True
+            except Exception as e:  # noqa: BLE001 - 图发不出去不能连累正文
+                logger.warning(f"[dota2] 推送{label}图片失败，回退为文本：{e}")
+
+        # 没图 / 图没确认送达：正文必须补发。宁可重复一条，不能让它消失。
+        await self._send_chunked(umo, report, label=label)
+        return False
 
     async def _deliver_now(self, event: AstrMessageEvent, result) -> bool:
         """尽量把一条结果直接投递出去，成功返回 True。
@@ -1955,6 +2205,36 @@ class Dota2Plugin(Star):
                 yield event.image_result(url)
                 return
         for result in self._text_results(event, text):
+            yield result
+
+    async def _emit_report(
+        self, event: AstrMessageEvent, header: str, report: str
+    ):
+        """指令路径：**先生图，图好了再一起发**（header + 图片）。
+
+        ⚠️ 与 :meth:`_emit` 的区别只有**顺序**，但这个顺序是用户明确要求的
+        （2026-11-05）：「把发送顺序改一下，生好了图再一起发送，不要先说了
+        报告生成完了，然后又让用户等半天。」
+
+        原先的写法是 ``yield event.plain_result(header)`` 之后再 ``_emit(...,
+        as_image=True)`` —— header 立刻出去，然后渲染卡 5~7 分钟，用户视角
+        就是「说好了，然后正文消失了」。现在先渲染、再一起 yield：
+        两条消息紧挨着到，等待期只有一句如实的「正在排版成图片」。
+        """
+        if not report:
+            return
+        image_path = None
+        if self.cfg("analysis_as_image", True):
+            yield event.plain_result(
+                "🖼 正在把战报排版成图片（可能要几分钟），好了直接发出来…"
+            )
+            image_path = await self._render_image(report)
+        if header:
+            yield event.plain_result(header)
+        if image_path:
+            yield event.image_result(image_path)
+            return
+        for result in self._text_results(event, report):
             yield result
 
     # ==================================================================
@@ -3266,6 +3546,25 @@ class Dota2Plugin(Star):
         #
         # 去重本来就是按「谁 + 哪一场」来的，**不需要**再区分是谁发起的 ——
         # 指令还是工具，等待的是同一场比赛，就该共用同一个槽位。
+        #
+        # 团战同理，而且更严格：key 由 `_fight_task_key` 统一生成，
+        # 指令路径与工具路径都调它。两边各拼各的字符串，就会重演上面那个
+        # 「同一波排两次、发两份报告」的坑（第二份还要再下载一次录像）。
+        if kind == "teamfight":
+            index = int(params.get("fight_index") or 0)
+            note = self._spawn_fight_task(
+                umo, match_id, index, str(params.get("focus") or "").strip()
+            )
+            logger.info(
+                f"[dota2] 工具发起后台任务 teamfight: "
+                f"比赛 {match_id} 第 {index} 波（{umo}）"
+            )
+            return (
+                f"{note}\n"
+                "结果会由插件**直接发到本会话**，不需要再调用这个工具。"
+                "请简短告诉用户「已经开始了，稍后发到本群」，不要复述细节。"
+            )
+
         key = self._parse_task_key(umo, match_id, uid)
 
         # 排之前先看这个槽位有没有现成的任务在跑：有就如实回一句
@@ -3285,13 +3584,13 @@ class Dota2Plugin(Star):
             loop = asyncio.get_running_loop()
         except RuntimeError:  # pragma: no cover - 工具一定在事件循环里跑
             return "[后台任务启动失败] 当前没有运行中的事件循环。"
+        # 用户点名的焦点玩家（可为空）：由**插件**用本局十人名单去消歧解析
+        # （名字 → account_id 是插件的事），工具只负责把它原样转达过来。
+        focus = str(params.get("focus") or "").strip()
         if kind == "parse":
             coro = self._nlu_async_parse(umo, match_id)
             note = "已开始检查并申请解析"
         else:
-            # 用户点名的焦点玩家（可为空）：由**插件**用本局十人名单去消歧解析
-            # （名字 → account_id 是插件的事），工具只负责把它原样转达过来。
-            focus = str(params.get("focus") or "").strip()
             coro = self._nlu_async_match_detail(umo, uid, match_id, focus)
             note = "已开始复盘"
         task = loop.create_task(coro)
@@ -3515,9 +3814,14 @@ class Dota2Plugin(Star):
         """生成并发送单场复盘（工具路径的最终一段）。
 
         报告正文走 :meth:`_generate_report_for_umo`（不依赖 event），
-        发送走 :meth:`_send_to_session`（**纯文本**，与监听推送同一条通道）。
-        刻意不做图片渲染：后台任务里没有 event，而渲染失败时的回退分支
-        会让「报告已生成」这件事变得难以判断；文本先保证一定送达。
+        发送走 :meth:`_deliver_report` —— 与「等解析完再出」那条路径
+        **同一个出口**，图片、标题顺序、回退规则都一致。
+
+        ⚠️ 这里原先是「刻意不做图片渲染，纯文本先保证送达」。理由（后台
+        任务没有 event）在 ``_send_image`` 支持脱离 event 发送之后就不成立了，
+        而代价很实在：**自然语言触发的复盘从来没有图**。群里最常用的恰好
+        是这条路径（「分析这盘」），于是用户看到的是「新命令又只给文字」
+        （2026-11-05 反馈）。
         """
         try:
             headline, prompt = await self._build_match_prompt(
@@ -3535,8 +3839,11 @@ class Dota2Plugin(Star):
             return
 
         if report:
-            await self._send_to_session(umo, headline)
-            await self._send_to_session(umo, report)
+            # 清单并进正文，跟指令路径出的战报是同一份东西。
+            report = self._append_fight_candidates(
+                report, match, focus_ids, focus_names, heroes
+            )
+            await self._deliver_report(umo, headline, report, label="复盘")
             logger.info(f"[dota2] 工具复盘已推送: 比赛 {match_id} → {umo}")
             return
         # 模型不可用：退化成原始数据，至少让用户拿到东西
@@ -3552,6 +3859,9 @@ class Dota2Plugin(Star):
                 abilities=abilities,
                 curve_ids=curve_ids,
             )
+        )
+        raw = self._append_fight_candidates(
+            raw, match, focus_ids, focus_names, heroes
         )
         await self._send_to_session(umo, raw)
 
@@ -4490,8 +4800,7 @@ class Dota2Plugin(Star):
         )
         report = await self._generate_report(event, prompt)
         if report:
-            yield event.plain_result(header)
-            async for item in self._emit(event, report, as_image=True):
+            async for item in self._emit_report(event, header, report):
                 yield item
             return
 
@@ -4686,8 +4995,7 @@ class Dota2Plugin(Star):
             f"{note}"
         )
         if report:
-            yield event.plain_result(header)
-            async for item in self._emit(event, report, as_image=True):
+            async for item in self._emit_report(event, header, report):
                 yield item
         else:
             summary = summarize_matches(matches, economy_samples=economy_samples)
@@ -4700,6 +5008,85 @@ class Dota2Plugin(Star):
             )
             for result in self._text_results(event, fallback):
                 yield result
+
+    # ==================================================================
+    # 录像深度解析：环境检测 / 候选清单 / 单线排队
+    # ==================================================================
+    def _replay_engine_dir(self) -> str:
+        """解析引擎目录（默认在 ``data/work`` 下，容器重建不丢）。"""
+        raw = str(self.cfg("replay_engine_dir", "") or "").strip()
+        return raw or dota_replay.DEFAULT_ENGINE_DIR
+
+    def _replay_runtime(self) -> dota_replay.RuntimeStatus:
+        """检测录像解析环境，缺失时给出可直接照做的安装提示。"""
+        return dota_replay.check_runtime(
+            engine_dir=self._replay_engine_dir(),
+            java_path=str(self.cfg("replay_java_path", "") or "").strip(),
+            keyword="/d2",
+        )
+
+    def _render_fight_candidates(
+        self,
+        match: dict,
+        focus_ids: list[int],
+        focus_names: dict[int, str],
+        heroes: dict[int, dict],
+    ) -> str:
+        """报告末尾的候选团战清单。
+
+        只用 OpenDota 的 ``teamfights``，不碰录像、不调模型 ——
+        所以它对**任何**已解析的对局都成立，也不受「有没有装解析引擎」影响。
+        """
+        try:
+            return dota_replay.render_candidates(
+                match,
+                focus_ids=focus_ids,
+                focus_names=focus_names,
+                hero_name=lambda hero_id: hname(heroes, hero_id),
+                keyword="/d2",
+                match_id=match.get("match_id"),
+            )
+        except Exception as e:  # noqa: BLE001 - 附加信息不能拖垮整份复盘
+            logger.warning(f"[dota2] 生成候选团战清单失败：{e}")
+            return ""
+
+    def _append_fight_candidates(
+        self,
+        report: str,
+        match: dict,
+        focus_ids: list[int],
+        focus_names: dict[int, str],
+        heroes: dict[int, dict] | None = None,
+    ) -> str:
+        """把「可以点开的团战」清单**拼进战报正文的末尾**。
+
+        为什么是拼进正文，而不是报告之后再发一条 —— 这是 2026-11-05 的返工：
+        初版做成独立一条消息，结果 ① 图片版战报（整段 ``report`` 渲染出来）
+        里根本没有这一段，看图的人压根不知道有这回事；② 聊天记录里它跟
+        「⚠️ 未解析」之类的收尾消息混在一起，很容易被当成系统提示漏掉。
+        用户要的是「这盘的战报顺便告诉我哪几波值得看」，不是两份东西。
+
+        为什么必须**纯代码生成**、不能让模型写进正文：
+        ① 编号必须稳定 —— 用户下一句就说「第 7 波」，而模型每次输出的措辞
+           和顺序都不保证一致，同一个人隔天问就指到别的团去了；
+        ② 它只依赖 ``teamfights``，对任何已解析的对局都成立，
+           跟有没有装录像引擎无关，不该占模型的输出空间。
+
+        提示词那边也已经交代「不要自己给团战编号」（见 ``_build_match_prompt``），
+        免得正文里出现一套编号、清单里又是一套。
+        """
+        try:
+            text = self._render_fight_candidates(
+                match, focus_ids, focus_names, heroes or {}
+            )
+        except Exception as e:  # noqa: BLE001 - 附加信息不能拖垮整份复盘
+            logger.warning(f"[dota2] 生成候选团战清单失败：{e}")
+            return report
+        if not text:
+            # 未解析的对局没有 teamfights，这时清单本来就不该出现
+            return report
+        # text 以空行开头，rstrip 掉正文尾巴正好只留一个空行
+        return report.rstrip() + "\n" + text
 
     # ==================================================================
     # 指令：单场复盘
@@ -4865,8 +5252,12 @@ class Dota2Plugin(Star):
 
         report = await self._generate_report(event, prompt)
         if report:
-            yield event.plain_result(headline)
-            async for item in self._emit(event, report, as_image=True):
+            # 清单并进正文再发：图片版与文本版是同一份战报，
+            # 而不是「报告一条、清单一条」两份东西。
+            report = self._append_fight_candidates(
+                report, match, focus_ids, focus_names, heroes
+            )
+            async for item in self._emit_report(event, headline, report):
                 yield item
         else:
             abilities, curve_ids = await self._match_render_constants(
@@ -4884,8 +5275,326 @@ class Dota2Plugin(Star):
                     curve_ids=curve_ids,
                 )
             )
+            raw = self._append_fight_candidates(
+                raw, match, focus_ids, focus_names, heroes
+            )
             for result in self._text_results(event, raw):
                 yield result
+
+    # ==================================================================
+    # 指令：录像级团战复盘
+    # ==================================================================
+    @d2.command("fight", alias={"团战", "复盘团战", "打团"})
+    @take_over_event
+    async def d2_fight(self, event: AstrMessageEvent, args: GreedyStr):
+        """录像级复盘某一波团：/d2 团战 <比赛ID> <第N波> [焦点玩家]
+
+        编号来自单场复盘报告末尾的候选清单。``/d2 团战 环境`` 用来检查
+        解析环境 —— 插件市场装来的用户需要先装 JRE 与解析引擎。
+        """
+        args = self._args_with_quote(event, args, mode="match")
+        tokens = [t for t in re.split(r"\s+", str(args).strip()) if t]
+
+        if tokens and tokens[0] in ("环境", "env", "检查", "status"):
+            yield event.plain_result(self._replay_runtime().describe())
+            return
+
+        if not tokens or len(tokens) < 2 or not re.fullmatch(r"\d{6,20}", tokens[0]):
+            yield event.plain_result(
+                "用法：`/d2 团战 <比赛ID> <第几波> [焦点玩家]`\n"
+                "例如：`/d2 团战 9073189779 7`\n"
+                "编号来自单场复盘报告末尾的「值得单独深挖的团战」。\n"
+                "· 检查解析环境：`/d2 团战 环境`"
+            )
+            return
+
+        match_id = int(tokens[0])
+        index = dota_replay.parse_fight_reference(tokens[1])
+        if index is None:
+            yield event.plain_result("❌ 第二项写第几波，例如 `7` 或 `第7波`。")
+            return
+        focus_raw = " ".join(tokens[2:]).strip()
+
+        # 环境检测放在最前面：缺 JRE / 引擎时不必先花时间拉数据，
+        # 直接告诉用户怎么装，而不是等十几秒再抛个栈。
+        status = self._replay_runtime()
+        if not status.ok:
+            yield event.plain_result(status.describe())
+            return
+
+        yield event.plain_result(self._spawn_fight_task(
+            event.unified_msg_origin, match_id, index, focus_raw
+        ))
+
+    def _spawn_fight_task(
+        self, umo: str, match_id: int, index: int, focus_raw: str
+    ) -> str:
+        """起一个「单波团战深挖」后台任务，返回要告诉用户的那句话。
+
+        指令（``/d2 团战``）与 AI 工具（``analyze_teamfight``）共用这一个入口：
+        去重 key、排队提示、异常回调三处只要有一处各写一份，就会出现
+        「同一波排两次」或者「工具路径漏了排队提示」这类不一致。
+        """
+        key = self._fight_task_key(umo, match_id, index)
+        existing = self._replay_tasks.get(key)
+        if existing is not None and not existing.done():
+            return "ℹ️ 这一波已经在分析了，完成后会发到本会话，不用重复提交。"
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - 两个入口都在事件循环里
+            return "[后台任务启动失败] 当前没有运行中的事件循环。"
+
+        task = loop.create_task(self._analyze_fight(umo, match_id, index, focus_raw))
+        self._replay_tasks[key] = task
+
+        # 具名闭包 + 默认参数：既躲开晚绑定，也能让类型推断过 mypy
+        def _forget(_task: object, k: str = key) -> None:
+            self._replay_tasks.pop(k, None)
+
+        task.add_done_callback(_forget)
+
+        waiting = self.replay_queue.pending()
+        if waiting:
+            return (
+                f"⏳ 已排队：前面还有 {waiting} 个解析任务。"
+                "（同一时刻只跑一个，避免把容器内存撑爆）"
+            )
+        return "⏳ 开始解析录像并复盘这一波团，大约 1–3 分钟，完成后发到本会话。"
+
+    async def _analyze_fight(
+        self, umo: str, match_id: int, index: int, focus_raw: str
+    ) -> None:
+        """后台任务：解析录像某一波团并让模型复盘（``/d2 团战`` 的落地）。"""
+        # 环境检测在**两条入口**都要做：指令路径在 d2_fight 里已经拦过一次，
+        # 但工具路径（模型自己发起的）也走这里，缺 JRE 时同样得给安装提示。
+        status = self._replay_runtime()
+        if not status.ok:
+            await self._send_to_session(umo, status.describe())
+            return
+        try:
+            await self._analyze_fight_inner(umo, match_id, index, focus_raw)
+        except asyncio.CancelledError:
+            raise
+        except dota_replay_parse.ReplayError as e:
+            await self._send_to_session(umo, f"❌ 录像解析失败：{e}")
+        except Exception as e:  # noqa: BLE001 - 后台任务不能把异常抛给事件循环
+            logger.exception(f"[dota2] 团战复盘失败：{e}")
+            await self._send_to_session(umo, f"❌ 团战复盘出错：{e}")
+
+    async def _analyze_fight_inner(
+        self, umo: str, match_id: int, index: int, focus_raw: str
+    ) -> None:
+        match = await self.api.get_match(match_id)
+        if not match:
+            await self._send_to_session(umo, f"❌ 查不到比赛 {match_id}。")
+            return
+        fights = match.get("teamfights") or []
+        if not (1 <= index <= len(fights)):
+            await self._send_to_session(
+                umo,
+                f"❌ 这场比赛只识别出 {len(fights)} 波团，没有第 {index} 波。\n"
+                f"用 `/d2 单场 {match_id}` 重新看一遍候选清单。",
+            )
+            return
+
+        heroes = await self._heroes()
+        items_const = await self._items()
+
+        focus_ids: list[int] = []
+        focus_names: dict[int, str] = {}
+        if focus_raw:
+            players_in_match = [p for p in (match.get("players") or []) if isinstance(p, dict)]
+            focus_ids, focus_names, failed = await self._resolve_focuses(
+                focus_raw, players_in_match, umo=umo
+            )
+            if failed and not focus_ids:
+                await self._send_to_session(
+                    umo,
+                    "❌ 焦点玩家没能解析出来：\n"
+                    + "\n".join(f"· {item}" for item in failed)
+                    + "\n可以直接用 32 位账号 ID 再试一次。",
+                )
+                return
+        # 后台任务手里没有 event，刻意不做「会话绑定自动聚焦」：
+        # 绑定可能是别人的，自动聚焦到错的人比不聚焦更糟。没点名就按全局视角复盘。
+
+        fight = fights[index - 1]
+        label = f"比赛 {match_id} 第 {index} 波"
+
+        # 真正的重活从这里开始，**必须**过队列：同一时刻只允许一个 JVM 在跑。
+        block = await self.replay_queue.run(
+            label,
+            lambda: self._build_replay_block(match, fight, heroes, items_const),
+        )
+
+        await self._send_to_session(umo, f"🔍 {label} 录像解析完成，正在生成复盘…")
+        prompt = self._fight_prompt(match, fight, index, block, focus_ids, focus_names)
+        report = await self._generate_report_for_umo(umo, prompt)
+        if report:
+            # 团战复盘同样是「长报告」：走统一出口，先出图再发。
+            # headline 传空 —— 上面那句「正在生成复盘」已经交代过上下文了。
+            await self._deliver_report(umo, "", report, label="团战复盘")
+        else:
+            await self._send_to_session(
+                umo,
+                "⚠️ 未启用大模型分析或模型不可用，以下是这一波的原始数据：\n\n" + block,
+            )
+
+    async def _build_replay_block(
+        self, match: dict, fight: dict, heroes: dict[int, dict], items_const: dict[str, dict]
+    ) -> str:
+        """下载 → 解压 → 解析 → 组装数据块。整个函数在队列里串行执行。"""
+        match_id = int(match.get("match_id") or 0)
+        engine = self._replay_engine_dir()
+        workdir = os.path.join(engine, "replays", str(match_id))
+        os.makedirs(workdir, exist_ok=True)
+
+        combat_path = os.path.join(workdir, "combat.jsonl")
+        hp_path = os.path.join(workdir, "hp.csv")
+        ward_path = os.path.join(workdir, "ward.csv")
+        items_path = os.path.join(workdir, "items.csv")
+
+        # 产物格式会随版本变（例如 hp.csv 后来才加了「复活时刻」这一列）。
+        # 不认版本号的话，旧缓存会被当成新数据用：复活倒计时永远算不出来，
+        # 而且**不会报错**，只是数据静默变旧。
+        marker = os.path.join(workdir, "cache_version")
+        want_version = "2"
+        if os.path.exists(combat_path):
+            try:
+                with open(marker, encoding="utf-8") as fh:
+                    cached_version = fh.read().strip()
+            except OSError:
+                cached_version = ""
+            if cached_version != want_version:
+                for name in ("combat.jsonl", "hp.csv", "ward.csv", "items.csv"):
+                    try:
+                        os.remove(os.path.join(workdir, name))
+                    except OSError:
+                        pass
+                logger.info(f"[dota2] 比赛 {match_id} 的录像缓存版本过旧，已清理待重解析")
+
+        if not os.path.exists(combat_path):
+            url = str(match.get("replay_url") or "").strip()
+            if not url:
+                raise dota_replay_parse.ReplayError(
+                    "这场比赛没有可用的录像地址（录像通常只保留两周，过期就下不到了）"
+                )
+            demo = os.path.join(workdir, "m.dem")
+            packed = os.path.join(workdir, "m.dem.bz2")
+            if not os.path.exists(demo):
+                await dota_replay_parse.download_replay(url, packed)
+                dota_replay_parse.unpack_replay(packed, demo)
+                try:
+                    os.remove(packed)
+                except OSError:
+                    pass
+            java = self._replay_runtime().java
+            await dota_replay_parse.run_java(java, engine, "Snap", [demo, hp_path, ward_path])
+            await dota_replay_parse.run_java(java, engine, "Dump", [demo, combat_path])
+            await dota_replay_parse.run_java(java, engine, "Eco", [demo, items_path])
+            # demo 有 37 MB，产物只有 7 MB 左右。产物留着（同一场再分析不同波次
+            # 不用重解析），demo 必须删 —— 否则每场都攒 37 MB，云端磁盘会满。
+            try:
+                os.remove(demo)
+            except OSError:
+                pass
+            with open(marker, "w", encoding="utf-8") as fh:
+                fh.write(want_version)
+            logger.info(f"[dota2] 比赛 {match_id} 录像解析完成（{workdir}）")
+
+        combat = dota_replay_parse._read_combat(combat_path)
+        hp_series = dota_replay_parse._read_hp(hp_path)
+        offsets = dota_replay_parse.calibrate(combat, hp_series, match)
+        items = dota_replay_parse.read_items(items_path)
+        wards = dota_replay_parse.read_wards(ward_path, 0.0)
+
+        npc_label: dict[str, str] = {}
+        npc_by_hero: dict[int, str] = {}
+        for hero_id, info in (heroes or {}).items():
+            if not isinstance(info, dict):
+                continue
+            npc = str(info.get("name") or "")
+            if npc:
+                npc_label[npc] = hname(heroes, hero_id)
+                npc_by_hero[int(hero_id)] = npc
+
+        def _item_label(key: str) -> str:
+            info = items_const.get(key) or {}
+            return str(info.get("dname") or info.get("name") or key)
+
+        return dota_replay_parse.build_fight_block(
+            match,
+            fight,
+            combat=combat,
+            hp_series=hp_series,
+            items=items,
+            wards=wards,
+            offsets=offsets,
+            npc_label=npc_label,
+            hero_of=lambda hero_id: hname(heroes, hero_id),
+            npc_by_hero=npc_by_hero,
+            item_label=_item_label,
+        )
+
+    def _fight_prompt(
+        self,
+        match: dict,
+        fight: dict,
+        index: int,
+        block: str,
+        focus_ids: list[int],
+        focus_names: dict[int, str],
+    ) -> str:
+        """构造「以某个人为主视角复盘这一波团」的提示词。
+
+        口径写死的几条：不许编造没给的字段；没有数据就说没有；
+        判定失误必须同时给出「替代方案」和「当时来不来得及执行」。
+        """
+        who = ""
+        if focus_ids:
+            aid = int(focus_ids[0])
+            who = focus_names.get(aid) or str(aid)
+
+        head = [
+            "你是 Dota 2 教练。下面是一场真实比赛的某一波团战的**录像级**数据，",
+            "包含比分数据看不到的东西：双方血量与蓝量轨迹、相对坐标、控制技能的实际",
+            "持续时长、技能与道具的施放记录、眼位时间与位置。",
+            "",
+        ]
+        if who:
+            head.append(
+                f"请以 **{who}** 为主视角复盘这波团：他打得怎么样，哪里能做得更好。"
+            )
+            head.append(
+                "评价他之前先交代条件：经济差、等级差、装备差、队友在不在。"
+                "如果这波团本身就是「条件上打不过」，要明说，不要把必败团算成他的失误。"
+            )
+        else:
+            head.append("请复盘这波团：谁打得对、谁出了问题、关键转折在哪。")
+
+        tail = [
+            "",
+            "写作要求：",
+            "1. 先给一句结论（打得好 / 一般 / 打得差），再说理由。",
+            "2. 按时间顺序点名关键时刻，引用**具体数据**（几点几分、血量多少、控了几秒）。",
+            "3. 判定为失误的，必须给出「当时应该怎么做」以及「凭什么说他来得及做」"
+            "（例如：他当时位置在哪、有没有被控、技能在不在手上）。如果数据不足以判断"
+            "来不来得及，就写「数据不足以下判断」，不要硬判。",
+            "4. 只使用上面给出的数据。买活只给了「本波买活次数」，没给「他还有没有钱再买活」，"
+            "后者写「未知」；技能冷却时间、队友语音也不在数据里。**一律不要编造**。",
+            "5. 数据里出现「阵亡读秒中……团战开始后 N 秒回来」时，**必须用上**："
+            "队友马上就到时，控场英雄先手或留人是配合，不是送；反之如果所有人复活都在"
+            "二三十秒后，那这波就是少打多，别按「队友该跟上」去怪他。"
+            "判断先手/追击是否合理时，先看这一行，再看血量。",
+            "6. 最后给 2–3 条可执行的改进点，别写「多练练」这种空话。",
+            "7. 全文 1200–2000 字，直接输出正文，不要客套。",
+            "",
+            "以下是数据：",
+            "",
+            block,
+        ]
+        return "\n".join(head + tail)
 
     # ==================================================================
     # 指令：催解析（只催不等，适合还没打算看复盘时先排上队）
@@ -6279,7 +6988,13 @@ class Dota2Plugin(Star):
         await self._send_quiet(umo, headline)
         # 原先这里是「for 分块 → `_send_quiet`」的第 5 份手写循环：单块失败会
         # 直接跳出循环、后面的报告全部丢失，且没有任何日志。走统一出口。
-        await self._send_chunked(umo, report, label="复盘")
+        report = self._append_fight_candidates(
+            report, match, focus_ids, focus_names, heroes
+        )
+        # 定时复查也是「复盘」，跟其它出口同一套发送规则（先出图、再连标题发）。
+        # headline 上面已经发过了（它同时兼作「已经开始出分析」的提示），
+        # 这里传空，避免同一句话出现两次。
+        await self._deliver_report(umo, "", report, label="复盘")
 
     def _recheck_focus(self, umo: str, match: dict) -> tuple[list[int], dict[int, str]]:
         """复查单场时的焦点玩家：本会话**唯一**绑定的那位，且得在这局里。
@@ -8045,6 +8760,23 @@ class Dota2Plugin(Star):
                 await parse_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+        # 录像解析队列：worker 里可能正跑着 java 子进程。stop() 会取消它，
+        # 子进程在 ``run_java`` 的 finally 里被 kill —— 否则热重载之后
+        # 那个 JVM 会一直占着 160 MB，几次下来容器就 OOM 了。
+        replay_tasks = list(self._replay_tasks.values())
+        self._replay_tasks.clear()
+        for task in replay_tasks:
+            if not task.done():
+                task.cancel()
+        for task in replay_tasks:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        try:
+            await self.replay_queue.stop()
+        except Exception as e:  # noqa: BLE001 - 清理失败不能挡住卸载
+            logger.warning(f"[dota2] 停止录像解析队列时出错：{e}")
         await self.api.close()
         esports = getattr(self, "esports", None)
         if esports is not None:

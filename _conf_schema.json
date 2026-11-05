@@ -368,6 +368,18 @@
     "default": 3,
     "hint": "每个等待中的场次每分钟会产生一次查询请求，并发过高容易触发 OpenDota 限流。超出上限时新的请求会退化为「直接用基础数据出报告」。"
   },
+  "replay_engine_dir": {
+    "description": "录像解析引擎目录",
+    "type": "string",
+    "default": "",
+    "hint": "留空则用默认的 data/work/dota-replay。目录里需要有 classes/（导出器）与 lib/（Clarity 等 jar）。解析录像需要额外的 JRE，详见「/d2 团战 环境」的输出。"
+  },
+  "replay_java_path": {
+    "description": "Java 可执行文件路径",
+    "type": "string",
+    "default": "",
+    "hint": "留空则依次尝试：引擎目录下的 jre/bin/java、系统 PATH 里的 java。需要 Java 21 或更高。"
+  },
   "watch_enabled": {
     "description": "启用比赛监听",
     "type": "bool",
