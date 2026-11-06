@@ -280,6 +280,18 @@ IMAGE_RENDER_TIMEOUT = 480.0
 #: 超大图会被平台拒收**且不抛异常**，最后表现为「图没来、正文也没来」。
 IMAGE_MAX_KB = 4096.0
 
+#: 取胜率曲线的总预算（秒），含下载 + 解压 + 解析。
+#:
+#: 实测：国内 CDN 下 21 MB 的录像包约 1 秒（见 ``dota_replay_parse``
+#: 的 ``DOWNLOAD_TIMEOUT`` 注释），解压 2~3 秒，导出胜率 6.5 秒 ——
+#: 正常十来秒就完了。给到 150 秒是为了兜住「CDN 抽风」那种慢，而不是
+#: 常态等待；超时就当这段没有，战报照出，绝不因为一个可选段落拖垮主流程。
+WIN_CURVE_TOTAL_TIMEOUT = 150.0
+
+#: 胜率缓存版本。取数口径一变就加一，让旧缓存自然失效 ——
+#: 否则旧算法算出来的曲线会被当成新数据用，而且**不会报错**。
+WIN_CURVE_CACHE_VERSION = 1
+
 
 def _discard_task_result(task: "asyncio.Task[object]") -> None:
     """吞掉被放弃任务的异常/取消，避免事件循环报「never retrieved」。
@@ -1428,6 +1440,9 @@ class Dota2Plugin(Star):
         与 ``d2_match`` 共用同一套提示词构造逻辑，保证「等解析出来的复盘」
         与「直接查已解析比赛的复盘」完全一致。
         """
+        # 幂等：d2_match 那条路径已经踢过了，这里再踢一次是为另外几条
+        # 直接进来的路径（监听推送、工具调用）兜底。
+        self._prefetch_win_curve(match)
         try:
             heroes = await self._heroes()
             items = await self._items()
@@ -1448,7 +1463,7 @@ class Dota2Plugin(Star):
 
         if report:
             # 清单先并进正文，图片版与文本版才是同一份战报。
-            report = self._append_fight_candidates(
+            report = await self._append_fight_candidates(
                 report, match, focus_ids, focus_names, heroes
             )
             # 标题不再单独先发：先发就等于告诉用户「好了」，然后要对着
@@ -1474,7 +1489,7 @@ class Dota2Plugin(Star):
         )
         # 模型不可用时也照样给清单：它不依赖模型，而且「等这么久却连哪波
         # 都点不了」比一份简略的原文更让人难受。
-        raw = self._append_fight_candidates(
+        raw = await self._append_fight_candidates(
             raw, match, focus_ids, focus_names, heroes
         )
         # 同上：裸循环换成统一分块出口（逐块隔离 + 带块号的日志）。
@@ -1715,6 +1730,10 @@ class Dota2Plugin(Star):
             match_id, focus_ids, focus_names, heroes
         )
         abilities, curve_ids = await self._match_render_constants(match, focus_ids)
+        # 2026-11-05：战报一生成就拉录像拿胜率曲线。模型看到「这波之后
+        # 胜率从 79% 跳到 88%」才可能做出真正的归因；只看阵亡人数，
+        # 它会把「死了七个人」的劣势互换团当成胜负手。
+        win_block = await self._win_curve_block(match, match_id, heroes)
         prompt = build_single_match_analysis_prompt(
             match=match,
             heroes=heroes,
@@ -1724,6 +1743,7 @@ class Dota2Plugin(Star):
             extra_context=extra_context,
             abilities=abilities,
             curve_ids=curve_ids,
+            win_curve=win_block,
         )
         return headline, prompt
 
@@ -3840,7 +3860,7 @@ class Dota2Plugin(Star):
 
         if report:
             # 清单并进正文，跟指令路径出的战报是同一份东西。
-            report = self._append_fight_candidates(
+            report = await self._append_fight_candidates(
                 report, match, focus_ids, focus_names, heroes
             )
             await self._deliver_report(umo, headline, report, label="复盘")
@@ -3860,7 +3880,7 @@ class Dota2Plugin(Star):
                 curve_ids=curve_ids,
             )
         )
-        raw = self._append_fight_candidates(
+        raw = await self._append_fight_candidates(
             raw, match, focus_ids, focus_names, heroes
         )
         await self._send_to_session(umo, raw)
@@ -5025,17 +5045,76 @@ class Dota2Plugin(Star):
             keyword="/d2",
         )
 
+    #: 环境检测结果的缓存时长（秒）。``check_runtime`` 要起一次 ``java -version``
+    #: 子进程，而每份战报收尾时都要问一句「环境装没装」—— 不缓存等于每份报告
+    #: 多起一个进程。60 秒是折中：用户装完环境再问，最多等一分钟就生效；
+    #: 而 ``/d2 团战 环境`` 这类主动查询永远走实时检测，见 :meth:`_replay_runtime`。
+    RUNTIME_CACHE_TTL = 60.0
+
+    _runtime_cache: "tuple[float, dota_replay.RuntimeStatus] | None" = None
+
+    def _replay_runtime_cached(self) -> dota_replay.RuntimeStatus:
+        """带缓存的环境检测，只给「战报要不要附一句提示」这种旁路用。"""
+        now = time.monotonic()
+        cached = self._runtime_cache
+        if cached is not None and now - cached[0] < self.RUNTIME_CACHE_TTL:
+            return cached[1]
+        status = self._replay_runtime()
+        self._runtime_cache = (now, status)
+        return status
+
+    def _invalidate_runtime_cache(self) -> None:
+        """装完环境回来查一次，就该立刻生效，不能等缓存过期。"""
+        self._runtime_cache = None
+
+    def _missing_curve_hint(self) -> str:
+        """战报末尾的「为什么没有胜负走势」说明。
+
+        **两种缺席必须分开说**，因为它们对读者的下一步完全不同：
+
+        * 环境没装 —— 自己能解决，给出装什么、去哪查，装完战报会变详细；
+        * 环境装了但这局取不到 —— 录像过期 / 地址缺失 / 数据不足，
+          照着提示装环境是白折腾，只会让人以为是装错了。
+
+        文案刻意不用反引号包命令、也不用 ``**``：正文在 QQ 里是纯文本，
+        反引号会原样显示；而本地兜底渲染没有中文字形，反引号里的「团战」
+        两个字会变成豆腐块（见 ``dota_replay.render_candidates`` 的注释）。
+        """
+        if self._replay_runtime_cached().ok:
+            return (
+                "\n---\n\n"
+                "本报告没有「胜负走势」\n\n"
+                "- 原因：这场比赛的录像暂时取不到（录像过期、地址缺失，"
+                "或录像里没有胜率数据）。装解析环境也解决不了，不用去折腾。\n"
+                "- 其余分析照常输出；关键转折点按阵亡人数与经济差判断，不按胜率。"
+            )
+        return (
+            "\n---\n\n"
+            "本报告没有「胜负走势」，录像级复盘也还用不了\n\n"
+            "- 原因：这台机器还没装录像解析环境（需要 Java 21+ 与解析引擎），"
+            "插件读不到录像里的胜率曲线。\n"
+            # 措辞刻意不写「上面的清单」：未解析的对局压根没有清单，
+            # 而「没装环境」和「这局没解析」经常同时发生（新用户查老比赛）。
+            "- 装上之后：战报会多出整局胜率曲线、按胜率影响排序的关键转折点、"
+            "选完人时的阵容优劣基线；团战清单也会改按胜率排序，"
+            "回复 /d2 团战 那条指令才真正可用。\n"
+            "- 怎么装：发 /d2 团战 环境，它会逐条列出缺哪一样、该放在哪里。"
+            "其余部分照常可读，不受影响。"
+        )
+
     def _render_fight_candidates(
         self,
         match: dict,
         focus_ids: list[int],
         focus_names: dict[int, str],
         heroes: dict[int, dict],
+        curve: "dota_replay.WinCurve | None" = None,
     ) -> str:
         """报告末尾的候选团战清单。
 
-        只用 OpenDota 的 ``teamfights``，不碰录像、不调模型 ——
-        所以它对**任何**已解析的对局都成立，也不受「有没有装解析引擎」影响。
+        ``teamfights`` 本身对**任何**已解析的对局都成立，所以这段永远能出；
+        ``curve`` 只是把「哪波值得看」的排序从阵亡人数换成胜率影响 ——
+        拿不到曲线时自动退回旧口径，不影响清单存在。
         """
         try:
             return dota_replay.render_candidates(
@@ -5045,12 +5124,13 @@ class Dota2Plugin(Star):
                 hero_name=lambda hero_id: hname(heroes, hero_id),
                 keyword="/d2",
                 match_id=match.get("match_id"),
+                curve=curve,
             )
         except Exception as e:  # noqa: BLE001 - 附加信息不能拖垮整份复盘
             logger.warning(f"[dota2] 生成候选团战清单失败：{e}")
             return ""
 
-    def _append_fight_candidates(
+    async def _append_fight_candidates(
         self,
         report: str,
         match: dict,
@@ -5076,17 +5156,255 @@ class Dota2Plugin(Star):
         免得正文里出现一套编号、清单里又是一套。
         """
         try:
+            # 2026-11-05：清单的排序口径换成胜率影响。曲线拿不到时
+            # 这里是 None，render_candidates 会自动退回阵亡人数口径，
+            # 所以这段在没装录像引擎的机器上照样出得来。
+            curve = await self._aligned_curve(
+                match, int(match.get("match_id") or 0)
+            )
             text = self._render_fight_candidates(
-                match, focus_ids, focus_names, heroes or {}
+                match, focus_ids, focus_names, heroes or {}, curve=curve
             )
         except Exception as e:  # noqa: BLE001 - 附加信息不能拖垮整份复盘
             logger.warning(f"[dota2] 生成候选团战清单失败：{e}")
-            return report
-        if not text:
+            curve, text = None, ""
+
+        # 曲线缺席必须交代一句。不交代的话，读者只会看到「这份战报比别人的
+        # 少了点什么」，然后怀疑是数据丢了 —— 而实际原因可能只是没装环境，
+        # 装完就变详细。所以提示要说清「差什么、怎么补、补了多什么」。
+        #
+        # 这段**只进正文、不进提示词**：模型看到它只会原样复述一遍，
+        # 而读者需要的是知道去哪装。
+        hint = "" if curve is not None else self._missing_curve_hint()
+        extra = "\n".join(part for part in (text, hint) if part)
+        if not extra:
             # 未解析的对局没有 teamfights，这时清单本来就不该出现
             return report
         # text 以空行开头，rstrip 掉正文尾巴正好只留一个空行
-        return report.rstrip() + "\n" + text
+        return report.rstrip() + "\n" + extra
+
+    # ==================================================================
+    # 胜负走势（录像胜率曲线）
+    # ==================================================================
+
+    def _win_cache_read(self, path: str) -> dict | None:
+        """读胜率缓存；版本不符或读坏了都当没有。"""
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        try:
+            version = int(data.get("version") or 0)
+        except (TypeError, ValueError):
+            return None
+        if version != WIN_CURVE_CACHE_VERSION:
+            return None
+        curve = data.get("curve")
+        return curve if isinstance(curve, dict) and curve.get("chance") else None
+
+    def _win_cache_write(self, path: str, curve: dict) -> None:
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {"version": WIN_CURVE_CACHE_VERSION, "curve": curve},
+                    fh,
+                    ensure_ascii=False,
+                )
+        except OSError as e:
+            logger.debug(f"[dota2] 胜率缓存写入失败（不影响出报告）：{e}")
+
+    async def _fetch_win_curve(
+        self, match: dict, match_id: int, engine: str, workdir: str
+    ) -> dict:
+        """下载录像并只导出胜率。**不跑完整解析**，所以六秒多就回来。"""
+        status = self._replay_runtime()
+        if not status.ok:
+            raise dota_replay_parse.ReplayError("录像解析环境未就绪")
+
+        url = str(match.get("replay_url") or "").strip()
+        if not url:
+            raise dota_replay_parse.ReplayError("这场比赛没有可用的录像地址")
+
+        os.makedirs(workdir, exist_ok=True)
+        # 故意不复用 ``m.dem``：那个名字属于完整解析（三件产物），
+        # 两边同时跑会互相删掉对方正在读的文件。
+        demo = os.path.join(workdir, "win.dem")
+        packed = os.path.join(workdir, "win.dem.bz2")
+        try:
+            if not os.path.exists(demo):
+                await dota_replay_parse.download_replay(url, packed)
+                dota_replay_parse.unpack_replay(packed, demo)
+            return await dota_replay_parse.export_win_curve(
+                status.java, engine, demo
+            )
+        finally:
+            # 38 MB 的 demo 绝不留：云端磁盘只有那么点，每场攒一份很快就满。
+            for path in (packed, demo):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    async def _fetch_win_curve_cached(
+        self, match: dict, match_id: int
+    ) -> dict | None:
+        """真正干活的那半：缓存 → 下载录像 → 轻量解析 → 落缓存。
+
+        任何一步失败都返回 ``None``（环境没装、录像过期、超时、解析崩），
+        战报照常出，只是少一段。
+        """
+        engine = self._replay_engine_dir()
+        workdir = os.path.join(engine, "replays", str(match_id))
+        cache_path = os.path.join(workdir, "winchance.json")
+
+        cached = self._win_cache_read(cache_path)
+        if cached:
+            return cached
+        try:
+            curve = await asyncio.wait_for(
+                self._fetch_win_curve(match, match_id, engine, workdir),
+                timeout=WIN_CURVE_TOTAL_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[dota2] 比赛 {match_id} 取胜率曲线超时"
+                f"（{int(WIN_CURVE_TOTAL_TIMEOUT)} 秒），本次不带胜负走势"
+            )
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - 可选段落，失败就算了
+            logger.warning(f"[dota2] 比赛 {match_id} 取胜率曲线失败：{e}")
+            return None
+        self._win_cache_write(cache_path, curve)
+        logger.info(
+            f"[dota2] 比赛 {match_id} 胜率曲线就绪"
+            f"（{len(curve.get('chance') or [])} 点）"
+        )
+        return curve
+
+    def _win_curve_task(self, match: dict, match_id: int) -> "asyncio.Task[dict | None]":
+        """同一场比赛只跑一份胜率任务，谁先来谁触发，后来者共享结果。
+
+        共享不只是省一次下载：两处各跑一遍会出现「走势说第 3 波最关键、
+        清单却把第 7 波排第一」这种自相矛盾 —— 判据必须只有一份。
+        """
+        tasks: dict[int, "asyncio.Task[dict | None]"] = getattr(
+            self, "_win_curve_tasks", None
+        ) or {}
+        self._win_curve_tasks = tasks
+        task = tasks.get(match_id)
+        if task is not None and not task.done():
+            return task
+        task = asyncio.create_task(self._fetch_win_curve_cached(match, match_id))
+        tasks[match_id] = task
+
+        def _forget(finished: "asyncio.Task[dict | None]") -> None:
+            if tasks.get(match_id) is finished:
+                tasks.pop(match_id, None)
+
+        task.add_done_callback(_forget)
+        return task
+
+    def _prefetch_win_curve(self, match: dict) -> None:
+        """把胜率任务提前踢起来，**不等它**。
+
+        2026-11-05 用户指出的一点：出战报本来就要先催 OpenDota 解析、
+        在那儿等好几分钟，那段时间足够下载 21 MB 录像并把胜率导出来。
+        所以胜率必须在「等解析」之前就开跑，而不是等数据齐了再串行去做 ——
+        并行之后这条链的净开销接近于零。
+        """
+        match_id = int(match.get("match_id") or 0)
+        if not match_id:
+            return
+        if not str(match.get("replay_url") or "").strip():
+            return
+        try:
+            self._win_curve_task(match, match_id)
+        except Exception as e:  # noqa: BLE001 - 起任务失败不该影响主流程
+            logger.debug(f"[dota2] 预取胜率任务启动失败：{e}")
+
+    async def _load_win_curve(self, match: dict, match_id: int) -> dict | None:
+        """取整局胜率曲线（缓存 / 已在跑的任务 / 现跑一份）。"""
+        cache_path = os.path.join(
+            self._replay_engine_dir(), "replays", str(match_id), "winchance.json"
+        )
+        cached = self._win_cache_read(cache_path)
+        if cached:
+            return cached
+        task = self._win_curve_task(match, match_id)
+        try:
+            return await task
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[dota2] 等待胜率任务失败：{e}")
+            return None
+
+    async def _aligned_curve(
+        self, match: dict, match_id: int
+    ) -> "dota_replay.WinCurve | None":
+        """已经对到比赛时间轴上的胜率曲线；拿不到返回 ``None``。
+
+        多一层内存缓存的原因：同一份战报里，「胜负走势」和「候选团战清单」
+        都要用它，而后者藏在同步的渲染链路里。判据也必须共用同一份 ——
+        两处各算一遍迟早会出现「走势说第 3 波最关键、清单却把第 7 波排第一」。
+        """
+        if not match_id:
+            return None
+        memo: dict[int, "dota_replay.WinCurve"] = getattr(
+            self, "_win_curve_memo", None
+        ) or {}
+        self._win_curve_memo = memo
+        if match_id in memo:
+            return memo[match_id]
+
+        raw = await self._load_win_curve(match, match_id)
+        if not raw:
+            return None
+        try:
+            aligned = dota_replay.align_curve(raw, match)
+        except Exception as e:  # noqa: BLE001 - 对齐失败不算致命
+            logger.warning(f"[dota2] 比赛 {match_id} 胜率对齐失败：{e}")
+            return None
+        if not aligned.ok:
+            logger.info(
+                f"[dota2] 比赛 {match_id} 胜率点太少"
+                f"（{len(aligned.points)}），跳过胜负走势"
+            )
+            return None
+        if len(memo) > 16:
+            memo.clear()
+        memo[match_id] = aligned
+        return aligned
+
+    async def _win_curve_block(
+        self,
+        match: dict,
+        match_id: int,
+        heroes: dict[int, dict],
+        *,
+        keyword: str = "/d2",
+    ) -> str:
+        """「胜负走势」文本块；拿不到曲线时返回空串。"""
+        aligned = await self._aligned_curve(match, match_id)
+        if aligned is None:
+            return ""
+        try:
+            return dota_replay.render_win_curve(
+                aligned,
+                match,
+                hero_name=lambda hero_id: hname(heroes, hero_id),
+                keyword=keyword,
+                match_id=match_id,
+            )
+        except Exception as e:  # noqa: BLE001 - 同上是可选段落
+            logger.warning(f"[dota2] 渲染胜负走势失败：{e}")
+            return ""
 
     # ==================================================================
     # 指令：单场复盘
@@ -5136,6 +5454,10 @@ class Dota2Plugin(Star):
                 f"{match_id} 的解析` 试一次。"
                     )
                 return
+            # 胜率任务在这里就踢起来，**不等它**：下面拉常量、解析焦点、
+            # 等 OpenDota 出数据要花几十秒到几分钟，足够把录像下回来
+            # 并把胜率导出来（实测下载约 1 秒 + 导出 6.5 秒）。
+            self._prefetch_win_curve(match)
             heroes = await self._heroes()
             items = await self._items()
             # 记进会话语境：紧接着问「再详细说说这把」时不用再报 ID。
@@ -5254,7 +5576,7 @@ class Dota2Plugin(Star):
         if report:
             # 清单并进正文再发：图片版与文本版是同一份战报，
             # 而不是「报告一条、清单一条」两份东西。
-            report = self._append_fight_candidates(
+            report = await self._append_fight_candidates(
                 report, match, focus_ids, focus_names, heroes
             )
             async for item in self._emit_report(event, headline, report):
@@ -5275,7 +5597,7 @@ class Dota2Plugin(Star):
                     curve_ids=curve_ids,
                 )
             )
-            raw = self._append_fight_candidates(
+            raw = await self._append_fight_candidates(
                 raw, match, focus_ids, focus_names, heroes
             )
             for result in self._text_results(event, raw):
@@ -5296,6 +5618,9 @@ class Dota2Plugin(Star):
         tokens = [t for t in re.split(r"\s+", str(args).strip()) if t]
 
         if tokens and tokens[0] in ("环境", "env", "检查", "status"):
+            # 主动来查往往就是「刚装完想确认一下」，所以顺手清掉缓存，
+            # 让紧接着的那份战报立刻用上新环境，而不是先等一分钟。
+            self._invalidate_runtime_cache()
             yield event.plain_result(self._replay_runtime().describe())
             return
 
@@ -6988,7 +7313,7 @@ class Dota2Plugin(Star):
         await self._send_quiet(umo, headline)
         # 原先这里是「for 分块 → `_send_quiet`」的第 5 份手写循环：单块失败会
         # 直接跳出循环、后面的报告全部丢失，且没有任何日志。走统一出口。
-        report = self._append_fight_candidates(
+        report = await self._append_fight_candidates(
             report, match, focus_ids, focus_names, heroes
         )
         # 定时复查也是「复盘」，跟其它出口同一套发送规则（先出图、再连标题发）。

@@ -143,6 +143,60 @@ async def run_java(
     return text
 
 
+#: 胜率曲线的输出标记。``run_java`` 把 stderr 并进了 stdout，
+#: 不加标记的话 slf4j 的日志会和 JSON 混在一起。
+WIN_MARKER = "WINCHANCE:"
+
+#: 只导胜率时的 JVM 上限与超时。实测 38 MB demo 用 6.5 秒、157 MB 内存 ——
+#: 它不解析战斗日志、不采样血量，比完整解析轻两个数量级。
+WIN_HEAP_MB = 256
+WIN_TIMEOUT = 120.0
+
+
+async def export_win_curve(
+    java: str,
+    engine: str,
+    demo: str,
+    *,
+    timeout: float = WIN_TIMEOUT,
+) -> dict:
+    """只导出整局胜率曲线，**不碰战斗日志**。
+
+    为什么要有这条轻量路径（2026-11-05）：战报要回答「哪一波才是关键团」，
+    而阵亡人数和经济增量都回答不了 —— 实测有一波死了七个人，胜率只动了
+    一个点（是劣势下的互换）；另一波只死三个，胜率却跳了九个点。
+    判关键团得看「这波之后局势有没有变」，而这正是 Valve 在观战界面
+    自己算的那条曲线。它写在 demo 里，读出来整局只要六秒多。
+
+    Returns:
+        ``{"start": float, "end": float, "chance": list[int],
+        "radiant": list[int], "dire": list[int],
+        "series": list[[float, float]]}``
+
+        ``start`` / ``end`` 与 ``series`` 的时间都是 **demo 时间**（含选人），
+        换算成比赛时间要减去 ``end - duration``，见
+        :func:`dota_replay.align_curve`。
+
+    Raises:
+        ReplayError: JVM 起不来、超时，或输出里没有曲线数据。
+    """
+    text = await run_java(
+        java, engine, "WinCurve", [demo], heap_mb=WIN_HEAP_MB, timeout=timeout
+    )
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if not line.startswith(WIN_MARKER):
+            continue
+        try:
+            data = json.loads(line[len(WIN_MARKER):])
+        except ValueError as exc:
+            raise ReplayError(f"胜率曲线解析失败：{exc}") from exc
+        if isinstance(data, dict) and data.get("chance"):
+            return data
+        break
+    raise ReplayError("胜率曲线导出失败：录像里没有曲线数据")
+
+
 # ======================================================================
 # 时间标定
 # ======================================================================
