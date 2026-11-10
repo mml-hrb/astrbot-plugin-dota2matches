@@ -25,6 +25,8 @@
   让插件只在被明确点名时才接手；
 * :func:`match_session_name` —— 把用户写的昵称对上本会话「真查出来的」
   绑定 / 监听名单（全名精确 → 简称反查），指令侧与工具侧共用；
+* :func:`match_hero_owner` —— 把**英雄名**对上本局玩它的玩家，
+  给「以祈求者为主视角」这类说法落地用；
 * :data:`WHEELCHAIR_SELF_WORDS` / :data:`NLU_STRIP_CMD_PREFIXES` ——
   两个纯词表常量，分别给「指本人」与「指令前缀」判定用。
 
@@ -39,12 +41,13 @@ from dataclasses import dataclass
 from typing import Iterable
 
 try:  # 插件目录被作为包加载时的相对导入
-    from . import dota_schedule
+    from . import dota_hero_playstyle, dota_schedule
 except ImportError:  # 兜底：以普通模块方式加载时，把插件目录加入 sys.path
     import os
     import sys
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import dota_hero_playstyle  # type: ignore[no-redef]
     import dota_schedule  # type: ignore[no-redef]
 
 # ======================================================================
@@ -1082,6 +1085,68 @@ def match_session_name(value: str, names: Iterable[str]) -> str:
         if piece_low in name.lower():
             return name
     return piece
+
+
+#: 英雄 ID 的上界。Valve 的英雄 ID 目前最大 155，留一倍余量；
+#: 超过它的纯数字只可能是账号 ID，不能拿去当英雄查。
+_MAX_HERO_ID = 300
+
+
+def match_hero_owner(
+    query: str,
+    players: Iterable[dict],
+    heroes: dict | None,
+) -> tuple[str, list[tuple[int, str]]]:
+    """把**英雄名**对到本局玩它的玩家：``(英雄显示名, [(account_id, 昵称)])``。
+
+    这是「以祈求者为主视角」这类说法的落地口径：用户点的是**英雄**，
+    复盘要的是**账号**，中间这一步只能由本局十人名单回答 —— 模型并不知道
+    谁玩了什么，让它自己猜就成了「同一局里挑个顺眼的」。
+
+    三条边界：
+
+    * **只看本局**。不查外部名单、不联网。认不出就是认不出 ——
+      猜一个「常玩这个英雄的人」比不认更糟，而且错得毫无痕迹。
+    * **大数字不当英雄**。:func:`resolve_hero` 会把纯数字当英雄 ID，
+      但 focus 位置上出现 5~10 位数字那是账号，必须让上层按账号解析。
+    * **两边同英雄时返回多个命中**。普通匹配 / 随机征召允许双方选同一个
+      英雄，这时「以祈求者为主视角」本身就有歧义；调用方要如实问是哪一边，
+      不能挑一个继续写。
+
+    Args:
+        query: 用户（或模型）给的名字：中文名 / 英文名 / npc 名 / 英雄 ID。
+        players: 本局十人（``match["players"]``），按 ``hero_id`` 反查。
+        heroes: 英雄常量表 ``{hero_id: {...}}``。
+
+    Returns:
+        ``(英雄显示名, 命中列表)``；认不出英雄时是 ``("", [])``。
+    """
+    text = str(query or "").strip()
+    if not text:
+        return "", []
+    if text.isdigit() and int(text) > _MAX_HERO_ID:
+        return "", []
+    resolved = dota_hero_playstyle.resolve_hero(heroes, text)
+    if not resolved:
+        return "", []
+    hero_id, hero_name = resolved
+    hits: list[tuple[int, str]] = []
+    for player in players or ():
+        if not isinstance(player, dict):
+            continue
+        account_id = player.get("account_id")
+        if not account_id:
+            continue
+        try:
+            same = int(player.get("hero_id") or 0) == int(hero_id)
+        except (TypeError, ValueError):
+            continue
+        if not same:
+            continue
+        hits.append(
+            (int(account_id), str(player.get("personaname") or f"账号{account_id}"))
+        )
+    return hero_name, hits
 
 
 def _wheelchair_pool_hit(value: str, names: tuple[str, ...]) -> str:

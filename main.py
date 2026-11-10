@@ -20,7 +20,7 @@ import re
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Sequence
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
@@ -55,12 +55,15 @@ try:  # 插件目录被作为包加载时的相对导入
         LLMRequestError,
         OpenAICompatibleClient,
         ProviderToolClient,
+        build_attribution_prompt,
         build_hero_pick_prompt,
         build_recent_analysis_prompt,
         build_single_match_analysis_prompt,
         build_watch_comment_prompt,
         call_llm,
+        inject_attribution,
         resolve_provider,
+        split_report_prompt,
     )
     from .dota_api import (
         FallbackDataSource,
@@ -115,12 +118,15 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
         LLMRequestError,
         OpenAICompatibleClient,
         ProviderToolClient,
+        build_attribution_prompt,
         build_hero_pick_prompt,
         build_recent_analysis_prompt,
         build_single_match_analysis_prompt,
         build_watch_comment_prompt,
         call_llm,
+        inject_attribution,
         resolve_provider,
+        split_report_prompt,
     )
     from dota_api import (  # type: ignore[no-redef]
         FallbackDataSource,
@@ -263,22 +269,40 @@ DEFAULT_PARSE_MAX_CONCURRENT = 3
 #: 避免群里刷屏式提交把内存和配额一起吃光。
 MAX_PARSE_TASKS = 50
 
-#: 文转图的硬超时（秒）。超时后本次改发纯文本。
-#: 框架的 ``render_t2i`` 会逐个端点重试、每个端点吃满 aiohttp 默认的 5 分钟，
-#: 且 ``except BaseException`` 兜住取消 —— 不设这个上限时，一份 6700 字的战报
-#: 可以卡在出图上十几分钟，用户那边只看到一条标题（2026-11-05 实机事故）。
+#: 文转图的硬超时（秒）。超时后本次改发纯文本，绝不让一张图拖住正文。
 #:
-#: ⚠️ **不要往下调**。曾经设成 45 秒，结果「慢」被当成了「失败」：实测一份
-#: 6743 字的战报要 **5~7 分钟**才能出图（端点池里第一个端点自己就吃掉 5 分钟），
-#: 于是**每一份**正常报告都超时回退成文本 —— 用户看到的就是「图片功能没了」
-#: （2026-11-05 用户第二次反馈）。慢是可以接受的，关键是别让用户对着
-#: 「报告已生成」干等，所以真正要修的是**发送顺序**，不是这个上限。
-#: 现在的等待期由调用方先发一句「正在排版成图片」，见 :meth:`_deliver_report`。
-IMAGE_RENDER_TIMEOUT = 480.0
+#: 2026-11-07 起**只走本地 Pillow 渲染**（见 :meth:`_render_image`），
+#: 不再有「逐个远程端点重试、每个端点 5 分钟」这回事。实测同一份 4098 字
+#: 战报本地只要 0.7 秒；60 秒纯粹是防止 Pillow 在异常输入上卡死的保险。
+#:
+#: 历史上这里是 480 秒，注释还写着「不要往下调」—— 因为当时走远程，
+#: 6743 字战报要 5~7 分钟，设成 45 秒会让**每一份**都超时回退成文本。
+#: 那个约束在去掉远程之后就不成立了，别再把旧注释当成不许改的理由。
+IMAGE_RENDER_TIMEOUT = 60.0
 
 #: 图片体积上限（KB）。超过就不发了：QQ 官方通道是「读文件 → base64 → 上传」，
 #: 超大图会被平台拒收**且不抛异常**，最后表现为「图没来、正文也没来」。
 IMAGE_MAX_KB = 4096.0
+
+#: 判定「这张图其实没画出内容」的暗像素占比下限（百分比）。
+#:
+#: 2026-11-06 实机事故：远程 t2i 主端点挂掉后，备用端点对**任何输入**都返回
+#: 同一张 800×720 / 5.4 KB 的图 —— 只有页头、正文一片空白，而框架的
+#: ``download_image_by_url`` 只下载不校验内容，用户连收两份空白战报。
+#: 这正是 2026-11-07 改成默认本地出图的直接原因。
+#:
+#: 现在渲染产物只来自本地 Pillow，理论上不会再出现那种图，但这道**产物质检**
+#: 仍然留着：本地渲染器哪天坏了、或者框架换了实现，它会先一步把空图丢掉，
+#: 而不是又发一张白图到群里。解码一次直方图是毫秒级开销，不值得省。
+#:
+#: 实测（同一份 4098 字战报，取灰度 < 100 的像素占比）：
+#:
+#: - 事故空白图：**0.137%**
+#: - 本地 Pillow 正常渲染：**8.068%**
+#:
+#: 差 60 倍，取 1.0% 当下限。深色主题的图暗像素更多，只会更容易通过，
+#: 不会被误判成空白。
+IMAGE_BLANK_DARK_PCT = 1.0
 
 #: 取胜率曲线的总预算（秒），含下载 + 解压 + 解析。
 #:
@@ -291,6 +315,34 @@ WIN_CURVE_TOTAL_TIMEOUT = 150.0
 #: 胜率缓存版本。取数口径一变就加一，让旧缓存自然失效 ——
 #: 否则旧算法算出来的曲线会被当成新数据用，而且**不会报错**。
 WIN_CURVE_CACHE_VERSION = 1
+
+
+def _is_blank_histogram(
+    hist: Sequence[int],
+    *,
+    min_pct: float = IMAGE_BLANK_DARK_PCT,
+) -> bool:
+    """判断一张灰度直方图是不是「几乎没画出内容」。
+
+    只看一件事：灰度 < 100 的像素占比。空白图的页头（logo + 版本号）占了
+    那 0.1% 左右，正文一个字没有；正常渲染的战报是 8% 上下。
+
+    拆成纯函数是为了能直接喂数字测：调用方负责从图片取直方图，
+    这里不碰文件、不依赖 PIL。
+
+    Args:
+        hist: 长度 256 的灰度直方图（Pillow ``Image.histogram()`` 的返回值）。
+        min_pct: 判定为空白时允许的最大暗像素占比（百分比）。
+
+    Returns:
+        暗像素占比低于 ``min_pct`` 时返回 True。直方图为空（读不出像素）时
+        返回 False —— 这种「不知道」的情况交给体积校验去挡，不在这里猜。
+    """
+    total = sum(hist)
+    if total <= 0:
+        return False
+    dark = sum(hist[:100])
+    return dark / total * 100.0 < min_pct
 
 
 def _discard_task_result(task: "asyncio.Task[object]") -> None:
@@ -547,7 +599,7 @@ HELP_TEXT = """🎮 Dota2 数据查询助手（数据来源：STRATZ / OpenDota 
 　　　　　　　　　　　　　　　 核心 / 中单 / 三号位 / 辅助
 /d2 战绩 [场次] [目标]　　　　 查看最近战绩（默认 20 场）
 /d2 分析 [场次] [目标]　　　　 AI 分析近期表现与打法风格
-/d2 单场 <比赛ID> [焦点玩家]　　AI 深度复盘单场比赛
+/d2 单场 <比赛ID> [焦点玩家/英雄]　AI 深度复盘单场比赛
 　　　　（未解析时自动催解析并等待，最多 10 分钟；
 　　　　　等满仍未解析就自动改用现有数据出一份基础数据版报告）
 　　　　（加 skip 可跳过等待，立刻用现有数据出报告）
@@ -1497,7 +1549,49 @@ class Dota2Plugin(Star):
 
     async def _generate_report_for_umo(self, umo: str, prompt: str) -> str | None:
         """在指定会话下调用大模型生成报告（供后台任务使用）。"""
-        return await self._call_report_llm(prompt, umo=umo)
+        return await self._generate_two_step(prompt, umo=umo)
+
+    async def _generate_two_step(self, prompt: str, *, umo: str = "") -> str | None:
+        """两步生成：先出责任归因表，再写正文。
+
+        第一步只做判断，输出一张短表；第二步带着这张表写整篇报告。
+        拆分的理由见 ``dota_analyzer.ATTRIBUTION_SPEC`` 上方的注释 ——
+        核心是「判断」与「表达」在同一条输出流里会互相挤压。
+
+        降级原则：**任何一步拿不到东西都退回单步**。多一步是为了更准，
+        不是为了多一次失败机会 —— 用户等的是战报，不是流程完整性。
+
+        Args:
+            prompt: :func:`build_single_match_analysis_prompt` 的完整输出。
+            umo: 会话来源，回退到 AstrBot 提供商时用来解析默认模型。
+        """
+        if not self.cfg("two_step_report", True):
+            return await self._call_report_llm(prompt, umo=umo)
+
+        common, spec = split_report_prompt(prompt)
+        if not spec:
+            # 结构对不上（不是单场复盘，比如战绩总结），保持原样单步。
+            logger.debug("[dota2] 提示词里没有输出要求标记，跳过两步生成")
+            return await self._call_report_llm(prompt, umo=umo)
+
+        started = time.time()
+        table = await self._call_report_llm(build_attribution_prompt(common), umo=umo)
+        if not table or len(table.strip()) < 40:
+            logger.warning("[dota2] 归因步没有拿到有效结果，退回单步生成")
+            return await self._call_report_llm(prompt, umo=umo)
+        logger.info(
+            f"[dota2] 归因步完成（{len(table.strip())} 字 · "
+            f"{time.time() - started:.1f}s）"
+        )
+
+        text = await self._call_report_llm(
+            inject_attribution(prompt, table), umo=umo
+        )
+        if not text:
+            # 不再退回单步重跑：那等于把刚花掉的一次调用原样再花一次，
+            # 而用户已经在等第二段时间了。直接走「模型不可用」的兜底原文。
+            logger.warning("[dota2] 写作步失败，不重试（改走原始数据兜底）")
+        return text
 
     async def _ability_constants(self) -> dict[int, str]:
         """技能常量 ``{技能ID: 技能名}``，用于把解析产物里的加点顺序翻译成可读文本。
@@ -1950,101 +2044,169 @@ class Dota2Plugin(Star):
             chunks.append("\n".join(buffer))
         return chunks
 
-    async def _render_image(self, text: str) -> str | None:
-        """把报告渲染成图片；未启用或失败时返回 None。
+    @staticmethod
+    def _looks_blank(path: str) -> bool:
+        """图片是不是「只有页头、正文一片空白」。
 
-        ⚠️ **必须传 ``return_url=False``**，让它返回**本地文件路径**。两个原因，
-        都是实测出来的（2026-11-05）：
-
-        1. ``text_to_image()`` 默认 ``return_url=True``，返回的是 t2i 服务的
-           静态资源 URL。而 QQ 官方适配器拿到 URL 后是**自己下载再转 base64**
-           发出去的，它用的是 aiohttp 默认 UA —— 实测那个 UA 会被 t2i 的
-           WAF 直接挂住（不是 403，是**超时**）：
-
-               UA=(默认)        → TimeoutError
-               UA=AstrBot/1.0   → HTTP 200 image/jpeg
-               UA=Mozilla/5.0   → HTTP 200 image/jpeg
-
-           ``return_url=False`` 走的是 ``POST /generate`` 直接取二进制，
-           不经过静态资源那条 WAF 规则，实测成功落盘。
-
-        2. 本地路径也顺带避开了「URL 被当路径」那一整类错误
-           （见 :meth:`_send_image`）。
-
-        ⚠️ **必须有硬超时**（2026-11-05 实机事故）。框架的 ``render_t2i`` 是
-        「逐个端点重试，每个端点最多等 aiohttp 的默认 5 分钟」，而它在
-        ``except BaseException`` 里还兜一层本地渲染 —— 单次调用可以挂十几分钟
-        都不返回。调用方（:meth:`_analyze_match_data`）是**先发标题、再出图、
-        最后发正文**，于是用户看到的就是「只收到一条战报头，正文再也没来」：
-
-            15:51:53 分析正文已生成（6743 字）
-            15:56:54 Endpoint https://t2i.soulter.top/text2img failed, trying next...
-            （正文始终没发出去）
-
-        所以这里用 ``asyncio.wait(timeout=...)`` 而不是直接 await：到点就走文本，
-        渲染任务丢在后台自行结束（它吞 CancelledError，``cancel()`` 拦不住，
-        只能不等它）。宁可以后补一张图，也不能让 6700 字的战报卡死在一张图上。
+        阈值与实测依据见 :data:`IMAGE_BLANK_DARK_PCT`，判定本身交给
+        :func:`_is_blank_histogram`。读不出图（不是图片、没装 PIL、文件坏了）
+        时返回 False —— 宁可放行一张可疑的图，也不要把正常图误杀成「发文本」。
         """
-        if not self.cfg("analysis_as_image", True):
-            return None
+        try:
+            from PIL import Image
+        except ImportError:
+            return False
+        try:
+            with Image.open(path) as im:
+                hist = im.convert("L").histogram()
+        except Exception:  # noqa: BLE001 - 解码失败不归这里管
+            return False
+        return _is_blank_histogram(hist)
 
-        async def _call_t2i() -> str:
-            try:
-                return await self.text_to_image(text, return_url=False)
-            except TypeError:
-                # 极旧版本没有这个关键字参数：退回默认行为，靠 `_send_image`
-                # 按前缀分派来兜住 URL，不要让图片功能整个消失。
-                return await self.text_to_image(text)
+    async def _render_image_once(self, text: str) -> str | None:
+        """本地渲染一次并做完整性校验，任何一项不过就返回 None。
 
-        started = time.time()
-        task = asyncio.ensure_future(_call_t2i())
+        2026-11-07 起**只走本地**：``use_network=False`` 让框架直接调 Pillow
+        排版，不进远程端点池。上游 t2i 服务 11-06 起主端点拒绝连接、备用端点
+        对任何输入都吐同一张空白图，而本地渲染同一份战报只要 0.7 秒 ——
+        继续先试远程只是每份报告白等 65 秒，再赌一张可能全是白的图。
+
+        Args:
+            text: 要渲染的正文。
+
+        Returns:
+            通过校验的图片路径；不通过时返回 None（调用方改发纯文本）。
+
+        校验顺序是有讲究的 —— 从便宜到贵，也从「确定是坏」到「需要解码」：
+
+        1. 拿到路径（HTTP 前缀的老版本返回值没法验内容，原样放行）；
+        2. 文件存在、非空、未超上限；
+        3. **不是空白图**（2026-11-06 事故补的，见 :data:`IMAGE_BLANK_DARK_PCT`）。
+        """
+        async def _call() -> str:
+            renderer = getattr(
+                getattr(self, "context", None), "html_renderer", None
+            )
+            if renderer is None:
+                raise RuntimeError("框架没有暴露 html_renderer，无法本地渲染")
+            # use_network=False 是关键：跳过端点池，直接 Pillow。
+            return await renderer.render_t2i(
+                text,
+                use_network=False,
+                return_url=False,
+            )
+
+        task = asyncio.ensure_future(_call())
         done, _pending = await asyncio.wait({task}, timeout=IMAGE_RENDER_TIMEOUT)
         if not done:
             task.cancel()
-            # 取消后底层可能仍在跑（`render_t2i` 的 except BaseException 会
-            # 吞掉 CancelledError 继续走本地渲染）。挂一个回调把异常吃掉，
+            # 底层可能吞掉 CancelledError 继续跑，挂回调吃掉异常，
             # 否则事件循环会打一条「Task exception was never retrieved」。
             task.add_done_callback(_discard_task_result)
             logger.warning(
-                f"[dota2] 文转图超过 {IMAGE_RENDER_TIMEOUT:.0f} 秒仍未返回，"
-                "本次改发纯文本（t2i 端点卡住不该拖住战报正文）"
+                f"[dota2] 本地文转图超过 {IMAGE_RENDER_TIMEOUT:.0f} 秒仍未返回，"
+                "本次放弃（一张图不该拖住战报正文）"
             )
             return None
 
         try:
             path = task.result()
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[dota2] 文本转图片失败，回退为纯文本发送: {e}")
+            logger.warning(f"[dota2] 本地文转图失败：{e}")
             return None
 
         if not isinstance(path, str) or not path:
-            logger.warning(f"[dota2] 文转图返回了非路径值 {path!r}，改发纯文本")
+            logger.warning(f"[dota2] 文转图返回了非路径值 {path!r}")
+            return None
+        if path.startswith("http"):
+            return path
+
+        try:
+            size_kb = os.path.getsize(path) / 1024.0
+        except OSError as e:
+            logger.warning(f"[dota2] 文转图产物不存在（{path}）：{e}")
+            return None
+        if size_kb <= 0:
+            logger.warning(f"[dota2] 文转图产物是空文件（{path}）")
+            return None
+        if size_kb > IMAGE_MAX_KB:
+            # QQ 官方通道是「下载/读取 → base64 → 上传」，超大图会被平台
+            # 拒收且不报错（见 `_send_image` 的返回值说明），不如直接发文本。
+            logger.warning(
+                f"[dota2] 文转图产物 {size_kb:.0f} KB 超过上限 "
+                f"{IMAGE_MAX_KB:.0f} KB，改发纯文本"
+            )
             return None
 
-        size_kb = 0.0
-        if not path.startswith("http"):
+        if self._looks_blank(path):
+            # 2026-11-06 事故的空白图只有页头、正文全无，体积校验挡不住它
+            # （5 KB 正好在正常区间），必须看像素才认得出来。现在产物来自
+            # 本地，这道检查是防止渲染器本身哪天坏了又把白图发出去。
+            logger.warning(
+                f"[dota2] 本地文转图产物是空白图"
+                f"（{size_kb:.1f} KB，只有页头没有正文），已丢弃"
+            )
             try:
-                size_kb = os.path.getsize(path) / 1024.0
-            except OSError as e:
-                logger.warning(f"[dota2] 文转图产物不存在（{path}）：{e}，改发纯文本")
-                return None
-            if size_kb <= 0:
-                logger.warning(f"[dota2] 文转图产物是空文件（{path}），改发纯文本")
-                return None
-            if size_kb > IMAGE_MAX_KB:
-                # QQ 官方通道是「下载/读取 → base64 → 上传」，超大图会被平台
-                # 拒收且不报错（见 `_send_image` 的返回值说明），不如直接发文本。
-                logger.warning(
-                    f"[dota2] 文转图产物 {size_kb:.0f} KB 超过上限 "
-                    f"{IMAGE_MAX_KB:.0f} KB，改发纯文本"
-                )
-                return None
-            self._prune_render_temp(os.path.dirname(path))
+                os.remove(path)
+            except OSError:
+                pass
+            return None
+
+        self._prune_render_temp(os.path.dirname(path))
+        return path
+
+    async def _render_image(self, text: str) -> str | None:
+        """把报告渲染成图片；未启用或失败时返回 None。
+
+        ⚠️ **默认只用本地渲染，不再调用远程 t2i**（2026-11-07 用户拍板）。
+        原因是 11-06 的服务端事故 + 成本对比：
+
+        ==========================  =========================================
+        远程主端点                  ``t2i.soulter.top`` 拒绝连接
+        远程备用端点                对 9 字 / 1006 字 / 4098 字输入都返回
+                                    同一张 800×720 / 5.4 KB 的空白图
+        远程单次切换端点            实测 65 秒
+        本地 Pillow 同一份战报      0.7 秒，排版可用（中文、标题、列表、分隔线）
+        ==========================  =========================================
+
+        上游什么时候恢复、会不会再换一个「返回 200 但内容是白图」的端点，
+        我们控制不了；所以不再「先试远程、失败再兜底」，直接走
+        ``render_t2i(use_network=False, return_url=False)``。远程冷却那套
+        状态机也随之删掉 —— 没有远程要探，就不用记「什么时候再探」。
+
+        ⚠️ **必须传 ``return_url=False``**，让它返回**本地文件路径**（2026-11-05
+        实测）：URL 交给 QQ 官方适配器后会被它用默认 UA 下载，静态资源那条
+        WAF 规则会挂住请求；本地路径也顺带避开「URL 被当路径」那整类错误
+        （见 :meth:`_send_image`）。
+
+        ⚠️ **保留硬超时**。调用方是「先发标题、再出图、最后发正文」，
+        一旦渲染卡住，用户那边就是「只收到一条战报头」。这里用
+        ``asyncio.wait(timeout=...)`` 而不是直接 await：到点就走文本，
+        渲染任务丢在后台自行结束（框架可能吞 CancelledError，``cancel()``
+        拦不住，只能不等它）。本地正常只要 0.7 秒，卡住必定是异常。
+        """
+        if not self.cfg("analysis_as_image", True):
+            return None
+
+        started = time.time()
+        path = await self._render_image_once(text)
+        if path is None:
+            logger.warning("[dota2] 本地文转图没成，本次改发纯文本")
+            return None
 
         logger.info(
-            f"[dota2] 战报图片已生成（{size_kb:.0f} KB · {time.time() - started:.1f}s）"
+            f"[dota2] 战报图片已生成（本地 · "
+            f"{self._image_size_kb(path):.0f} KB · {time.time() - started:.1f}s）"
         )
         return path
+
+    @staticmethod
+    def _image_size_kb(path: str) -> float:
+        """图片体积（KB）；读不到时返回 0（仅用于日志，不参与判定）。"""
+        try:
+            return os.path.getsize(path) / 1024.0
+        except OSError:
+            return 0.0
 
     def _prune_render_temp(self, temp_dir: str, keep_hours: float = 2.0) -> None:
         """清掉自己渲染出来的旧临时图。
@@ -2096,8 +2258,8 @@ class Dota2Plugin(Star):
         ``file_image`` 恰好是对的 —— 看起来就像「图片服务不稳定」，
         实际是自己把 URL 当路径用（2026-11-05 查清）。
 
-        现在 ``_render_image`` 已经固定走本地路径，这里的前缀分派是**兜底**：
-        ``text_to_image`` 的返回值本来就是二选一，判据与框架
+        现在 ``_render_image`` 固定走本地路径，这里的前缀分派是**兜底**：
+        框架版本不同，``render_t2i`` 仍可能给出 URL，判据与框架
         ``event.image_result`` 保持一致。
         """
         if url_or_path.startswith("http"):
@@ -2266,12 +2428,14 @@ class Dota2Plugin(Star):
         players_in_match: list[dict],
         *,
         umo: str = "",
+        heroes: dict | None = None,
     ) -> tuple[list[int], dict[int, str], list[str]]:
-        """把用户点名的焦点玩家串解析成 ``(ids, names, 失败说明)``。
+        """把用户点名的焦点对象解析成 ``(ids, names, 失败说明)``。
 
-        **两条路径共用它**（P1-13，2026-10-14 审查）：``/d2 单场 <id> <焦点>``
-        （指令路径）与 ``query_match_detail`` 的 ``focus`` 参数（工具路径）。
-        原先两边各写一份，且已经**真的分叉**：
+        **三条路径共用它**（P1-13，2026-10-14 审查）：``/d2 单场 <id> <焦点>``
+        （指令路径）、``/d2 团战 <id> <N> <焦点>``（团战指令）与
+        ``query_match_detail`` / ``analyze_teamfight`` 的 ``focus`` 参数（工具路径）。
+        原先各写一份，且已经**真的分叉**：
 
         * 指令路径 ``_resolve_account(query, in_match_players=...)`` —— **不传
           ``umo``**，于是跳过了「本会话名单优先」这一步。结果是
@@ -2283,10 +2447,24 @@ class Dota2Plugin(Star):
         现在统一**一律带 ``umo``**：名单里的昵称本来就是从账号反查出来的，
         再用它反查回去是零成本的精确命中，没有理由不用。
 
+        解析顺序（越靠前越本地、越不容易认错）：
+
+        1. **本局昵称精确命中** —— 一次字符串比较，不联网；
+        2. **英雄名** —— 用户说「以祈求者为主视角」时，靠本局十人名单回答
+           「谁在玩祈求者」。没有这一步，模型要么漏掉这个信息，要么自己
+           从上下文里挑一个人顶替（真机出过：focus 被填成上一轮对话里的
+           昵称，用户以为自己点的英雄没被听见）；
+        3. 会话名单简称反查 / 数字 ID / 全局搜索。
+
+        1、2 两步在 :meth:`_resolve_account` 内部完成，本函数只负责把一串名字
+        拆开、去重、收集失败原因 —— 单点解析只有一份实现，指令与工具两条
+        路径才不会再次分叉。
+
         Args:
-            raw: 用户给的一整串（可能含多个名字，用 ``、`` / ``,`` / ``/`` 分隔）。
-            players_in_match: 本局十人名单，用作昵称消歧器。
+            raw: 用户给的一整串（可能含多个对象，用 ``、`` / ``,`` / ``/`` 分隔）。
+            players_in_match: 本局十人名单，用作昵称消歧器与英雄反查表。
             umo: 会话标识，用于「本会话名单优先」。
+            heroes: 英雄常量表；不给时跳过英雄名解析（纯昵称 / ID 场景）。
 
         Returns:
             ``(focus_ids, focus_names, failed)``。``failed`` 里是
@@ -2300,7 +2478,10 @@ class Dota2Plugin(Star):
                 continue
             try:
                 account_id, name = await self._resolve_account(
-                    query, in_match_players=players_in_match, umo=umo
+                    query,
+                    in_match_players=players_in_match,
+                    umo=umo,
+                    heroes=heroes,
                 )
             except OpenDotaError as e:  # 含 TargetNotFoundError（它的子类）
                 failed.append(f"{query}（{e}）")
@@ -2344,18 +2525,23 @@ class Dota2Plugin(Star):
         in_match_players: list[dict] | None = None,
         *,
         umo: str = "",
+        heroes: dict | None = None,
     ) -> tuple[int, str]:
         """把用户输入解析成 ``(account_id, personaname)``。
 
         Args:
-            target: 用户输入的昵称 / 32 位 ID / 64 位 SteamID / 个人主页链接。
+            target: 用户输入的昵称 / 32 位 ID / 64 位 SteamID / 个人主页链接 /
+                **英雄名**。
             in_match_players: 可选的「本局选手列表」。给出时，昵称会先在这
-                10 个人里精确匹配；命中唯一就直接采用。OpenDota 上重名昵称
-                极多（例如「大魔导师马化腾」有 5 个同名账号），只靠全局搜索
-                会让这些玩家永远解析不出来，而复盘场景下本局选手就是天然消歧器。
+                10 个人里精确匹配，其次按**英雄**匹配；命中唯一就直接采用。
+                OpenDota 上重名昵称极多（例如「大魔导师马化腾」有 5 个同名账号），
+                只靠全局搜索会让这些玩家永远解析不出来，而复盘场景下本局选手
+                就是天然消歧器。
             umo: 会话标识。给了就先在**本会话名单**（已绑定 / 已监听）里找 ——
                 零网络开销，而且不会像全局搜索那样被重名账号绊住。自然语言
                 入口给的昵称常来自名单（「钢板」「天鸽」），走这一步最稳。
+            heroes: 英雄常量表。给了才认英雄名 —— 「以祈求者为主视角」这类
+                说法点的是英雄，而复盘要的是账号。
 
         Raises:
             TargetNotFoundError: 找不到唯一确定的玩家。
@@ -2409,6 +2595,29 @@ class Dota2Plugin(Star):
             if len(hits) == 1:
                 hit_id = int(hits[0]["account_id"])
                 return hit_id, str(hits[0].get("personaname") or f"账号{hit_id}")
+
+            # 英雄名 → 本局玩它的玩家。
+            #
+            # 「以祈求者为主视角」点的是英雄，复盘要的是账号 —— 这一步只能由
+            # 本局十人名单回答，模型并不知道谁玩了什么。必须排在**全局搜索
+            # 之前**：否则会去搜出一个叫「祈求者」的陌生账号，然后安静地
+            # 聚焦到一个和这局无关的人（报告照常生成，错得毫无痕迹）。
+            if heroes:
+                hero_name, owners = dota_nlu.match_hero_owner(
+                    target, in_match_players, heroes
+                )
+                if len(owners) == 1:
+                    return owners[0]
+                if len(owners) > 1:
+                    # 双方同英雄（普通匹配 / 随机征召都可能）：说清是哪一边，
+                    # 别替用户挑一个。猜错的代价是整份报告评错人。
+                    raise TargetNotFoundError(
+                        f"本局两边都在玩 {hero_name}："
+                        + "、".join(f"{who}（{aid}）" for aid, who in owners)
+                        + "。请改点玩家名或账号 ID。"
+                    )
+                if hero_name:
+                    raise TargetNotFoundError(f"本局没有人玩 {hero_name}。")
 
         # 昵称：走主数据源搜索（STRATZ 优先，不可用时自动降级）
         try:
@@ -3718,7 +3927,7 @@ class Dota2Plugin(Star):
         focus_names: dict[int, str] = {}
         if focus:
             focus_ids, focus_names, failed = await self._resolve_focuses(
-                focus, players_in_match, umo=umo
+                focus, players_in_match, umo=umo, heroes=heroes
             )
             if failed:
                 # 注意别把这段写成 `await self._send_to_session(umo, (… ,))` ——
@@ -5395,7 +5604,7 @@ class Dota2Plugin(Star):
         if aligned is None:
             return ""
         try:
-            return dota_replay.render_win_curve(
+            block = dota_replay.render_win_curve(
                 aligned,
                 match,
                 hero_name=lambda hero_id: hname(heroes, hero_id),
@@ -5405,6 +5614,24 @@ class Dota2Plugin(Star):
         except Exception as e:  # noqa: BLE001 - 同上是可选段落
             logger.warning(f"[dota2] 渲染胜负走势失败：{e}")
             return ""
+
+        # 责任窗口紧跟在曲线后面：曲线说「什么时候变了」，它说「那会儿谁在场」。
+        # 两块必须挨着，中间隔开几千字之后模型只会记得自己写的故事。
+        npc_names = {
+            str(hero.get("name") or ""): hname(heroes, hid)
+            for hid, hero in (heroes or {}).items()
+            if isinstance(hero, dict) and hero.get("name")
+        }
+        try:
+            block += dota_replay.render_responsibility_block(
+                aligned,
+                match,
+                hero_name=lambda hero_id: hname(heroes, hero_id),
+                npc_text=lambda raw: npc_names.get(raw) or dota_replay.npc_label(raw),
+            )
+        except Exception as e:  # noqa: BLE001 - 责任块是增强项，失败不能拖垮曲线
+            logger.warning(f"[dota2] 渲染责任窗口失败：{e}")
+        return block
 
     # ==================================================================
     # 指令：单场复盘
@@ -5422,10 +5649,10 @@ class Dota2Plugin(Star):
         tokens = [token for token in re.split(r"\s+", str(args).strip()) if token]
         if not tokens or not re.fullmatch(r"\d{6,20}", tokens[0]):
             yield event.plain_result(
-                "用法：`/d2 单场 <比赛ID> [焦点玩家] [skip]`\n"
+                "用法：`/d2 单场 <比赛ID> [焦点玩家 / 英雄] [skip]`\n"
                 "例如：`/d2 单场 8989601141`\n"
                 "多位焦点：`/d2 单场 8989601141 张三、李四、王五`"
-                "（昵称或账号 ID，用 、/, 分隔；昵称可以含空格）\n"
+                "（昵称、账号 ID 或英雄名，用 、/, 分隔；昵称可以含空格）\n"
                 "不想等待解析：`/d2 单场 8989601141 skip`\n"
                 "比赛 ID 可以从 `/d2 战绩` 的结果中获取，或直接使用 Dota 客户端的比赛编号。"
             )
@@ -5487,7 +5714,7 @@ class Dota2Plugin(Star):
             # 会话名单里的昵称（本来就是从 account_id 反查出来的）
             # 反而要再花钱去网上搜一遍，还可能被重名账号绊住报「匹配到多个玩家」。
             focus_ids, focus_names, failed = await self._resolve_focuses(
-                rest, players_in_match, umo=event.unified_msg_origin
+                rest, players_in_match, umo=event.unified_msg_origin, heroes=heroes
             )
             if failed and not focus_ids:
                 yield event.plain_result(
@@ -5626,9 +5853,10 @@ class Dota2Plugin(Star):
 
         if not tokens or len(tokens) < 2 or not re.fullmatch(r"\d{6,20}", tokens[0]):
             yield event.plain_result(
-                "用法：`/d2 团战 <比赛ID> <第几波> [焦点玩家]`\n"
-                "例如：`/d2 团战 9073189779 7`\n"
+                "用法：`/d2 团战 <比赛ID> <第几波> [焦点玩家 / 英雄]`\n"
+                "例如：`/d2 团战 9073189779 7`、`/d2 团战 9073189779 7 祈求者`\n"
                 "编号来自单场复盘报告末尾的「值得单独深挖的团战」。\n"
+                "· 焦点可以直接写英雄名，插件会自己查出这局是谁在玩。\n"
                 "· 检查解析环境：`/d2 团战 环境`"
             )
             return
@@ -5731,7 +5959,7 @@ class Dota2Plugin(Star):
         if focus_raw:
             players_in_match = [p for p in (match.get("players") or []) if isinstance(p, dict)]
             focus_ids, focus_names, failed = await self._resolve_focuses(
-                focus_raw, players_in_match, umo=umo
+                focus_raw, players_in_match, umo=umo, heroes=heroes
             )
             if failed and not focus_ids:
                 await self._send_to_session(
@@ -5750,11 +5978,15 @@ class Dota2Plugin(Star):
         # 真正的重活从这里开始，**必须**过队列：同一时刻只允许一个 JVM 在跑。
         block = await self.replay_queue.run(
             label,
-            lambda: self._build_replay_block(match, fight, heroes, items_const),
+            lambda: self._build_replay_block(
+                match, fight, heroes, items_const, focus_ids
+            ),
         )
 
         await self._send_to_session(umo, f"🔍 {label} 录像解析完成，正在生成复盘…")
-        prompt = self._fight_prompt(match, fight, index, block, focus_ids, focus_names)
+        prompt = self._fight_prompt(
+            match, fight, index, block, focus_ids, focus_names, heroes
+        )
         report = await self._generate_report_for_umo(umo, prompt)
         if report:
             # 团战复盘同样是「长报告」：走统一出口，先出图再发。
@@ -5767,7 +5999,12 @@ class Dota2Plugin(Star):
             )
 
     async def _build_replay_block(
-        self, match: dict, fight: dict, heroes: dict[int, dict], items_const: dict[str, dict]
+        self,
+        match: dict,
+        fight: dict,
+        heroes: dict[int, dict],
+        items_const: dict[str, dict],
+        focus_ids: Sequence[int] | None = None,
     ) -> str:
         """下载 → 解压 → 解析 → 组装数据块。整个函数在队列里串行执行。"""
         match_id = int(match.get("match_id") or 0)
@@ -5860,6 +6097,7 @@ class Dota2Plugin(Star):
             hero_of=lambda hero_id: hname(heroes, hero_id),
             npc_by_hero=npc_by_hero,
             item_label=_item_label,
+            focus_account_ids=focus_ids,
         )
 
     def _fight_prompt(
@@ -5870,6 +6108,7 @@ class Dota2Plugin(Star):
         block: str,
         focus_ids: list[int],
         focus_names: dict[int, str],
+        heroes: dict | None = None,
     ) -> str:
         """构造「以某个人为主视角复盘这一波团」的提示词。
 
@@ -5877,9 +6116,26 @@ class Dota2Plugin(Star):
         判定失误必须同时给出「替代方案」和「当时来不来得及执行」。
         """
         who = ""
+        focus_hero = ""
         if focus_ids:
             aid = int(focus_ids[0])
             who = focus_names.get(aid) or str(aid)
+            # 把「这个人本局玩的是哪个英雄」写进提示词。
+            #
+            # 为什么不指望模型自己从数据块里对出来：团战数据块的每一段
+            # 都按**英雄**列（血量、技能、位置），十个人的昵称在块里根本不
+            # 出现；只给一句「请以钢板为主视角」，模型只能靠猜。真机上就
+            # 出过这份报告通篇没提「祈求者」，用户以为插件没认出他玩的英雄。
+            for player in match.get("players") or []:
+                if not isinstance(player, dict):
+                    continue
+                try:
+                    same = int(player.get("account_id") or 0) == aid
+                except (TypeError, ValueError):
+                    continue
+                if same:
+                    focus_hero = hname(heroes or {}, player.get("hero_id"))
+                    break
 
         head = [
             "你是 Dota 2 教练。下面是一场真实比赛的某一波团战的**录像级**数据，",
@@ -5888,8 +6144,17 @@ class Dota2Plugin(Star):
             "",
         ]
         if who:
+            subject = f"{who}（本局玩的是 {focus_hero}）" if focus_hero else who
             head.append(
-                f"请以 **{who}** 为主视角复盘这波团：他打得怎么样，哪里能做得更好。"
+                f"请以 **{subject}** 为主视角复盘这波团：他打得怎么样，哪里能做得更好。"
+            )
+            head.append(
+                "开头就把「谁 + 什么英雄」讲清楚，后面一直用这个英雄的职责去衡量他："
+                "肉盾按肉盾、核心按核心、辅助按辅助，别拿别的定位的标准评他。"
+            )
+            head.append(
+                "叙述用「他」或直接说名字与英雄，不要通篇写「你」——"
+                "主视角对象不一定是提问者本人。"
             )
             head.append(
                 "评价他之前先交代条件：经济差、等级差、装备差、队友在不在。"
@@ -7694,7 +7959,7 @@ class Dota2Plugin(Star):
         self, event: AstrMessageEvent, prompt: str
     ) -> str | None:
         """调用大模型生成报告。失败或未启用时返回 None。"""
-        return await self._call_report_llm(
+        return await self._generate_two_step(
             prompt, umo=event.unified_msg_origin
         )
 

@@ -487,24 +487,47 @@ def score_fights(
             if total_dur and start >= total_dur * 0.6:
                 score += 3.0
 
-        focus_note = None
+        # ⚠️ 这里必须把**所有**焦点玩家都收进来，不能找到第一个就 break。
+        #
+        # 2026-11-10 修：原来只收第一个命中 ``focus`` 的玩家，而渲染层取名字用的
+        # 是 ``focus_ids[0]`` —— 两位焦点玩家（「以我和某某为主视角」）时，
+        # 名字与英雄会**点错人**：实测 ``focus_ids=[B, A]`` 输出「B · A 的英雄」。
+        # 名字与英雄必须来自同一条 note，所以 note 里带上 ``account_id``。
+        focus_notes: list[dict] = []
         for slot, entry in enumerate(entries):
             owner = players[slot] if slot < len(players) else {}
-            if int((owner or {}).get("account_id") or 0) not in focus:
+            try:
+                owner_aid = int((owner or {}).get("account_id") or 0)
+            except (TypeError, ValueError):
+                owner_aid = 0
+            # 匿名玩家 account_id 是 0，而 0 永远不该被当成焦点 —— 否则
+            # 只要焦点集合里混进一个 0，全场的匿名玩家都会被算成焦点。
+            if not owner_aid or owner_aid not in focus:
                 continue
             team_entries = entries[:5] if slot < 5 else entries[5:]
             team_damage = sum(_int(p, "damage") for p in team_entries)
             damage = _int(entry, "damage")
-            focus_note = {
+            focus_notes.append({
+                "account_id": owner_aid,
                 "hero_id": owner.get("hero_id"),
                 "damage": damage,
                 "share": round(damage / team_damage * 100.0, 1) if team_damage else 0.0,
                 "deaths": _int(entry, "deaths"),
-                "kills": len([k for k in (entry.get("killed") or {})
-                              if str(k).startswith("npc_dota_hero_")]),
+                # killed 是 {npc 名: 次数} 的聚合字典，次数要累加不能只数 key：
+                # 同一波里重复击杀同一个英雄（买活再死）时只数 key 会少算。
+                "kills": sum(int(v or 0) for k, v in (entry.get("killed") or {}).items()
+                             if str(k).startswith("npc_dota_hero_")),
                 "gold_delta": _int(entry, "gold_delta"),
-            }
-            break
+                # 这波到底参没参战。OpenDota 对**没到场的玩家**也补一条全零记录，
+                # 原来一律渲染成「伤害 0（占全队 0%）、存活」—— 读起来像「他去了
+                # 但一点输出没打」，其实是「他不在场」（2026-11-10 实测第 15 波）。
+                # 判据只要「有动作」：伤害 / 施法 / 用物 / 阵亡，任一即可。
+                # 不能用``healing``：被动回血、范围光环都会漏一点，实测有 6 点。
+                "engaged": bool(damage
+                                or (entry.get("ability_uses") or {})
+                                or (entry.get("item_uses") or {})
+                                or _int(entry, "deaths")),
+            })
 
         out.append({
             "index": index,
@@ -515,7 +538,10 @@ def score_fights(
             "engaged": engaged,
             "gold_delta": gold_rad - gold_dire,
             "score": round(score, 1),
-            "focus": focus_note,
+            # ``focus`` 保留「第一位焦点玩家」以兼容既有调用方与测试，
+            # 渲染层一律用 ``focus_all`` —— 逐人一行，名字与英雄不会点错。
+            "focus": focus_notes[0] if focus_notes else None,
+            "focus_all": focus_notes,
             # 拿不到曲线时这三项全是 None，渲染层据此决定要不要显示胜率
             "win_before": round(impact.before) if impact else None,
             "win_after": round(impact.after) if impact else None,
@@ -530,6 +556,10 @@ def pick_candidates(cands: list[dict], top_n: int = DEFAULT_TOP_N) -> list[dict]
     除了关键度最高的几波，另外单独保一个「焦点玩家高光团」：
     他没死、伤害占全队比例最高的一波。用户要的正是「我打得好的那波」，
     而它未必在团队关键度榜上（比如顺风局的一次小规模收割）。
+
+    返回的是**副本**，每项多一个 ``pick_reason``（``"关键"`` / ``"高光"``）。
+    2026-11-10 之前这个标签算出后就丢掉了 —— 高光团被挑进清单，可读者
+    从清单上看不出它凭什么进来，也看不出哪一波是「打得好的那波」。
     """
     if not cands:
         return []
@@ -537,13 +567,25 @@ def pick_candidates(cands: list[dict], top_n: int = DEFAULT_TOP_N) -> list[dict]
     for c in sorted(cands, key=lambda c: -c["score"])[:top_n]:
         picked[c["index"]] = "关键"
 
-    good = [c for c in cands
-            if c.get("focus") and c["focus"]["deaths"] == 0 and c["focus"]["share"] >= 25.0]
-    if good:
-        best = max(good, key=lambda c: c["focus"]["share"])
-        picked.setdefault(best["index"], "高光")
+    best: tuple[dict, float] | None = None
+    for c in cands:
+        # 多焦点时逐个判：任意一位「没死 + 伤害占比 ≥25%」都算高光，
+        # 取占比最高的那一波。只看 ``focus``（第一位）会漏掉另一位的高光。
+        for note in c.get("focus_all") or ([c["focus"]] if c.get("focus") else []):
+            if note["deaths"] == 0 and note["share"] >= 25.0:
+                if best is None or note["share"] > best[1]:
+                    best = (c, note["share"])
+    highlight = best[0]["index"] if best is not None else 0
+    if highlight:
+        picked.setdefault(highlight, "高光")
 
-    return [c for c in cands if c["index"] in picked]
+    # ``focus_highlight`` 必须**独立于** ``pick_reason``：一波常常既是关键团、
+    # 又是焦点玩家打得最好的一波。用 setdefault 合并进同一个字段的话，
+    # 它已经以「关键」身份进了前 top_n，高光标记就永远显示不出来
+    # （2026-11-10 实测：占比 67%、存活的那波，清单上什么也没标）。
+    return [dict(c, pick_reason=picked[c["index"]],
+                 focus_highlight=bool(highlight) and c["index"] == highlight)
+            for c in cands if c["index"] in picked]
 
 
 def _fight_tag(cand: dict, all_cands: list[dict]) -> str:
@@ -577,8 +619,31 @@ def _fight_tag(cand: dict, all_cands: list[dict]) -> str:
         tags.append("大规模团战")
     delta = cand["gold_delta"]
     if abs(delta) >= 5000:
-        tags.append("经济差拉开 %d" % abs(delta))
+        # 必须写清是哪边拉开的。原来只写「经济差拉开 6164」，读者无从判断
+        # 这波是谁赚了 —— 顺风局里这句话可能是夸夜魇的（delta 是
+        # 「天辉 − 夜魇」的净额，正数才是天辉赚）。
+        tags.append("%s经济 +%d" % ("天辉" if delta > 0 else "夜魇", abs(delta)))
     return "、".join(tags)
+
+
+def _focus_display_name(names: dict, account_id: Any) -> str:
+    """从 ``focus_names`` 里取昵称，容忍 key 是 int 或 str。
+
+    调用方有的传 ``{int: str}``（``main.py`` 里做过一次转换），有的直接透传
+    上游的 ``{str: str}``。只按 int 查的话，后者会全体查不到、清单一律退化成
+    「焦点玩家」—— 名字没了但报告照常出，属于不会报错的错。
+    """
+    try:
+        aid = int(account_id or 0)
+    except (TypeError, ValueError):
+        return ""
+    if not aid:
+        return ""
+    for key in (aid, str(aid)):
+        value = names.get(key)
+        if value:
+            return str(value).strip()
+    return ""
 
 
 def render_candidates(
@@ -613,7 +678,7 @@ def render_candidates(
 
     names = focus_names or {}
     focus_aid = int(next(iter(focus_ids), 0) or 0) if focus_ids else 0
-    who = names.get(focus_aid) or ("焦点玩家" if focus_aid else "")
+    who = _focus_display_name(names, focus_aid) or ("焦点玩家" if focus_aid else "")
 
     # 标题前先来一条分隔线，原因见下；标题后空一行，否则部分 Markdown
     # 实现会把「🎯 …」和第一项并成同一个段落。
@@ -635,13 +700,29 @@ def render_candidates(
         tag = _fight_tag(cand, cands)
         if tag:
             head += " · " + tag
+        # 「高光」是单独特批进来的（未必在关键度榜上），不标出来读者会以为
+        # 它排错位置了；它也可能是「关键」那一波，两种身份并存。
+        if cand.get("focus_highlight"):
+            head += " · 焦点玩家打得最好的一波"
         lines.append("- " + head)
-        note = cand.get("focus")
-        if note and who:
+        # 一位焦点玩家一行。名字与英雄**必须**取自同一条 note：多焦点时
+        # 拿 focus_ids[0] 的名字去配另一位玩家的英雄，就是张冠李戴
+        # （2026-11-10 实测：focus_ids=[B, A] 打出「B · A 的英雄」）。
+        for note in (cand.get("focus_all")
+                     or ([cand["focus"]] if cand.get("focus") else [])):
+            # 查不到名字（调用方没给 focus_names、或匿名玩家）时兜底，
+            # 不能留空 —— 空名字会渲染成「  -  · 英雄84：…」这种断头行。
+            label = _focus_display_name(names, note.get("account_id"))
+            label = label or who or "焦点玩家"
             if hero_name:
                 hero = hero_name(note.get("hero_id"))
             else:
                 hero = "本命"
+            # 没到场的人不要写成「伤害 0、存活」—— 那是「去了没打」的意思。
+            # 「没给 / 真是 0 / 没做」是三件事，这里属于「没做」。
+            if not note.get("engaged", True):
+                lines.append("  - %s · %s：这波没到场" % (label, hero))
+                continue
             bits = ["伤害 %d（占全队 %.0f%%）" % (note["damage"], note["share"])]
             if note["kills"]:
                 bits.append("击杀 %d" % note["kills"])
@@ -652,7 +733,7 @@ def render_candidates(
             #
             # 名字与英雄用「 · 」隔开而不是「名字（英雄）」：后面还有
             # 「伤害 1925（占全队 36%）」，括号套括号读起来很绕。
-            lines.append("  - %s · %s：%s" % (who, hero, "、".join(bits)))
+            lines.append("  - %s · %s：%s" % (label, hero, "、".join(bits)))
 
     lines.append("")
     mid = str(match_id or "")
@@ -833,6 +914,258 @@ def render_win_curve(
     if keyword:
         lines.append("想看某一波的逐秒细节（谁先死、血量怎么掉、有没有视野），"
                      "回复「%s 团战 %s <第N波>」。" % (keyword, match_id or "<比赛ID>"))
+    return "\n".join(lines)
+
+
+# ======================================================================
+# 责任窗口：把「全队胜率曲线」拆到「哪个窗口、哪些人」
+# ======================================================================
+#
+# 曲线只回答「什么时候局势变了」，不回答「是谁干的」。判最佳最差要的是后者，
+# 所以这里把两件事拼起来：
+#
+#   1. 每个窗口列出**全员**的伤害占比与存活状态（``_fight_cast`` 已是全员）；
+#   2. 每次阵亡带上**击杀者**（OpenDota 的 ``deaths_log`` 直接给 ``key``）；
+#   3. 团战之外那些「一次被抓就把胜率打下去」的死亡单独列一节。
+#
+# 位置权重：同样是 12 个点，在 50% 附近是翻盘，在 95% 附近只是垃圾时间。
+# 不区分这两者，模型会把「领先 95% 时被反打一波」和「五五开时被打崩一波」
+# 判成同样的责任 —— 2026-11-09 按旧提示词跑出的「天辉最差是撼地者」
+# 就是这个错：那波 −12 发生在 95%→83%，胜负从没悬起来过。
+
+#: 位置权重的保底系数。
+#:
+#: 完全按「距 50% 的远近」线性衰减会让 99%→90% 直接归零，但它在数据上
+#: 依然真实发生。给 0.35 的保底：保留三分之一的分量，又不与真正的胜负手并列。
+STAKE_FLOOR = 0.35
+
+#: 权重分档线（单位是「权重分」，不是百分点）。
+STAKE_DECISIVE = 10.0
+STAKE_MINOR = 4.0
+
+#: 团战之外的关键死亡：死者一方胜率至少掉这么多点才算「关键」。
+DEATH_DROP_MIN = 6.0
+
+#: 死亡后看多少秒的胜率变化。太短会漏掉「死了之后接着被推塔」的连锁，
+#: 太长会把下一波团算进来。
+DEATH_GLANCE = 30.0
+
+
+def stake_score(delta: float, before: float, after: float) -> float:
+    """这次胜率变化对最终胜负的**实际影响**分。
+
+    Args:
+        delta: 胜率变化（百分点，带符号）。
+        before: 变化前的胜率（0~100）。
+        after: 变化后的胜率（0~100）。
+
+    Returns:
+        非负的权重分。``|delta|`` 越大、越靠近 50%，分越高 ——
+        在 95% 上掉 12 个点只拿 6.8 分，在 63% 上掉 15 个点拿 12.4 分。
+    """
+    edge = min(abs(float(before) - 50.0), abs(float(after) - 50.0))
+    closeness = max(0.0, 1.0 - edge / 50.0)
+    return abs(float(delta)) * (STAKE_FLOOR + (1.0 - STAKE_FLOOR) * closeness)
+
+
+def stake_label(score: float) -> str:
+    """把权重分翻成给模型看的三档标签。"""
+    if score >= STAKE_DECISIVE:
+        return "决定性"
+    if score >= STAKE_MINOR:
+        return "影响有限"
+    return "基本无关"
+
+
+def npc_label(raw: str) -> str:
+    """npc 名 → 可读名。英雄走本地化表，非英雄单位归成类别。
+
+    实测 ``deaths_log`` 的 ``key`` 不一定是英雄：野区被抓会被记成
+    ``npc_dota_miniboss``、越塔会记成 ``npc_dota_badguys_tower2_mid``。
+    原样输出会让模型读到一串 ``npc dota miniboss``，既难看也容易被误读成玩家。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return "?"
+    low = text.lower()
+    if "tower" in low:
+        return "防御塔"
+    if "fort" in low or "fountain" in low:
+        return "基地"
+    if "roshan" in low:
+        return "肉山"
+    if "miniboss" in low or "neutral" in low or "creep" in low:
+        return "野怪"
+    return text.replace("npc_dota_hero_", "").replace("_", " ")
+
+
+def _collect_deaths(
+    match: dict,
+    npc_text: Callable[[str], str],
+) -> list[dict]:
+    """把 ``deaths_log`` 摊平成按时间排序的统一列表。
+
+    Returns:
+        ``[{"t": 秒, "i": 玩家下标, "radiant": bool, "killer": 名字}, ...]``
+    """
+    players = sorted(
+        [p for p in (match.get("players") or []) if isinstance(p, dict)],
+        key=lambda p: int(p.get("player_slot") or 0),
+    )
+    out: list[dict] = []
+    for i, player in enumerate(players):
+        for item in player.get("deaths_log") or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                when = float(item.get("time") or 0)
+            except (TypeError, ValueError):
+                continue
+            out.append({
+                "t": when,
+                "i": i,
+                "radiant": int(player.get("player_slot") or 0) < 128,
+                "killer": npc_text(str(item.get("key") or "")),
+            })
+    out.sort(key=lambda d: d["t"])
+    return out
+
+
+def key_deaths(
+    curve: WinCurve,
+    match: dict,
+    *,
+    npc_text: Callable[[str], str] | None = None,
+    top_n: int = 4,
+) -> list[dict]:
+    """团战之外、把胜率明显打下去的那几次阵亡（单抓 / 被抓 / 独自送掉）。
+
+    Args:
+        curve: 已对齐的胜率曲线。
+        match: 比赛数据，需要有 ``players[].deaths_log``。
+        npc_text: npc 名 → 可读英雄名的转换器。
+        top_n: 最多给几条。
+
+    Returns:
+        每条含 ``t`` / ``i`` / ``killer`` / ``own_before`` / ``own_after`` /
+        ``drop``（死者一方视角，负数为掉点）/ ``stake`` / ``label``。
+        **按 ``stake`` 从大到小排 —— 不是按掉点大小**：在 25% 上掉 13 个点，
+        未必比在 79% 上掉 7 个点更改变胜负，得看它离 50% 有多远。
+    """
+    if not curve.ok:
+        return []
+    convert = npc_text or npc_label
+    windows = [(f.start - 5, f.end + 5) for f in curve.fights]
+
+    picked: list[dict] = []
+    for death in _collect_deaths(match, convert):
+        when = death["t"]
+        if any(lo <= when <= hi for lo, hi in windows):
+            continue
+        before = curve.chance_at(when - 5)
+        after = curve.chance_at(when + DEATH_GLANCE)
+        # 换算到**死者这一方**的视角：天辉死看天辉胜率，夜魇死看夜魇胜率。
+        own_before = before if death["radiant"] else 100.0 - before
+        own_after = after if death["radiant"] else 100.0 - after
+        drop = round(own_after - own_before, 1)
+        if drop > -DEATH_DROP_MIN:
+            continue
+        score = stake_score(drop, own_before, own_after)
+        picked.append({**death, "own_before": own_before,
+                       "own_after": own_after, "drop": drop,
+                       "stake": score, "label": stake_label(score)})
+
+    picked.sort(key=lambda d: -d["stake"])
+    return picked[:top_n]
+
+
+def render_responsibility_block(
+    curve: WinCurve,
+    match: dict,
+    *,
+    hero_name: Callable[[Any], str] | None = None,
+    npc_text: Callable[[str], str] | None = None,
+    top_n: int = 4,
+) -> str:
+    """生成「责任窗口」文本块：全队曲线 → 窗口 → 人。
+
+    Args:
+        curve: 已对齐的胜率曲线。
+        match: 比赛数据。
+        hero_name: ``hero_id → 名字``，用于逐人行的显示。
+        npc_text: ``npc_dota_hero_xxx → 名字``，用于击杀者。
+        top_n: 渲染几个窗口（按权重分排序，**不是按时间**）。
+
+    Returns:
+        可直接拼进提示词的文本；曲线无效时返回空串。
+    """
+    if not curve.ok:
+        return ""
+
+    players = sorted(
+        [p for p in (match.get("players") or []) if isinstance(p, dict)],
+        key=lambda p: int(p.get("player_slot") or 0),
+    )
+    if not players:
+        return ""
+    convert = npc_text or npc_label
+
+    def who(index: int) -> str:
+        if index >= len(players):
+            return "选手%d" % (index + 1)
+        name = hero_name(players[index].get("hero_id")) if hero_name else ""
+        return name or "选手%d" % (index + 1)
+
+    deaths = _collect_deaths(match, convert)
+
+    lines = ["", "---", "",
+             "责任窗口（按**对胜负的实际影响**排序，不是按阵亡人数）", ""]
+    lines.append(
+        "权重口径：|胜率变化| × 距 50% 的接近程度。同样十几个点，"
+        "在五五开附近是翻盘，在九成以上只是垃圾时间 —— "
+        "**判「最差」必须有至少一个【决定性】窗口作证**；只有【影响有限】的窗口"
+        "最多算过程瑕疵；【基本无关】的窗口一个字都不许用来说谁打得差。"
+    )
+
+    scored = []
+    for fight in curve.fights:
+        score = stake_score(fight.delta, fight.before, fight.after)
+        scored.append((score, fight))
+    scored.sort(key=lambda pair: -pair[0])
+
+    for score, fight in scored[:top_n]:
+        lines.append("")
+        lines.append("【%s】第 %d 波 %s · 天辉胜率 %d%% → %d%%（%+d）· 阵亡 %d" % (
+            stake_label(score), fight.index, fight.span,
+            round(fight.before), round(fight.after), fight.shown_delta, fight.deaths,
+        ))
+        lines.extend(_fight_cast(match, fight, hero_name))
+        inside = [d for d in deaths
+                  if fight.start - 2 <= d["t"] <= fight.end + 2]
+        if inside:
+            lines.append("    这段内阵亡：" + " ｜ ".join(
+                "%s %s 被 %s 击杀" % (_clock(d["t"]), who(d["i"]), d["killer"])
+                for d in inside
+            ))
+
+    singles = key_deaths(curve, match, npc_text=convert)
+    if singles:
+        lines.append("")
+        lines.append("团战之外把胜率打下去的阵亡（单抓 / 被抓 / 独自送掉）：")
+        for death in singles:
+            lines.append(
+                "- 【%s】%s %s 被 %s 击杀 · %s胜率 %d%% → %d%%（%+d）" % (
+                    death["label"], _clock(death["t"]), who(death["i"]), death["killer"],
+                    "天辉" if death["radiant"] else "夜魇",
+                    round(death["own_before"]), round(death["own_after"]),
+                    round(death["drop"]),
+                )
+            )
+        lines.append(
+            "  （这类死亡责任最清楚：没有团战、没有队友，就是他一个人被抓住。"
+            "但**责任清楚不等于影响大** —— 权重档位同样要看它发生在什么局势下。）"
+        )
+
     return "\n".join(lines)
 
 

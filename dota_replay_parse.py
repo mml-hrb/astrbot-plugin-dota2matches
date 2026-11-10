@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 import httpx
 
@@ -450,6 +450,7 @@ def build_fight_block(
     hero_of: Callable[[Any], str],
     npc_by_hero: dict[int, str],
     item_label: Callable[[str], str] | None = None,
+    focus_account_ids: Iterable[Any] | None = None,
 ) -> str:
     """把一波团整理成给模型看的文本块。
 
@@ -458,6 +459,11 @@ def build_fight_block(
     ``npc_label`` 是 ``npc_dota_hero_xxx → 显示名`` 的映射，由调用方用英雄表
     建好传进来：录像里的实体名是英文 npc 名，而插件显示的是中文名，
     在函数内部硬拼是拼不出来的。
+
+    ``focus_account_ids`` 是主视角玩家的 ``account_id``（可多位）：只用于在
+    开头的「十人名单」里标一个「（焦点）」。这个块的其他段落全部按英雄列，
+    昵称不出现，所以没有这张表，模型无法把「请以某某为主视角」对到
+    具体哪个英雄身上。
     """
     c2m = float(offsets.get("combatlog_to_match") or 0)
     d2c = float(offsets.get("demo_to_combatlog") or 0)
@@ -485,6 +491,33 @@ def build_fight_block(
     lines.append("比赛 %s，时长 %s，%s。以下所有时间都是**比赛时间**。" % (
         match.get("match_id"), _clock(match.get("duration")),
         "天辉获胜" if match.get("radiant_win") else "夜魇获胜"))
+
+    # 十人名单：这个块的**每一段都按英雄列**（血量、技能、位置），
+    # 玩家的昵称在别处一次都不出现。主视角说的是「某个人」，
+    # 没有这张对照表，模型就只能猜谁在玩哪个英雄 —— 猜错了整份报告
+    # 都在评一个不相干的人，而且从文字上看不出来。
+    lines.append("")
+    lines.append("=== 十人名单（阵营 · 玩家 · 英雄）===")
+    focus_set: set[int] = set()
+    for raw_id in focus_account_ids or ():
+        try:
+            focus_set.add(int(raw_id))
+        except (TypeError, ValueError):
+            continue
+    for player in players[:10]:
+        hero = hero_of(player.get("hero_id"))
+        name = str(player.get("personaname") or "").strip()
+        try:
+            account_id = int(player.get("account_id") or 0)
+        except (TypeError, ValueError):
+            account_id = 0
+        mark = "（焦点）" if account_id and account_id in focus_set else ""
+        who = "%s · %s" % (name, hero) if name else hero
+        try:
+            side = "天辉" if int(player.get("player_slot") or 0) < 5 else "夜魇"
+        except (TypeError, ValueError):
+            side = "天辉"
+        lines.append("  [%s] %s%s" % (side, who, mark))
 
     lines.append("")
     lines.append("=== 这一波的坐标与结果（OpenDota 统计）===")
