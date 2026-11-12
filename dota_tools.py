@@ -38,7 +38,7 @@ from typing import Any, Awaitable, Callable
 from astrbot.api import logger
 
 try:  # 插件目录被作为包加载时的相对导入
-    from . import dota_chat, dota_esports, dota_hero_playstyle, dota_pool
+    from . import dota_chat, dota_esports, dota_hero_kb, dota_hero_playstyle, dota_pool
     from .dota_format import (
         format_hero_meta_board,
         format_match_list,
@@ -57,6 +57,7 @@ except ImportError:  # 兜底：以普通模块方式加载时，把插件目录
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import dota_chat  # type: ignore[no-redef]
     import dota_esports  # type: ignore[no-redef]
+    import dota_hero_kb  # type: ignore[no-redef]
     import dota_hero_playstyle  # type: ignore[no-redef]
     import dota_pool  # type: ignore[no-redef]
     from dota_format import (  # type: ignore[no-redef]
@@ -236,6 +237,17 @@ class ToolContext:
     #: 职业赛事 / 战队 / 转会那三个工具要用；为 ``None``（离线单测、或
     #: 用户在配置里关掉了赛事数据源）时，它们回一句「这块没开」而不是报错。
     esports: Any = None
+    #: ``await hero_kb_search(query, hero=None)``：在**英雄画像知识库**里检索。
+    #:
+    #: 为 ``None`` 时（离线单测、或宿主没配嵌入模型导致知识库建不起来），
+    #: ``query_hero_profile`` 会退化到**本地精确查找**（按英雄名命中
+    #: ``hero_profiles.json`` 那一条）—— 这条路不需要嵌入、也不需要联网，
+    #: 保证「查某个英雄的画像」在任何环境下都答得出来；只是少了语义检索
+    #: （「什么英雄克制高蓝法师」这种不带英雄名的问法会答不了）。
+    hero_kb_search: Callable[..., Awaitable[str]] | None = None
+    #: ``dota_hero_kb.HeroKnowledge`` 实例：知识库不可用时的**本地兜底**。
+    #: 按英雄名精确命中 ``hero_profiles.json`` 那一条，不需要嵌入、不联网。
+    hero_kb: Any = None
     #: 当前时间戳
     now: float = 0.0
     #: 单工具超时
@@ -522,6 +534,28 @@ def build_tool_specs(*, include_write: bool = True) -> list[dict]:
             {"hero": _HERO_PROP},
             ["hero"],
         ),
+        _spec(
+            "query_hero_profile",
+            "查**英雄的判读基准**（人工整理，不是统计）：这个英雄的输出来自哪里、"
+            "**克制什么**、**怕什么**、怕的东西怎么应对、**不能做什么**、什么算失职。"
+            "问「XX 克谁 / 怕谁 / 该怎么打 / 什么算打得差」时用。"
+            "也支持**不带英雄名**的语义问法，如「什么英雄克制高蓝上限的法师」"
+            "「谁怕力丸」—— 这类问题直接把整句放进 hero 参数。"
+            "**与 query_hero_playstyle 分工不同**：那个查的是当前版本统计（出装热度、"
+            "出场率、职业赛表现），本工具查的是判读基准，**没有任何统计数字**。"
+            "问「怎么出装 / 出场率」用 playstyle，问「他该克制谁 / 这局他该做什么」用本工具。",
+            {
+                "hero": {
+                    "type": "string",
+                    "description": "英雄中文名（如「敌法师」），或一句语义化的问法。",
+                },
+                "topic": {
+                    "type": "string",
+                    "description": "可选，只关心某一方面时填，如「克制」「出装思路」「失职标准」。",
+                },
+            },
+            ["hero"],
+        ),
         # ---------------- 只读：职业赛事 / 战队 / 转会 ----------------
         _spec(
             "query_tournament",
@@ -801,6 +835,7 @@ TOOL_READ_NAMES: tuple[str, ...] = (
     "query_meta",
     "recommend_heroes",
     "query_hero_playstyle",
+    "query_hero_profile",
     "query_tournament",
     "query_esports_team",
     "query_transfers",
@@ -1649,6 +1684,86 @@ async def _tool_query_hero_playstyle(args: dict, ctx: ToolContext) -> str:
     )
 
 
+# ---------------------------------------------------- 英雄画像知识库
+
+
+#: 知识库没接上时的统一答复。**不能拿模型自己的常识顶上** ——
+#: 那正是这套画像要防的事（换个模型结论就飘）。但要说清「查不到」而不说「不存在」。
+_HERO_KB_OFF = (
+    "英雄画像知识库暂时不可用（宿主没配嵌入模型，或知识库没建起来）。"
+    "如实告诉用户「这一块查不了」；**不要用你自己的常识替他作答** —— "
+    "这份画像的意义就是替代模型凭印象判断。"
+)
+
+
+async def _tool_query_hero_profile(args: dict, ctx: ToolContext) -> str:
+    """查**单个或一组英雄的画像**：克制谁、被谁克制、什么算失职。
+
+    与 ``query_hero_playstyle`` 的分工（**这条必须分清，否则模型会混用**）：
+
+    * ``query_hero_playstyle`` 查的是**统计出来的当前版本数据**：出装热度、
+      出场率、职业赛表现、高分段位置分布。它回答「这版本大家怎么玩」。
+    * 本工具查的是**人工整理的判读基准**：这英雄的输出来自哪里、做不到什么、
+      克谁、怕谁、怕的东西怎么应对、什么算失职。它回答「他这局该做什么」，
+      **不含任何统计数字**，也不随版本更新。
+
+    两条取数路径：
+
+    1. 有知识库（``ctx.hero_kb_search``）→ 走向量检索，支持**不带英雄名的
+       语义问法**（「什么英雄克制高蓝上限的法师」）。
+    2. 没有知识库 → 退化到**本地精确查找**：按英雄名命中
+       ``hero_profiles.json`` 里那一条。这条路不需要嵌入也不联网，
+       只是答不了语义问法（会如实说明）。
+    """
+    raw = str(args.get("hero") or "").strip()
+    topic = str(args.get("topic") or "").strip()
+    hero = raw
+    if not hero:
+        return (
+            "没给英雄名或问题。请让用户说要查哪个英雄（如「敌法师」），"
+            "或者直接问「什么英雄克制高蓝上限的法师」这类问题。"
+        )
+
+    # 有知识库：走检索（能处理语义问法，也能处理「英雄名 + 话题」）
+    if ctx.hero_kb_search is not None:
+        query = hero if not topic else f"{hero} {topic}"
+        try:
+            text = await ctx.hero_kb_search(query, hero=hero)
+        except Exception as e:  # noqa: BLE001
+            ctx.note_failure("query_hero_profile")
+            return (
+                f"知识库检索出错（{type(e).__name__}: {e}）。"
+                "如实说明这一块暂时查不到，不要自己编一份画像。"
+            )
+        if text:
+            return text
+        # 走到这里说明知识库在、但没命中 —— 继续走本地精确查找兜底
+
+    # 本地精确查找（也作为知识库没命中时的兜底）
+    kb = getattr(ctx, "hero_kb", None)
+    if kb is None:
+        return _HERO_KB_OFF
+    heroes = await _guarded(ctx.heroes(), ctx)
+    profile = {}
+    display = hero
+    if isinstance(heroes, dict):
+        # 先按中文名反查 id，再把 id 交给画像表
+        for hid, info in heroes.items():
+            name = ""
+            if isinstance(info, dict):
+                name = str(info.get("name_zh") or info.get("localized_name") or "")
+            if name and name == hero:
+                profile = kb.profile(hid)
+                display = name
+                break
+    if not profile:
+        return (
+            f"没有找到「{hero}」的画像。可能原因：① 这个名字不在英雄表里；"
+            "② 知识库与本地表都没有这一条。如实告诉用户查不到，不要凭印象编。"
+        )
+    return dota_hero_kb.render_profile_text(display, profile)
+
+
 # ---------------------------------------------------- 职业赛事 / 战队 / 转会
 
 
@@ -2379,6 +2494,7 @@ _DISPATCH: dict[str, Callable[[dict, ToolContext], Awaitable[str]]] = {
     "query_meta": _tool_query_meta,
     "recommend_heroes": _tool_recommend_heroes,
     "query_hero_playstyle": _tool_query_hero_playstyle,
+    "query_hero_profile": _tool_query_hero_profile,
     "query_tournament": _tool_query_tournament,
     "query_esports_team": _tool_query_esports_team,
     "query_transfers": _tool_query_transfers,

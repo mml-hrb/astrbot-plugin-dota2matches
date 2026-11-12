@@ -40,6 +40,7 @@ try:  # 插件目录被作为包加载时的相对导入
         dota_cron,
         dota_esports,
         dota_hero_kb,
+        dota_hero_kb_ingest,
         dota_history,
         dota_jobs,
         dota_nlu,
@@ -107,6 +108,7 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
     import dota_cron  # type: ignore[no-redef]
     import dota_esports  # type: ignore[no-redef]
     import dota_hero_kb  # type: ignore[no-redef]
+    import dota_hero_kb_ingest  # type: ignore[no-redef]
     import dota_history  # type: ignore[no-redef]
     import dota_jobs  # type: ignore[no-redef]
     import dota_nlu  # type: ignore[no-redef]
@@ -1037,6 +1039,13 @@ class Dota2Plugin(Star):
             self.data_dir,
             budget=int(self.cfg("hero_kb_budget", dota_hero_kb.DEFAULT_BUDGET) or 0),
         )
+        #: 英雄画像**知识库**（与上面的 ``_hero_kb`` 是两件事）：
+        #:
+        #: ``_hero_kb`` 读本地 JSON 做复盘注入；知识库是把同一份数据灌进
+        #: AstrBot 的向量库，让**闲聊也能检索**（「敌法师克谁」）。
+        #: 建库是后台任务，这两个属性只是它的状态位。
+        self._hero_kb_task: asyncio.Task | None = None
+        self._hero_kb_ready = False
         #: 职业赛事数据源（Liquipedia wiki）。
         #:
         #: 它是**懒连接**的：构造时不发请求，第一次真正查询才建 httpx 客户端，
@@ -3154,6 +3163,78 @@ class Dota2Plugin(Star):
             self._jobs.render(str(event.unified_msg_origin))
         )
 
+    @d2.command("知识库", alias={"kb", "herokb", "英雄库"})
+    @take_over_event
+    async def d2_hero_kb(self, event: AstrMessageEvent):
+        """管理英雄画像知识库：/d2 知识库 [重建|状态]
+
+        为什么要人手动触发：自动建库只在**启动时**试一次。如果宿主启动时还没配
+        嵌入模型，或者后来才在 WebUI 里加了一个，那次尝试就白过了 ——
+        重建不用重启插件，这是最省事的一条路。
+
+        * 不带参数 / `状态` → 看建没建、多少篇、用的哪个嵌入模型
+        * `重建` → 忽略 marker 与已有文档，强制重灌（画像更新后用）
+        """
+        arg = (event.message_str or "").strip()
+        # event.message_str 含前缀，取最后一段判断意图
+        parts = arg.split()
+        action = parts[-1] if parts else ""
+
+        if action in {"重建", "rebuild", "重灌", "刷新"}:
+            yield event.plain_result("开始重建英雄画像知识库（127 条，约需一分钟）……")
+            msg = await self._build_hero_kb(force=True)
+            yield event.plain_result(msg)
+            return
+
+        km = getattr(self.context, "kb_manager", None)
+        if km is None:
+            yield event.plain_result(
+                "宿主没有知识库模块，用不了向量检索。\n"
+                "英雄画像仍然会注入复盘提示词，只是闲聊里查不了。"
+            )
+            return
+
+        ep = dota_hero_kb_ingest.pick_embedding_provider(
+            getattr(km, "provider_manager", None)
+        )
+        if ep is None:
+            yield event.plain_result(
+                "宿主**没有配置嵌入模型**，所以建不了知识库。\n"
+                "\n"
+                "**画像本身不受影响**：复盘时照常注入十人的判读参考，只是闲聊里查不了。\n"
+                "\n"
+                "— 想让闲聊也能查？三步 —\n"
+                "1. 打开 AstrBot 的 WebUI → 「服务提供商」；\n"
+                "2. 新增一个**嵌入（Embedding）类型**的提供商。常见的几种：\n"
+                "   · 阿里云百炼 DashScope：模型 `text-embedding-v4`（中文最好，有免费额度）\n"
+                "   · 硅基流动：模型 `BAAI/bge-m3`（很便宜，按量计费）\n"
+                "   · 本地 ollama：如 `bge-m3`（不花钱，但要有机器跑）\n"
+                "3. 回来发 `/d2 知识库 重建`，**不用重启插件**。\n"
+                "\n"
+                "配好后发 `/d2 知识库` 可以确认它有没有被认出来。"
+            )
+            return
+
+        try:
+            helper = await km.get_kb_by_name(dota_hero_kb_ingest.KB_NAME)
+        except Exception as e:  # noqa: BLE001
+            yield event.plain_result(f"读知识库失败：{e}")
+            return
+
+        if helper is None:
+            yield event.plain_result(
+                "知识库还没建（嵌入模型已就绪：%s）。\n发 `/d2 知识库 重建` 现在建。"
+                % (dota_hero_kb_ingest.provider_id_of(ep) or "未知")
+            )
+            return
+
+        count = await helper.count_documents()
+        yield event.plain_result(
+            "英雄画像知识库：%d 篇文档\n嵌入模型：%s\n"
+            "想在闲聊里查某个英雄，直接问就行（如「敌法师克谁」）。"
+            % (count, dota_hero_kb_ingest.provider_id_of(ep) or "未知")
+        )
+
     # ==================================================================
     # 自然语言入口：不用记指令，直接说人话
     # ==================================================================
@@ -4104,6 +4185,8 @@ class Dota2Plugin(Star):
             ),
             schedules_text=lambda: self._schedule_list_text(umo),
             esports=getattr(self, "esports", None),
+            hero_kb_search=lambda query, hero=None: self._hero_kb_search(query, hero),
+            hero_kb=self._hero_kb,
             now=time.time(),
             timeout=timeout,
         )
@@ -8958,8 +9041,71 @@ class Dota2Plugin(Star):
 
     @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self):
-        """AstrBot 初始化完成后确保监听任务已启动。"""
+        """AstrBot 初始化完成后确保监听任务已启动，并尝试建英雄画像知识库。"""
         self._start_watcher()
+        self._ensure_hero_kb()
+
+    # ------------------------------------------------------------------
+    # 英雄画像知识库：自动建库 + 闲聊检索
+    # ------------------------------------------------------------------
+    def _ensure_hero_kb(self) -> None:
+        """后台试着建库（幂等、不阻塞启动、失败不影响任何功能）。
+
+        ⚠️ **为什么必须是后台任务**：首次建库要发 127 次嵌入请求，实测约 40 秒。
+        同步跑会把「AstrBot 启动完成」整体推迟这么久，而这件事**不是必需品** ——
+        建不起来，画像照旧只喂复盘，功能少一块而已。所以丢给事件循环，
+        启动路径不 await 它。
+
+        ⚠️ **为什么放在 ``on_astrbot_loaded`` 而不是 ``__init__`` /
+        ``initialize``**：命中过一次真实的时序坑 —— ``core_lifecycle`` 的顺序是
+        ``plugin_manager.reload()``（插件 initialize 在这里）→
+        ``provider_manager.initialize()`` → ``kb_manager.initialize()``。
+        在插件 initialize 里拿 ``kb_manager.kb_db`` 会直接
+        ``AttributeError``（实测 2026-11-12）。``on_astrbot_loaded`` 才是
+        全部初始化完成之后触发的。
+
+        开关：``hero_kb_build``（默认开）。关掉后只有手动 ``/d2 知识库 重建`` 会建。
+        """
+        if not bool(self.cfg("hero_kb_build", True)):
+            logger.info("[dota2] 英雄画像知识库自动建库已关闭（hero_kb_build=false）")
+            return
+        task = asyncio.create_task(self._build_hero_kb(force=False))
+        # 留住引用，否则任务可能被 GC 掉（asyncio 只持弱引用）。
+        self._hero_kb_task = task
+
+    async def _build_hero_kb(self, *, force: bool) -> str:
+        """真正建库的地方（自动与手动共用）。返回一句给人看的结论。"""
+        km = getattr(self.context, "kb_manager", None)
+        if km is None:
+            return "宿主没有知识库模块，建不了库（画像仍用于复盘）"
+
+        plugin_dir = Path(__file__).resolve().parent
+        profiles = dota_hero_kb_ingest.load_profiles(plugin_dir, self.data_dir)
+        marker = self.data_dir / "hero_kb_built.txt"
+        try:
+            changed, msg = await dota_hero_kb_ingest.ensure(
+                km, profiles, force=force, marker_path=marker
+            )
+        except Exception as e:  # noqa: BLE001 - 建库失败不能影响插件其它功能
+            logger.warning(f"[dota2] 英雄画像建库失败（不影响复盘）：{e}")
+            return f"建库失败：{e}"
+
+        if changed:
+            self._hero_kb_ready = True
+        logger.info("[dota2] %s", msg)
+        return msg
+
+    async def _hero_kb_search(self, query: str, hero: str | None = None) -> str:
+        """闲聊侧检索英雄画像。**失败一律返回空串**，让工具退化到本地查找。
+
+        不把异常抛给工具层，是因为「知识库没建起来」是**常态**而不是故障
+        （很多部署没有嵌入模型）。抛异常会让模型看到一句报错，
+        然后自己编一份画像 —— 那正是这套数据要防的事。
+        """
+        km = getattr(self.context, "kb_manager", None)
+        if km is None:
+            return ""
+        return await dota_hero_kb_ingest.search(km, query)
 
     def _watch_poll_plan(self, watchers: list[dict]) -> tuple[int, str]:
         """算出这一轮该隔多久再轮询，外加一句给人看的理由。

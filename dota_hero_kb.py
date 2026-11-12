@@ -403,3 +403,28 @@ def _int(value: Any) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def render_profile_text(name: str, rec: dict[str, str]) -> str:
+    """把**单个英雄**的画像渲染成一段可读文本（给闲聊问答用）。
+
+    与 :meth:`HeroKnowledge.render_review_block` 的区别：那个是「本局十人」的
+    清单，带块头纪律、带预算降级；这个是**单英雄问答**，一次只讲一个英雄，
+    所以不降级、不截断 —— 一条画像实测一千五百字左右，整条给它才讲得全。
+
+    字段顺序照 :data:`LABELS` 的定义顺序走（位置 → 流派 → 输出 → ... →
+    复盘基准），这个顺序本身是有叙事的：先说「他一般怎么玩」，再说
+    「他做不到什么」，最后才是「什么算失职」。倒过来读会像在数落人。
+    """
+    lines = ["%s（英雄判读参考）" % name, ""]
+    lines.append(
+        "以下是**常见对局**里的主流打法与判读基准，**不是限定** —— "
+        "本局走的号位、选的流派、出的装备与这里不同时，按本局实际打法判，"
+        "不要拿参考去否定他。"
+    )
+    lines.append("")
+    for key, label in LABELS.items():
+        val = str(rec.get(key) or "").strip()
+        if val:
+            lines.append("· %s：%s" % (label, val))
+    return "\n".join(lines).strip()
