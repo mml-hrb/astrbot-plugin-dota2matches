@@ -472,6 +472,26 @@ NLU_DEFAULT_KEYWORD = "dota2助手"
 #: 再长也没有增量信息，白白占提示词的 token。
 QUOTE_TEXT_MAX_CHARS = 900
 
+#: 会话内「最近一份复盘正文」的保留时长（秒）。
+#:
+#: 用途只有一个：用户**引用一张战报图片**时，把那张图对应的正文补回给模型
+#: （图片消息的 ``message_str`` 只有 ``[图片]``，正文哪都取不到，
+#: 详见 :meth:`Dota2Plugin._quote_report_body`）。
+#:
+#: 取 **8 小时**，比聊天历史的 12 小时短：这条关联的本质是「刚才那份」，
+#: 隔了一夜再去引用一张旧图，「最近一份」早就换成别的了 —— 留着只会让
+#: 模型把新战报当成旧图的内容，错得比没有更糟。
+REPORT_MEMORY_TTL = 8 * 3600.0
+
+#: 媒体占位符：适配器把图片摊平成文本时，引用正文就只剩这些字样。
+#:
+#: 只用来判「这条引用里没有可读文字」—— 命中之后才去走「补复盘正文」那条路
+#: （见 :func:`_quote_has_image`）。**不是**要拿它去猜图片内容。
+_MEDIA_PLACEHOLDER_RE = re.compile(
+    r"^[\[\【(（]?\s*(图片|image|img|照片|pic|picture)\s*[\]\】)）]?$",
+    re.IGNORECASE,
+)
+
 #: 本插件自己发出去的消息里的**固定标记** —— 用来判断「用户引用的这条消息
 #: 是不是插件发的」。
 #:
@@ -524,6 +544,34 @@ def _is_quote_component(component: Any) -> bool:
         return True
     # 版本兜底：类路径取不到时按类名认（AstrBot 这个组件的类名一直是 Reply）
     return component.__class__.__name__ == "Reply"
+
+
+def _quote_has_image(event: AstrMessageEvent) -> bool:
+    """本条消息**引用**的那条消息里有没有图片段。
+
+    为什么需要单独判一次：报告发成图片之后，被引用消息的正文是空串或
+    ``[图片]`` 这类占位符（各适配器不同），**图片里的字是取不出来的**。
+    插件唯一能补回内容的办法是从自己发出去时留下的那份正文里取
+    （见 :meth:`Dota2Plugin._quote_report_body`），而前提就是先认出
+    「用户引用的是张图」。
+
+    两条判据取或，覆盖两种链路：
+
+    * 引用段里有 ``Image`` 组件 —— 消息链层面的硬事实，最可靠；
+    * 正文只有占位符（``[图片]`` / ``[image]`` 等）—— 少数适配器会把
+      图片摊平成文本，链里没有 ``Image`` 段。
+    """
+    for component in reversed(_message_chain(event)):
+        if not _is_quote_component(component):
+            continue
+        chain = getattr(component, "chain", None)
+        if isinstance(chain, (list, tuple)):
+            for seg in chain:
+                if seg is not None and seg.__class__.__name__ == "Image":
+                    return True
+        text = str(getattr(component, "message_str", "") or "").strip()
+        return _MEDIA_PLACEHOLDER_RE.fullmatch(text) is not None
+    return False
 
 
 def _extract_quote(event: AstrMessageEvent) -> tuple[str, bool]:
@@ -1137,6 +1185,22 @@ class Dota2Plugin(Star):
         #: 只放在内存里：重启后语境清空是合理的（「这一盘」本来就是会话内的
         #: 概念，隔天再问没有意义）。
         self._nlu_recent_matches: dict[str, deque[dict]] = {}
+        #: 会话语境：每个会话**最近发出的一份复盘正文**。
+        #:
+        #: 为什么需要单独一份，而不是全靠 :attr:`history`：
+        #:
+        #: ``history`` 会按 12 小时 TTL 与 4000 字预算裁剪，而且里面混着
+        #: 闲聊、播报、工具查询结果。用户「引用一张战报图片」时，插件要回答的
+        #: 是**「那张图里写了什么」**，这需要一个能明确指认的对象（标题 +
+        #: 发出时刻 + 完整正文），从一堆历史条目里猜不可靠。
+        #:
+        #: 存的是**内存里的最近一份**，键是 umo。只留一份是刻意的：
+        #: 框架不把平台返回的消息 ID 交回插件（``context.send_message`` →
+        #: ``send_by_session`` 返回值是 ``bool``，底层还是 ``create_task``
+        #: 投递），所以**无法按消息 ID 精确关联**。既然只能按「同会话最近
+        #: 一份」关联，多留几份也解决不了误判，反而会让提示词变重。
+        #: 真有歧义时让模型反问（见 :meth:`_quote_report_body` 的提示词）。
+        self._last_reports: dict[str, dict] = {}
         #: 会话语境：每个会话最近几轮对话。
         #:
         #: 实体是 :attr:`history`（可落盘、带 TTL 与预算，见 :mod:`dota_history`）；
@@ -2649,6 +2713,78 @@ class Dota2Plugin(Star):
             return False
         return True
 
+    # ----------------------------------------------------------------
+    # 复盘正文的留存：让「引用一张战报图片」也能聊
+    # ----------------------------------------------------------------
+
+    def _remember_report_body(
+        self, umo: str, report: str, *, headline: str = "", label: str = "复盘"
+    ) -> None:
+        """把一份刚发出去的复盘正文记进会话上下文（内存 + 历史）。
+
+        只在 :meth:`_deliver_report` 里调用 —— 那是全部后台复盘出口的唯一收口。
+
+        两处都记，**用途不同**：
+
+        * :attr:`_last_reports` —— 给「引用了一张图片」这条路径用。它要的是
+          「最近一份战报的完整正文 + 标题 + 时刻」，从历史里捞不可靠（历史
+          混着闲聊、有 TTL、还按 4000 字裁剪）。
+        * :meth:`_nlu_log_line` ``kind="report"`` —— 给「最近对话」用。用户
+          不引用、直接追问「刚那场他补刀多少」时，模型靠这条才接得上。
+
+        标题一起进历史：只看正文的话，模型无法判断「这份报告说的是哪一场」。
+        """
+        body = str(report or "").strip()
+        if not body:
+            return
+        umo = str(umo or "")
+        if not umo:
+            return
+
+        now = time.time()
+        self._last_reports[umo] = {
+            "text": body,
+            "headline": str(headline or "").strip(),
+            "label": str(label or "复盘"),
+            "ts": now,
+        }
+        # 不设上限地留着会随群数增长。按会话存一份，总量就是「群的数量」，
+        # 而且每次覆盖同一键，不会累积。这里再顺手清掉过期的（8 小时），
+        # 与聊天历史的 12 小时 TTL 相比略短 —— 隔天再引用一张旧图，
+        # 「最近一份」本来就不该再当成它。
+        stale = [
+            key
+            for key, row in self._last_reports.items()
+            if now - float(row.get("ts") or 0) > REPORT_MEMORY_TTL
+        ]
+        for key in stale:
+            self._last_reports.pop(key, None)
+
+        # 标题与正文合成一条：分开记会让模型以为这是两条机器人发言。
+        line = body if not headline else f"{headline}\n\n{body}"
+        self._nlu_log_line(umo, "bot", line, kind="report")
+
+    def _quote_report_body(self, umo: str) -> dict | None:
+        """取本会话最近一份复盘正文（给「引用图片」用）；没有则 ``None``。
+
+        为什么需要它：报告发成**图片**之后，用户用 QQ 的「回复」指向那张图，
+        适配器塞进 ``Reply.message_str`` 的只有 ``[图片]`` 这类占位符 ——
+        正文既不在消息里，也不在 ``event.message_str`` 里。这时候唯一能让
+        模型看见内容的，就是插件自己发出去时留下的那一份。
+
+        ⚠️ **不做消息 ID 校验**，因为拿不到：``context.send_message`` →
+        ``send_by_session`` 返回 ``bool``，底层 ``create_task`` 投递，平台
+        返回的消息 ID 不会回到插件手里。所以这里只能按「同会话 + 最近一份」
+        关联，并在提示词里**如实说明这个不确定性**，让模型在拿不准时反问，
+        而不是硬答（见 :func:`dota_chat._quoted_report_block`）。
+        """
+        row = self._last_reports.get(str(umo or ""))
+        if not isinstance(row, dict):
+            return None
+        if time.time() - float(row.get("ts") or 0) > REPORT_MEMORY_TTL:
+            return None
+        return row
+
     async def _deliver_report(
         self,
         umo: str,
@@ -2674,6 +2810,25 @@ class Dota2Plugin(Star):
         """
         if not report:
             return False
+
+        # ---- 先记历史，再发 ----
+        #
+        # ⚠️ **这里以前完全没有记历史**，而它是全部后台复盘出口的唯一收口
+        # （等解析完 / 降级 / 自然语言 / 定时复查 / 团战复盘），于是复盘正文
+        # 发出去之后**不在任何上下文里**。用户接着问「刚那场他补刀多少」，
+        # 模型手上什么都没有，只能重新查一遍或干脆答错。
+        #
+        # 更要命的是它和「发成图片」叠在一起（2026-11-12 用户提问）：
+        # 报告被渲染成**图片**发出去了，用户用 QQ 的「回复」指向那张图时，
+        # 适配器塞进 ``Reply.message_str`` 的只有 ``[图片]`` 这类占位符 ——
+        # 真正的正文既不在消息里，也不在历史里，两头都取不到。
+        # 记进历史之后，:func:`_extract_quote` 那条路才有东西可回退
+        # （见 :meth:`_remember_report_body` 与 ``_quote_report_body``）。
+        #
+        # 与 ``_send_to_session`` 同一口径（``kind="report"``）：那是推送 /
+        # 播报的出口，这里是复盘的出口，两边都进历史，读出来才有统一的
+        # 「[自动播报]」前缀，模型不必猜这段是谁说的。
+        self._remember_report_body(umo, report, headline=headline, label=label)
 
         image_path = None
         if self.cfg("analysis_as_image", True):
@@ -2781,6 +2936,14 @@ class Dota2Plugin(Star):
         """
         if not report:
             return
+        # 与 :meth:`_deliver_report` 同一件事：**先记历史，再发**。
+        #
+        # 这条是指令路径（``/d2 单场 <ID>`` 等），同样会把报告发成图片；
+        # 不在这里记，用户「引用那张图接着问」时就什么都取不到。
+        # 两处都记会不会重复？不会 —— 它们是**互斥的两条出口**：
+        # 指令路径 yield 出去，后台路径走 ``_deliver_report``，
+        # 同一次复盘只经过其中一条。
+        self._remember_report_body(event.unified_msg_origin, report, headline=header)
         image_path = None
         if self.cfg("analysis_as_image", True):
             yield event.plain_result(
@@ -4849,7 +5012,12 @@ class Dota2Plugin(Star):
         return (answer or None), "; ".join(tool_ctx.trace), list(tool_ctx.pending_prompts)
 
     async def _nlu_agent_reply(
-        self, event: AstrMessageEvent, question: str, *, quoted: str = ""
+        self,
+        event: AstrMessageEvent,
+        question: str,
+        *,
+        quoted: str = "",
+        quoted_from_report: bool = False,
     ) -> tuple[str | None, list[str]]:
         """自然语言入口的**唯一**路径：带着全套工具，让模型自己决定干什么。
 
@@ -4909,6 +5077,7 @@ class Dota2Plugin(Star):
                 local_only=True,
                 include_history=not tools_on,
                 quoted=quoted,
+                quoted_from_report=quoted_from_report,
             )
         except Exception as e:  # noqa: BLE001 - 兜底失败也要放行，不能吞消息
             logger.error(f"[dota2] 闲聊兜底收集数据失败: {e}", exc_info=True)
@@ -4959,6 +5128,7 @@ class Dota2Plugin(Star):
         local_only: bool = False,
         include_history: bool = True,
         quoted: str = "",
+        quoted_from_report: bool = False,
     ) -> dota_chat.ChatContext:
         """收集一次「带插件数据的回答」所需的会话语境。
 
@@ -4998,6 +5168,7 @@ class Dota2Plugin(Star):
             # 本条消息**引用**的那条消息的正文（QQ「回复」）。适配器构造
             # message_str 时不带它，所以只能由入口单独取出来给到上下文。
             quoted=quoted,
+            quoted_from_report=quoted_from_report,
             self_binding=binding,
             focus_accounts=focus,
             recent_limit=int(
@@ -5074,12 +5245,44 @@ class Dota2Plugin(Star):
            会直接 ``break``），表现为「正常对话和其他插件全都没反应」。
         """
         text = dota_nlu.normalize(getattr(event, "message_str", "") or "")
+        umo = event.unified_msg_origin
+        uid = str(event.get_sender_id())
         # 本条消息引用的那条消息（QQ「回复」功能）。**必须单独取一次**：
         # 各适配器构造 ``message_str`` 时只放用户自己打的正文，被引用内容
         # 只进消息链的 ``Reply`` 段（见 :func:`_extract_quote`）。
         quoted_text, quoted_for_bot = _extract_quote(event)
-        umo = event.unified_msg_origin
-        uid = str(event.get_sender_id())
+        #: 这次的引用正文是不是**插件从自己发过的战报里补回来的**（用户
+        #: 引用的是图片）。只影响提示词的措辞，不影响要不要接管 —— 见下面。
+        quoted_from_report = False
+
+        # ---- 引用的是**图片**：正文从插件自己留下的那份里补 ----
+        #
+        # ⚠️ 这条分支存在的原因：复盘默认发成**图片**（``analysis_as_image``）。
+        # 用户对着那张图按「回复」时，适配器能给的只有 ``[图片]`` 或空串 ——
+        # **图片里的字是取不出来的**，模型于是收到一条「引用了一份空内容」的
+        # 消息，只能说「我看不到你引用的内容」。
+        #
+        # 不用 OCR、也不用视觉模型：那份报告正文本来就是插件自己写出来、
+        # 自己发出去的，发的时候留了一份（:meth:`_remember_report_body`）。
+        # 这里把它取回来即可 —— 零成本、零延迟、不依赖任何外部能力。
+        #
+        # ``quoted_for_bot`` 一并置真：引用一张本插件刚发的战报图，就是最
+        # 明确的「这话是给你说的」。不置真的话，这条消息会被闸门当成
+        # 「引用了别人的图」直接放行，用户会觉得 bot 装死。
+        if _quote_has_image(event):
+            remembered = self._quote_report_body(umo)
+            if remembered is not None:
+                quoted_text = str(remembered.get("text") or "").strip()
+                quoted_for_bot = True
+                quoted_from_report = True
+                logger.info(
+                    "[dota2] 引用了一张图片，已按本会话最近一份战报补正文（%d 字）",
+                    len(quoted_text),
+                )
+            else:
+                # 引用的是图、但本会话没有留过战报：多半是别人发的图或早已过期。
+                # **不要**认领 —— 那会让插件去答一张它看不见的图。
+                logger.info("[dota2] 引用了一张图片，但本会话没有可用的战报记录，放行")
 
         # 会话场景（群 / 频道 / 私聊）：**每条消息都记一次**，与后面有没有
         # 被唤醒无关。QQ 官方适配器重启后会忘掉「哪个会话是群」，从而静默
@@ -5219,6 +5422,7 @@ class Dota2Plugin(Star):
             reply, pending_prompts = await self._nlu_agent_reply(
                 event, self._nlu_effective_question(effective, quoted_text),
                 quoted=quoted_text,
+                quoted_from_report=quoted_from_report,
             )
             if reply or pending_prompts:
                 if reply:
