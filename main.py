@@ -2357,9 +2357,17 @@ class Dota2Plugin(Star):
         elif primary_label == "OpenDota" and not opendota.api_key:
             # 没有 Key 不是错，只是额度小得多，且**被 429 拒掉的请求照样扣**。
             # 不提示的话，用户遇到限流时完全不知道为什么、也不知道怎么解。
+            #
+            # ⚠️ **绝不能写「去免费申请一个」** —— OpenDota 没有免费 Key，官方原话是
+            # 「Getting an API key requires a linked payment method」，也就是必须先绑
+            # 支付方式、按次计费（$0.0001/次）。写成免费会让人白跑一趟，而这是启动
+            # 日志里**唯一**一行相关提示，看的人会当真（2026-11-11 用户当场纠正：
+            # 「你自己说的 opendota 没有免费的 key，只有收费的」—— 原话是我自己写错的）。
             logger.info(
-                "[dota2] 未配置 OpenDota API Key：额度按出口 IP 计（3000 次/天），"
-                "且被限流拒绝的请求同样计数。到 opendota.com 免费注册可大幅提高额度。"
+                "[dota2] 未配置 OpenDota API Key：额度按出口 IP 计（3000 次/天、60 次/分），"
+                "且被限流拒绝的请求同样计数。OpenDota 没有免费 Key —— 要提额度只能绑定"
+                "支付方式按次计费（$0.0001/次，3000 次/分、无日限）；日常省额度靠"
+                "「监听轮询优先走 STRATZ」，那份额度按 token 计、不吃这一份。"
             )
         return source
 
@@ -7123,7 +7131,8 @@ class Dota2Plugin(Star):
                 f"⚠️ 解析申请没有返回排队凭据，可能原因：\n"
                 f"· OpenDota 认为这局无法解析（临时对局 / 录像已过期）；\n"
                 f"· 该局已在解析队列中（这时其实不用再催）；\n"
-                f"· 请求被限流（配置里填写 OpenDota API Key 可以提升额度）。\n\n"
+                f"· 请求被限流（配置里填写 OpenDota API Key 可以提升额度；"
+                f"注意它没有免费 Key，需绑定支付方式按次计费）。\n\n"
                 f"当前状态：{state.describe()}\n"
                 f"可以过几分钟再用 `/d2 单场 {match_id}` 试探一次。"
             )

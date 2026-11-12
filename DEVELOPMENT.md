@@ -1256,6 +1256,7 @@ v2.3.4 起，插件里**两条模型通道各管一摊**，不再混用：
 1. 把 `astrbot_plugin_dota2` 目录放到 `AstrBot/data/plugins/` 下；
 2. 在 AstrBot WebUI 的「插件管理」中重载插件；
 3. 打开插件配置，按需填写（可选）OpenDota API Key 与 HTTP 代理。
+   注意 OpenDota **没有免费 Key**（需绑定支付方式按次计费），不填也能用匿名额度。
 
 依赖：`httpx`（AstrBot 本体已内置）。
 
@@ -2015,8 +2016,9 @@ STRATZ 不吃出口 IP 额度），复盘要的是**有团战数据的那端**�
 > 「数据源：OpenDota 主 + STRATZ 后备」的说明）。
 >
 > 切到 `opendota` 主之后，复盘那几场也落到 OpenDota 额度上（无 Key 时
-> 3000 次/天、按出口 IP 计）。按上面第二行「1,800 次/天」的量级仍有富余，
-> 但**如果一天复盘很多场，建议补一个 OpenDota Key**。
+> 3000 次/天、按出口 IP 计）。按上面第二行「1,800 次/天」的量级仍有富余。
+> 真的一天复盘很多场怎么办：**先靠轮询走 STRATZ 把大头挪走**（已在做），
+> 还不够再考虑 OpenDota 的付费 Key —— 注意它**没有免费 Key**，见下节。
 
 #### 成本参照
 
@@ -2654,7 +2656,7 @@ STRATZ 的 `match` 与 OpenDota 的 `/matches/{id}` 不是「字段多少」的�
 | `data_source_priority` | `opendota` | 数据源优先级。`opendota` = OpenDota 主 / STRATZ 后备（默认）；`stratz` = 对调。**只有 OpenDota 的 `teamfights` 带逐波伤害**——选 `stratz` 时团战清单只剩「谁在哪一刻死了」，`damage` / `ability_uses` / `item_uses` 全部不存在（渲染层已改成「没数据就不写」，不会再出现假的「伤害 0」）。选 `stratz` 时 match 里也没有 `replay_url`，录像相关能力会向 OpenDota 补取（见「录像地址从哪来」） |
 | `stratz_api_key` | 空 | STRATZ API Key。留空则跳过 STRATZ、只用 OpenDota。令牌会绑定出口 IP |
 | `stratz_rate_limit_per_minute` | 240 | 本地限流，保护 STRATZ 配额（官方 Default Token 为 250 次/分） |
-| `opendota_api_key` | 空 | 可选。匿名额度约 60 次/分钟、2000 次/天；填 Key 后可达 1200 次/分钟 |
+| `opendota_api_key` | 空 | 可选，但**没有免费 Key**。匿名额度是 60 次/分钟、3000 次/天，按出口 IP 计、被 429 拒绝的请求同样计数；填 Key（需绑定支付方式，$0.0001/次）后为 3000 次/分钟、无日限 |
 | `steam_api_key` | 空 | **目前不使用，填了也不生效。** 曾经用来直接向 Valve 官方接口要 `cluster` + `replay_salt`，实测该接口对普通对局只回 `result: 1`（不返回 salt，见 issue #24383 / #32617），同一个 Key 对照 Dota2 官方客户端能拿到，说明不是 key 权限问题。录像地址现在一律只从 OpenDota 取，见「录像地址从哪来」 |
 | `http_proxy` | 空 | 国内服务器建议配置，例如 `http://127.0.0.1:7890` |
 | `request_timeout` | 30 | 普通接口超时（秒）；单场详情接口自动用 3 倍 |

@@ -29,7 +29,7 @@
     "type": "string",
     "default": "",
     "secret": true,
-    "hint": "留空则使用匿名额度（约 60 次/分钟、2000 次/天）。填写后可提升到约 1200 次/分钟。可在 https://www.opendota.com/api-keys 免费申请。",
+    "hint": "留空则使用匿名额度（3,000 次/天、60 次/分钟，按出口 IP 计，被 429 拒绝的请求同样计数）。注意 OpenDota 没有免费 Key：要提额度只能绑定支付方式按次计费（$0.0001/次，3,000 次/分钟、无日限），申请地址 https://www.opendota.com/api-keys。日常省额度更划算的做法是把「监听轮询」交给 STRATZ（watch_use_stratz，额度按 token 计），那份开销不吃这里的 IP 额度。",
     "obvious_hint": true
   },
   "steam_api_key": {
