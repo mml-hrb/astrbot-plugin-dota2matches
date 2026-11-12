@@ -2,9 +2,12 @@
   "data_source_priority": {
     "description": "数据源优先级",
     "type": "string",
-    "default": "stratz",
-    "options": ["stratz", "opendota"],
-    "hint": "stratz = STRATZ 为主、OpenDota 为后备（推荐，经济数据一次拿全，没有 20 场上限）；opendota = OpenDota 为主、STRATZ 为后备。主数据源失效（未配置 / 鉴权失败 / 限流 / 网络异常）时会自动切到后备，无需人工干预。",
+    "default": "opendota",
+    "options": [
+      "stratz",
+      "opendota"
+    ],
+    "hint": "opendota = OpenDota 为主、STRATZ 为后备（默认）。它给的是服务端聚合好的团战段，带每人的逐波伤害、经济变化与技能/道具使用记录；STRATZ 的团战是按死亡事件聚出来的，只有「谁在哪一刻死了」，没有任何逐波伤害数据。stratz = STRATZ 为主、OpenDota 为后备，能多出控制次数与时长、带天赋的技能加点、扫描/塔防次数、野区与建筑收益、反眼收益这几块独有明细，但会失去逐波伤害。主数据源失效（未配置 / 鉴权失败 / 限流 / 网络异常）时会自动切到后备，无需人工干预。",
     "obvious_hint": true
   },
   "stratz_api_key": {
@@ -27,6 +30,14 @@
     "default": "",
     "secret": true,
     "hint": "留空则使用匿名额度（约 60 次/分钟、2000 次/天）。填写后可提升到约 1200 次/分钟。可在 https://www.opendota.com/api-keys 免费申请。",
+    "obvious_hint": true
+  },
+  "steam_api_key": {
+    "description": "Steam WebAPI Key（目前不使用，可留空）",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "⚠️ 目前不使用，填了也不会生效。Valve 的单场详情接口 GetMatchDetails 自 2024 年 7.36 起恒返回 HTTP 500 空响应（官方 issue #24383 已标 not planned），国内到 api.steampowered.com 还经常整段不可达 —— 所以 2026-11-11 已把 Steam 这一级从取录像地址的链路里整段删除，录像地址一律只从 OpenDota 取。这个字段和 dota_steam 模块都保留着，等 Valve 修好后能直接接回来。若届时需要填，免费申请地址：https://steamcommunity.com/dev/apikey",
     "obvious_hint": true
   },
   "http_proxy": {
@@ -297,8 +308,8 @@
   "llm_timeout": {
     "description": "专用模型请求超时（秒）",
     "type": "int",
-    "default": 120,
-    "hint": "长报告生成较慢，建议不低于 60 秒。仅对专用 API Key 通道生效。"
+    "default": 300,
+    "hint": "长报告生成很慢，而且**超时不会回退重试**（见「超时也回退」那一项），所以这里给到底：实测两步生成里「写正文」这一步最慢的一次用了 137 秒，旧的 120 秒默认值在换用较慢的供应商后必然踩线。低于 120 基本必炸。仅对专用 API Key 通道生效。"
   },
   "llm_proxy": {
     "description": "专用模型 HTTP 代理",
@@ -310,7 +321,13 @@
     "description": "专用通道失败时回退 AstrBot 模型",
     "type": "bool",
     "default": true,
-    "hint": "开启后，专用 API Key 调用失败（网络/鉴权/限流）会自动改用 AstrBot 的提供商重试一次；关闭则直接报错不做分析。"
+    "hint": "开启后，专用 API Key 调用失败（网络/鉴权/限流/服务端 5xx）会自动改用 AstrBot 的提供商重试一次；关闭则直接报错不做分析。**超时不在回退之列**，见下一项。"
+  },
+  "llm_fallback_on_timeout": {
+    "description": "超时也回退 AstrBot 模型重试",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭。开启「回退」后，专用模型**超时**会改用 AstrBot 的提供商再跑一遍——但换通道并不解决「模型慢」这件事，代价是用户再等一整轮超时（实测线上就是超时 120 秒后回退、回退又超时重试，用户等了十分钟只拿到一句「模型不可用」）。所以默认只对鉴权/限流/连不上这类**换通道确实有救**的失败回退，超时则立刻认输并如实告诉用户「模型 N 秒没返回」。只有在你确认「网络抖动导致偶发超时、宁可多等也要出报告」时才建议打开。"
   },
   "analysis_system_prompt": {
     "description": "分析报告系统提示词",
@@ -374,6 +391,12 @@
     "default": 3,
     "hint": "每个等待中的场次每分钟会产生一次查询请求，并发过高容易触发 OpenDota 限流。超出上限时新的请求会退化为「直接用基础数据出报告」。"
   },
+  "replay_nudge_budget": {
+    "description": "缺录像地址时催解析并等待的秒数",
+    "type": "int",
+    "default": 60,
+    "hint": "OpenDota 未解析的场次不会给出录像地址（replay_url / replay_salt 都是空），而解析不会自己发生，必须有人提交申请。所以拿不到地址时插件会先催一次解析、再在这个时间预算内轮询等待。默认 60 秒：解析通常要排队几分钟到几十分钟，等太久会挤占胜率曲线的时间（那一段总共只有 150 秒）。填 0 表示不催也不等。"
+  },
   "replay_engine_dir": {
     "description": "录像解析引擎目录",
     "type": "string",
@@ -392,11 +415,29 @@
     "default": true,
     "hint": "开启后会按下面的轮询间隔检查被监听玩家是否有新比赛，并在数据就绪后推送分析。"
   },
+  "watch_use_stratz": {
+    "description": "轮询优先用 STRATZ",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后「检查有没有新比赛」走 STRATZ（额度按 token 算，默认 10,000 次/天），不去消耗 OpenDota 的出口 IP 额度（无 key 时 3,000 次/天，且被限流拒绝的请求同样计数）。复盘、战绩等查询仍按「数据源优先级」走。没填 STRATZ Key 时自动回落到主数据源。"
+  },
+  "watch_auto_interval": {
+    "description": "按监听人数自动决定轮询间隔",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后间隔由「监听人数 × 86400 ÷ 每日请求预算」算出：人少时更勤、人多时自动放慢，避免把 OpenDota 每天 3000 次的额度吃干净。一个 bot 被多个群共用、监听了几十个人时尤其需要。关闭后固定用下面的「监听轮询间隔」。"
+  },
+  "watch_daily_budget": {
+    "description": "每天留给监听轮询的请求次数",
+    "type": "int",
+    "default": 1800,
+    "hint": "只在开启自动间隔时生效。OpenDota 无 Key 的额度是 3000 次/天，默认只花 1800（六成），剩下的留给主动查战绩、赛后短评和解析申请（后者按 10 倍计费）。允许调到 2400 封顶。注意：请求数还受 60 次/分钟的限流，而这个配额是按出口 IP 共享的，调高预算并不能解决 429。"
+  },
   "watch_interval": {
     "description": "监听轮询间隔（秒）",
     "type": "int",
     "default": 180,
-    "hint": "拉取被监听玩家比赛列表的间隔，建议不低于 120 秒，以免消耗过多 OpenDota 配额。注意：等待解析的重试有独立的 30 秒节拍，不受此值影响。"
+    "hint": "固定间隔。仅在关闭「按监听人数自动决定轮询间隔」时使用，或当前一位监听者都没有时用于空转。注意：等待解析的重试有独立的 30 秒节拍，不受此值影响。"
   },
   "watch_max_wait_attempts": {
     "description": "等待收录最大尝试次数",
@@ -439,6 +480,18 @@
     "type": "bool",
     "default": true,
     "hint": "遇到静态表和缓存里都没有的条目（例如 Valve 新出的英雄/道具）时，问一次大模型要中文名并写进本地缓存，之后不再联网。关闭后缺的条目保持英文原名，不会发起任何额外请求。"
+  },
+  "hero_kb_enabled": {
+    "description": "复盘时注入英雄判读参考",
+    "type": "bool",
+    "default": true,
+    "hint": "复盘时把「这个英雄在常见对局里怎么打、什么算失职」交给模型（单场复盘与团战复盘都把本局十个人全部注入），用来判断他这一局该做什么。参考只描述常见打法与常见位置，不是限定 —— 提示词明确要求「本局走了非常规位置或流派时按实际打法判」。关闭后模型只凭数据与自己的常识判得失。"
+  },
+  "hero_kb_budget": {
+    "description": "英雄判读参考的字数上限",
+    "type": "int",
+    "default": 16000,
+    "hint": "一次复盘注入十人的总字数上限。实测常见对局约 1.1 万字，画像厚的十人局能到 1.5 万字；超出后部分英雄降级为「常见位置 + 不能做什么 + 克制什么 + 怕什么 + 复盘基准」，再超出则不给参考（注入块里会写明哪些人没给，不会静默丢弃）。模型上下文较小时可调低到 4000；填 0 表示不限制。"
   },
   "watch_auto_unwatch_on_kick": {
     "description": "被踢出群/被拉黑时自动取消该会话的监听",

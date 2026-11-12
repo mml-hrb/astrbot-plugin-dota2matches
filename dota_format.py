@@ -914,11 +914,16 @@ def _describe_objective(objective: dict) -> str:
             side, target = "夜魇", "天辉"
         else:
             side, target = "未知方", "未知方"
-        building = "建筑"
-        for token, name in BUILDING_HINTS:
-            if token in key:
-                building = name
-                break
+        building = str(objective.get("building") or "")
+        if not building:
+            # OpenDota 侧没有 building 字段，只能从 key 里认；STRATZ 侧
+            # （dota_stratz_events.build_objectives）会直接把中文名填进来，
+            # 因为它的 towerDeaths 只有 npcId，没有 ``tower1_mid`` 这种 key。
+            building = "建筑"
+            for token, name in BUILDING_HINTS:
+                if token in key:
+                    building = name
+                    break
         lane = ""
         for token, name in LANE_HINTS:
             if key.endswith(token):
@@ -1177,6 +1182,54 @@ def _map_zone(x: float, y: float) -> str:
     return "地图中部"
 
 
+def _clustered_fight_events(
+    fight: dict, heroes: dict[int, dict], *, limit: int = 8
+) -> list[str]:
+    """STRATZ 事件聚类团战的「逐次阵亡」明细。
+
+    这是 OpenDota 的 ``teamfights`` 完全给不了的：它只有聚合后的伤害与死亡
+    摘要，而 STRATZ 的每条死亡事件都带引擎判定 —— 买活死（``isDieBack``）、
+    被秒（``isBurst``，进战 2 秒内暴毙）、临死想传送（``isAttemptTpOut``）。
+
+    **只留稀有标签**。实测 113 条死亡事件里，``isEngagedOnDeath`` 占 42%、
+    ``isWardWalkThrough`` 出现得更多 —— 这类「团战里被围着打死」本来就是常态，
+    写出来只会把真正稀有的买活死/被秒淹没。``isWardWalkThrough`` 尤其不能
+    翻成「踩眼位」：STRATZ 这个字段的名字是「死亡时途经眼位视野」，
+    照字面写成「踩眼位阵亡」会被读成「他主动送」。
+    """
+    events = fight.get("_events")
+    if not isinstance(events, list):
+        return []
+    rows: list[str] = []
+    shown = 0
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        tags: list[str] = []
+        if event.get("is_die_back"):
+            tags.append("买活死")
+        if event.get("is_burst"):
+            tags.append("被秒")
+        if event.get("is_tp_attempt"):
+            tags.append("临死想TP")
+        killer_id = _as_int(event.get("killer_hero"))
+        victim_id = _as_int(event.get("victim_hero"))
+        if not tags:
+            # 没有稀有标签的阵亡不占篇幅：团战一段里「谁死了」上面那行
+            # 「阵亡: 天辉 xxx」已经写全了。
+            continue
+        victim = hname(heroes, victim_id) if victim_id else "未知单位"
+        killer = hname(heroes, killer_id) if killer_id else ""
+        text = f"{fmt_clock(event.get('time'))} "
+        text += f"{killer} 击杀 {victim}" if killer else f"{victim} 阵亡"
+        text += f"（{'、'.join(tags)}）"
+        rows.append(text)
+        shown += 1
+        if shown >= limit:
+            break
+    return rows
+
+
 def _fight_actions(
     fight: dict,
     ordered_players: list[dict],
@@ -1355,6 +1408,11 @@ def summarize_teamfights(
             continue
         if index > limit:
             break
+        # STRATZ 侧没有服务端聚合的团战段，这里的 ``teamfights`` 是由逐次死亡
+        # 事件聚类出来的（见 ``dota_stratz_events.build_teamfights``）。
+        # 它的 ``gold_delta`` 是「本段阵亡掉的钱」（负值），与 OpenDota 的
+        # 「团战期间净赚」方向相反 —— 所以这一类只报伤亡，绝不写经济差。
+        clustered = bool(fight.get("_clustered"))
         start = fmt_clock(fight.get("start"))
         end = fmt_clock(fight.get("end"))
         raw_start = _as_int(fight.get("start"))
@@ -1419,17 +1477,18 @@ def summarize_teamfights(
                         bits.append("击杀 " + "、".join(killed_names))
                 if entry_deaths:
                     bits.append(f"阵亡 {entry_deaths} 次")
-                damage = entry.get("damage")
-                if damage:
-                    bits.append(f"打出 {fmt_num(damage)} 伤害")
-                healing = entry.get("healing")
-                if healing:
-                    bits.append(f"治疗 {fmt_num(healing)}")
-                bits.append(f"经济 {delta:+d}")
-                try:
-                    bits.append(f"经验 {int(entry.get('xp_delta') or 0):+d}")
-                except (TypeError, ValueError):
-                    pass
+                if not clustered:
+                    damage = entry.get("damage")
+                    if damage:
+                        bits.append(f"打出 {fmt_num(damage)} 伤害")
+                    healing = entry.get("healing")
+                    if healing:
+                        bits.append(f"治疗 {fmt_num(healing)}")
+                    bits.append(f"经济 {delta:+d}")
+                    try:
+                        bits.append(f"经验 {int(entry.get('xp_delta') or 0):+d}")
+                    except (TypeError, ValueError):
+                        pass
                 if entry.get("buybacks"):
                     bits.append("交了买活")
                 focus_notes.append("　".join(bits))
@@ -1437,7 +1496,11 @@ def summarize_teamfights(
         rows.append(
             f"#{index} {start}-{end} 阵亡 {deaths} 人"
             f"（天辉 {radiant_deaths} / 夜魇 {dire_deaths}）· "
-            f"天辉合计经济 {radiant_gold:+d} / 夜魇 {dire_gold:+d}"
+            + (
+                "由逐次击杀/死亡事件聚类"
+                if clustered
+                else f"天辉合计经济 {radiant_gold:+d} / 夜魇 {dire_gold:+d}"
+            )
         )
         center = _fight_center(fight)
         if center:
@@ -1454,6 +1517,10 @@ def summarize_teamfights(
             rows.append("   阵亡: " + "；".join(dead_bits))
         for note in focus_notes:
             rows.append(f"   焦点贡献: {note}")
+        if clustered:
+            detail = _clustered_fight_events(fight, heroes)
+            if detail:
+                rows.append("   逐次阵亡: " + "；".join(detail))
         actions = _fight_actions(fight, ordered_players, heroes, focus_set)
         if actions:
             rows.append("   关键动作: " + "；".join(actions))
@@ -2108,16 +2175,39 @@ def summarize_neutral_items(player: dict, item_index: ItemIndex) -> str:
 
 
 def summarize_ability_build(
-    player: dict, ability_names: dict[int, str] | None, limit: int = 20
+    player: dict,
+    ability_names: dict[int, str] | None,
+    limit: int = 20,
+    displays: dict[int, str] | None = None,
 ) -> str:
     """``ability_upgrades_arr`` → 加点顺序。
 
     数组里存的是技能**数字 ID**，没有常量表就完全不可读（``5439`` 是什么
     谁也猜不出来），因此拿不到名字映射时**宁可不输出**，也不喂一串数字。
+
+    天赋单独走显示名：内部名 ``special_bonus_unique_furion_6`` 经
+    :func:`ability_label` 也只是把下划线换成空格，读起来等于没翻译；它的
+    显示名才是 ``-10s Nature's Call Cooldown``。显示名不单独传参 ——
+    STRATZ 链路已经把它落在 ``player["ability_build"]`` 里，直接从那儿取，
+    免得给整条调用链再加一个参数。
     """
     upgrades = player.get("ability_upgrades_arr")
     if not isinstance(upgrades, list) or not upgrades or not ability_names:
         return ""
+    talent_display: dict[int, str] = dict(displays or {})
+    # 每条加点的「当时英雄等级」，**按位置**对应 ``ability_upgrades_arr``
+    # （两者是同一次构建出来的，顺序一致）。不能按技能 ID 建表 —— 同一个技能
+    # 会被学 4 次，按 ID 查只会拿到第一次的等级，后面全错。
+    #
+    # OpenDota 没有 ``ability_build``，那边按数组下标当地级即可（它的数组
+    # 本来就是每级一格）；STRATZ 侧存在「攒着天赋点晚点选」的情况
+    # （实测龙骑 10 级天赋记在 11 级），用下标会把后面所有条目都写低一级。
+    build_rows = [r for r in (player.get("ability_build") or []) if isinstance(r, dict)]
+    for row in build_rows:
+        ability_id = row.get("ability_id")
+        display = row.get("display")
+        if isinstance(ability_id, int) and isinstance(display, str) and display:
+            talent_display.setdefault(ability_id, display)
     ordinals = [
         "1级", "2级", "3级", "4级", "5级", "6级", "7级", "8级", "9级", "10级",
         "11级", "12级", "13级", "14级", "15级", "16级", "17级", "18级",
@@ -2126,11 +2216,20 @@ def summarize_ability_build(
     parts: list[str] = []
     for index, ability_id in enumerate(upgrades[:limit]):
         try:
-            name = ability_names.get(int(ability_id))
+            key = int(ability_id)
         except (TypeError, ValueError):
-            name = None
+            continue
+        name = ability_names.get(key)
         label = ability_label(name) if name else f"技能#{ability_id}"
+        if isinstance(name, str) and name.startswith("special_bonus"):
+            display = talent_display.get(key)
+            if display:
+                label = display
         level_text = ordinals[index] if index < len(ordinals) else f"第{index + 1}次"
+        if index < len(build_rows):
+            hero_level = build_rows[index].get("hero_level")
+            if isinstance(hero_level, int):
+                level_text = f"{hero_level}级"
         parts.append(f"{level_text} {label}")
     return " → ".join(parts)
 
@@ -2143,6 +2242,159 @@ def summarize_ability_uses(player: dict, limit: int = 6) -> str:
 def summarize_item_uses(player: dict, limit: int = 6) -> str:
     """``item_uses`` → 用得最多的主动道具（跳刀/魔棒/雾…看行动力）。"""
     return _breakdown_text(player.get("item_uses"), limit, labeler=ability_label)
+
+
+# ----------------------------------------------------------------------
+# STRATZ 独有指标（OpenDota 没有这些字段）
+# ----------------------------------------------------------------------
+# 下面这几个函数读的键**只有 STRATZ 链路会产生**（见 dota_stratz_rich）。
+# OpenDota 的解析产物里没有它们，所以这里必须逐项判空 —— 拿不到就整行不输出，
+# 绝不能渲染出一排「-」，那会让模型以为「他确实没做这些」。
+def summarize_talent_picks(player: dict) -> str:
+    """天赋选择（10/15/20/25 级）。
+
+    OpenDota 的 ``ability_upgrades_arr`` 里天赋和普通技能长得一样，只能看到
+    「某个 ID 在 10 级被学了」；STRATZ 的 ``abilityLearnEvents`` 直接带
+    ``isTalent`` 与技能名，于是「10 级选了哪个天赋」第一次变得可读。
+    """
+    rows = player.get("talent_picks")
+    if not isinstance(rows, list) or not rows:
+        return ""
+    parts: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        # 天赋优先用显示名：内部名 ``special_bonus_unique_furion_6`` 经
+        # ability_label 也只是把下划线换成空格，等于没翻译。
+        display = row.get("display")
+        name = row.get("name")
+        if isinstance(display, str) and display:
+            label = display
+        elif isinstance(name, str) and name:
+            label = ability_label(name)
+        else:
+            continue
+        level = row.get("hero_level")
+        parts.append(f"{level}级 {label}" if isinstance(level, int) else label)
+    return " → ".join(parts)
+
+
+def control_breakdown(player: dict) -> str:
+    """控制与减速，分「打出」与「承受」两侧。
+
+    OpenDota 只有一个 ``stuns``（被打出去的控制总秒数），分不清是谁控谁、
+    也分不出减速。STRATZ 的 ``heroDamageReport`` 两侧都给，且眩晕/缠绕/减速
+    三类分开 —— 判断「这局谁控住了团战」终于有据可依。
+    """
+    bits: list[str] = []
+    for title, key in (("打出", "control_dealt"), ("承受", "control_taken")):
+        node = player.get(key)
+        if not isinstance(node, dict):
+            continue
+        parts: list[str] = []
+        for field, label in (
+            ("stun", "眩晕"),
+            ("disable", "缠绕/束缚"),
+            ("slow", "减速"),
+        ):
+            item = node.get(field)
+            if not isinstance(item, dict):
+                continue
+            count = item.get("count")
+            seconds = item.get("seconds")
+            if not count and not seconds:
+                continue
+            seg = label
+            if count:
+                seg += f" {count} 次"
+            if seconds:
+                seg += f"/{float(seconds):.0f} 秒"
+            parts.append(seg)
+        if parts:
+            bits.append(f"{title} " + "、".join(parts))
+    return "控制: " + "；".join(bits) if bits else ""
+
+
+def summarize_ability_casts(player: dict, limit: int = 5) -> str:
+    """技能施放次数，以及其中「对英雄成交」了多少次。
+
+    和「技能使用次数」的区别：那个是总数，这个带了分母，能看出一个技能是被
+    拿去清线还是拿去打架。注意 ``对英雄 X 次`` **不等于命中率** ——
+    范围技能一次施放可能打到多个人，成交次数会大于施放次数。
+    """
+    rows = player.get("ability_casts")
+    if not isinstance(rows, list) or not rows:
+        return ""
+    parts: list[str] = []
+    for row in rows[:limit]:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("name")
+        count = row.get("count")
+        if not name or not count:
+            continue
+        label = ability_label(name)
+        hit = row.get("target_casts") or 0
+        parts.append(f"{label} {count} 次" + (f"（对英雄 {hit} 次）" if hit else ""))
+    return "、".join(parts)
+
+
+def farm_sources_text(player: dict) -> str:
+    """打野 / 远古 / 建筑收益（STRATZ 独有）。
+
+    只给这三项，且**不给占比** —— 三项之和不是总收入（击杀、赏金符、
+    被动收入都不在 ``farmDistributionReport`` 里），算出来的百分比会虚高。
+    线上兵那块刻意没做，理由见 :func:`dota_stratz_rich.build_farm_report`。
+    """
+    rows = player.get("farm_sources")
+    if not isinstance(rows, dict) or not rows:
+        return ""
+    ordered = sorted(rows.items(), key=lambda kv: -float(kv[1] or 0))
+    return "、".join(
+        f"{name} {int(value):,}" for name, value in ordered if value
+    )
+
+
+def action_report_text(player: dict) -> str:
+    """扫描 / 塔防 / 标记次数。
+
+    这是「谁在指挥」的直接证据：扫描 0 次的辅助和扫描 5 次的中单，
+    复盘时该说的话完全不同。OpenDota 一个都拿不到。
+    """
+    rows = player.get("actions")
+    if not isinstance(rows, dict) or not rows:
+        return ""
+    labels = (("scan", "扫描"), ("glyph", "塔防"), ("ping", "标记"))
+    return "、".join(
+        f"{label} {rows[key]} 次" for key, label in labels if rows.get(key)
+    )
+
+
+def stratz_profile_text(player: dict) -> str:
+    """IMP / 称号 / 拉野 / 回泉 / 反眼 —— OpenDota 全都没有。
+
+    ``IMP`` 是 STRATZ 自己的「相对同位平均的表现分」，可正可负（实测
+    ``-17`` / ``+3``），**不是 0~100 的评分**。这里照原值带符号输出，
+    并在提示词里点明这个口径，避免模型把 ``-17`` 读成「评分很低」。
+    """
+    parts: list[str] = []
+    imp = player.get("imp")
+    if isinstance(imp, int):
+        parts.append(f"IMP {imp:+d}")
+    award = player.get("award")
+    if isinstance(award, str) and award:
+        parts.append(f"本场称号 {award}")
+    stacks = player.get("camp_stacks")
+    if stacks:
+        parts.append(f"拉野 {stacks} 次")
+    fountain = player.get("fountain_trips")
+    if fountain:
+        parts.append(f"回泉 {fountain} 次")
+    ward_kills = player.get("ward_kills")
+    if isinstance(ward_kills, list) and ward_kills:
+        gold = player.get("ward_kill_gold") or 0
+        parts.append(f"反眼 {len(ward_kills)} 个（{int(gold):,} 金币）")
+    return "、".join(parts)
 
 
 def player_advanced_line(
@@ -2702,7 +2954,24 @@ def build_match_data_text(
     )
     if fights:
         lines.append("")
-        lines.append(f"=== 团战（共 {len(match.get('teamfights') or [])} 次，列出前 12 次）===")
+        all_fights = match.get("teamfights") or []
+        clustered = any(
+            isinstance(item, dict) and item.get("_clustered") for item in all_fights
+        )
+        if clustered:
+            lines.append(
+                f"=== 团战（由逐次击杀/死亡事件聚类，共 {len(all_fights)} 段，列出前 12 段）==="
+            )
+            lines.append(
+                "口径: 同一时间窗（相邻阵亡 ≤12 秒、阵亡点相距 ≤30 格、整段 ≤45 秒）内"
+                "至少 3 人阵亡，或双方各 1 人在 5 秒内互换。段内**没有**服务端聚合的"
+                "伤害与净经济差，只有伤亡、阵亡点位与稀有死法（买活死/被秒/临死想TP）。"
+                "不要把「阵亡人数」当成「输赢」：以少换多也可能是赢的。"
+            )
+        else:
+            lines.append(
+                f"=== 团战（共 {len(all_fights)} 次，列出前 12 次）==="
+            )
         lines.extend(fights)
 
     # 十人数据
@@ -2825,13 +3094,34 @@ def build_match_data_text(
                 "　" + row for row in summarize_player_curve(player)
             )
 
-    # 未解析时补充提示（与标题行走同一套判据，不会自相矛盾）
+    # 解析不完整时逐项说明缺什么（与标题行走同一套判据，不会自相矛盾）
+    gaps = parsed_gaps(match)
     if not _parsed:
         lines.append("")
-        lines.append(
-            "注意: 本场尚未被解析，缺少逐分钟经济、团战分布与出装日志，"
-            "请避免对「具体时间点的决策」下结论。"
-        )
+        if gaps:
+            lines.append(
+                "注意: 本场解析不完整，缺少"
+                + "、".join(gaps)
+                + "。这几块请直接写「数据未提供」，不要用推测代替；"
+                "上面已经给出的数据可以照常分析。"
+            )
+        else:
+            lines.append(
+                "注意: 本场尚未被解析，请避免对「具体时间点的决策」下结论。"
+            )
+    elif match.get("_stratz"):
+        # STRATZ 链路现在能给出加点（含天赋）、伤害类型分解与控制数据，
+        # 但仍然**没有**逐技能命中率、塔的路名与等级、对局内聊天文本。
+        # 这段护栏按「实际缺了什么」来写：写死「缺技能加点」会主动劝退模型，
+        # 让它对已经摆在提示词里的加点数据避而不谈。
+        missing = [gap for gap in gaps if gap in ("技能加点", "逐分钟经济曲线")]
+        if missing:
+            lines.append("")
+            lines.append(
+                "注意: 本场数据来自 STRATZ 事件流，缺少"
+                + "、".join(missing)
+                + "，这方面不要展开；团战、拆塔、出装与视野有真实数据，可正常分析。"
+            )
 
     return "\n".join(lines)
 
@@ -2948,40 +3238,107 @@ def _has_timeseries(players: list[dict]) -> bool:
     return False
 
 
+def parsed_gaps(match: dict) -> list[str]:
+    """列出本场**缺**的解析产物（人话），供提示词护栏逐项说明。
+
+    和 :func:`parsed_state` 配套：那个回答「算不算已解析」，这个回答
+    「缺了哪几块」。拆开是因为「缺哪块说哪块」比一句笼统的
+    「尚未被解析」有用得多 —— 只缺技能加点的比赛，不应该让模型连
+    团战也不敢分析。
+    """
+    if not isinstance(match, dict):
+        return ["全部解析产物"]
+    players = [p for p in (match.get("players") or []) if isinstance(p, dict)]
+    gaps: list[str] = []
+    if not any(p.get("gold_t") for p in players):
+        gaps.append("逐分钟经济曲线")
+    if not match.get("teamfights"):
+        gaps.append("团战分布")
+    if not any(p.get("purchase_log") for p in players):
+        gaps.append("出装日志")
+    if not any(p.get("obs_log") or p.get("sen_log") for p in players):
+        gaps.append("视野记录")
+    if not any(p.get("ability_upgrades_arr") for p in players):
+        gaps.append("技能加点")
+    if not match.get("objectives"):
+        gaps.append("关键事件时间轴")
+    return gaps
+
+
 def parsed_state(match: dict) -> tuple[bool, str]:
     """统一的「解析状态」判定，返回 ``(是否已解析, 人类可读说明)``。
 
     这是**唯一**的解析口径，标题行与提示词正文都必须用它，否则同一条信息
-    在两处会打架。判定顺序：
+    在两处会打架。判定顺序（2026-11-11 拆档）：
 
-    1. 有逐分钟曲线（OpenDota ``gold_t`` 或 STRATZ 的经济/经验曲线）→ 已解析；
-    2. 否则看 ``od_data.has_parsed``（OpenDota 的解析状态对象）；
-    3. 都没有 → 未解析（仅基础统计）。
+    1. **OpenDota 完整解析**：玩家级 ``gold_t`` 存在 → 已解析；
+    2. **STRATZ 事件级解析**：``_stratz`` 且拿到了团战 / 关键事件 / 逐分钟曲线
+       中的任意一项 → 已解析，但**必须在文案里写清缺什么**（STRATZ 没有
+       技能加点与伤害分解）；
+    3. **只有曲线**：有团队或玩家曲线，但团战、出装、视野一样都没有
+       → **部分解析**，返回 False（护栏会列出缺的项）；
+    4. **只剩声明**：``od_data.has_parsed`` 为真却什么都没取到 → 部分解析；
+    5. 其余 → 未解析。
+
+    第 2 档的文案以前写的是「已解析（含逐分钟曲线）」，于是 STRATZ 只给
+    一条团队经济曲线时也报「已解析」，提示词里的护栏被整段跳过，模型
+    照样编团战与出装 —— 这正是用户 2026-11-11 反馈的那个假象。
     """
     if not isinstance(match, dict):
         return False, "未知（无数据）"
-    if _match_has_timeseries(match):
-        # 区分一下来源，方便排查时看出走的是哪条通道
+
+    players = [p for p in (match.get("players") or []) if isinstance(p, dict)]
+    has_player_curve = any(p.get("gold_t") for p in players)
+    has_teamfights = bool(match.get("teamfights"))
+    has_objectives = bool(match.get("objectives"))
+    is_stratz = bool(match.get("_stratz"))
+
+    # STRATZ 必须先判：它现在**也**有玩家级 gold_t（由事件流还原），
+    # 若按「有 gold_t = OpenDota 完整解析」的旧顺序，会一直落到第一档，
+    # 文案写成「含逐分钟曲线」而掩盖「没有技能加点/伤害分解」的事实。
+    if is_stratz:
+        if has_teamfights or has_objectives:
+            bits = []
+            if has_teamfights:
+                bits.append(f"{len(match.get('teamfights') or [])} 段团战")
+            if has_objectives:
+                bits.append(f"{len(match.get('objectives') or [])} 条关键事件")
+            detail = "、".join(bits) or "基础统计"
+            # STRATZ 在 2026-11-11 之后补齐了技能加点（含天赋）与伤害/控制分解，
+            # 所以这句后缀必须按**实际拿到什么**来写，不能写死。写死「无技能加点」
+            # 会主动劝退模型，让它对已经有的数据避而不谈。
+            extra: list[str] = []
+            if any(p.get("ability_upgrades_arr") for p in players):
+                extra.append("加点含天赋")
+            if any(p.get("damage_inflictor") for p in players):
+                extra.append("伤害与控制分解")
+            if extra:
+                suffix = "；另有" + "、".join(extra)
+            else:
+                suffix = "；缺少技能加点与伤害分解"
+            return True, f"已解析（STRATZ 事件流：{detail}{suffix}）"
+        if has_player_curve or _match_has_timeseries(match):
+            return False, "部分解析（只有逐分钟曲线，缺团战/出装/视野）"
+        return False, "未解析（仅基础统计）"
+
+    if has_player_curve:
         dates = []
         for key in ("radiant_gold_adv", "radiant_xp_adv"):
             series = match.get(key)
             if isinstance(series, list) and series:
                 dates.append(f"{len(series)} 分钟")
-        has_gold_t = any(
-            isinstance(p, dict) and p.get("gold_t")
-            for p in (match.get("players") or [])
-        )
         detail = "含逐分钟经济/经验曲线"
         if dates:
             detail += f"（{dates[0]}）"
-        elif has_gold_t:
-            detail += "（玩家 gold_t）"
         return True, f"已解析（{detail}）"
+
+    if _match_has_timeseries(match):
+        return False, "部分解析（只有逐分钟曲线，缺团战/出装/视野）"
 
     od_data = match.get("od_data")
     if isinstance(od_data, dict) and od_data.get("has_parsed") is True:
-        # 声明已解析，却没有拿到任何逐分钟曲线 —— 说明解析产物不完整。
-        return True, "已解析（未取到逐分钟曲线，团战/出装日志可能缺失）"
+        # 声明已解析，却没有拿到任何解析产物 —— 数据源在骗人，照实写。
+        return False, "部分解析（数据源声明已解析，但未取到任何解析产物）"
 
     return False, "未解析（仅基础统计）"
 
@@ -3202,9 +3559,12 @@ def _focus_detail_lines(
     build = summarize_ability_build(focus, ability_names)
     if build:
         lines.append("技能加点顺序: " + build)
-    ability_uses = summarize_ability_uses(focus, 8)
-    if ability_uses:
-        lines.append("技能使用次数: " + ability_uses)
+    # 「技能使用次数」与「技能施放明细」信息重叠：后者带「对英雄成交次数」，
+    # 是前者的超集。有明细就不再重复一遍总数。
+    if not focus.get("ability_casts"):
+        ability_uses = summarize_ability_uses(focus, 8)
+        if ability_uses:
+            lines.append("技能使用次数: " + ability_uses)
     ability_targets = focus.get("ability_targets")
     if isinstance(ability_targets, dict) and ability_targets:
         bits = []
@@ -3226,6 +3586,34 @@ def _focus_detail_lines(
     hero_hits = _breakdown_text(focus.get("hero_hits"), 6, labeler=ability_label)
     if hero_hits:
         lines.append("技能命中英雄次数（按技能）: " + hero_hits)
+
+    # ---- STRATZ 独有数据（OpenDota 给不了这些字段）------------------
+    # 整段逐项判空：OpenDota 链路上这些键根本不存在，硬写会渲染出一排
+    # 「-」，反而让模型以为「他确实没做这些」。
+    damage_type = _breakdown_text(focus.get("damage_by_type"), 4)
+    if damage_type:
+        lines.append("输出类型构成: " + damage_type)
+    taken_type = _breakdown_text(focus.get("damage_taken_by_type"), 4)
+    if taken_type:
+        lines.append("承伤类型构成: " + taken_type)
+    control = control_breakdown(focus)
+    if control:
+        lines.append(control)
+    talents = summarize_talent_picks(focus)
+    if talents:
+        lines.append("天赋选择: " + talents)
+    casts = summarize_ability_casts(focus)
+    if casts:
+        lines.append("技能施放明细: " + casts)
+    farm_sources = farm_sources_text(focus)
+    if farm_sources:
+        lines.append("野区与建筑收益: " + farm_sources)
+    actions = action_report_text(focus)
+    if actions:
+        lines.append("地图动作: " + actions)
+    profile = stratz_profile_text(focus)
+    if profile:
+        lines.append("表现指标: " + profile)
 
     # ---- 装备 -----------------------------------------------------
     neutral_items = summarize_neutral_items(focus, item_index)

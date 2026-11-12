@@ -473,6 +473,22 @@ def score_fights(
         gold_rad = sum(_int(p, "gold_delta") for p in entries[:5])
         gold_dire = sum(_int(p, "gold_delta") for p in entries[5:])
         engaged = sum(1 for p in entries if _int(p, "damage") > 0)
+        # 这波**到底有没有逐人伤害数据** —— 用来分辨「伤害是 0」和「没有伤害字段」。
+        #
+        # ⚠️ 这两个意思完全不同，混起来会同时污染提示词和给用户看的清单：
+        #   * OpenDota：``teamfights`` 是服务端聚合的，每条 entry **都带**
+        #     ``damage`` 键（没出手就是 0）。这里的 0 是观测值。
+        #   * STRATZ：``teamfights`` 是按死亡事件聚出来的（见
+        #     ``dota_stratz_events.build_teamfights``），entry 从 ``{}`` 起步，
+        #     只填 ``deaths`` / ``gold_delta`` / ``xp_delta`` / ``killed``，
+        #     **从来没有 ``damage`` 键**。这里的 0 是「没这个字段」。
+        #
+        # 判据只能看「键在不在」，不能看值大不大 —— 前者问的是数据源有没有给，
+        # 后者问的是他打没打，是两件事（实测 2026-11-11：主数据源是 STRATZ，
+        # 于是每一波都渲染成「伤害 0（占全队 0%）」）。
+        has_damage = any(
+            "damage" in p for p in entries if isinstance(p, dict)
+        )
 
         impact = curve.impact_at(index) if curve is not None else None
         if impact is not None:
@@ -512,6 +528,10 @@ def score_fights(
                 "hero_id": owner.get("hero_id"),
                 "damage": damage,
                 "share": round(damage / team_damage * 100.0, 1) if team_damage else 0.0,
+                # 渲染层据此决定写不写「伤害 x（占全队 y%）」。没有这个字段时
+                # 写出来的 0 会被读成「他去了但一点输出没打」，而事实是数据源
+                # 压根没提供逐人伤害。
+                "has_damage": has_damage,
                 "deaths": _int(entry, "deaths"),
                 # killed 是 {npc 名: 次数} 的聚合字典，次数要累加不能只数 key：
                 # 同一波里重复击杀同一个英雄（买活再死）时只数 key 会少算。
@@ -523,10 +543,19 @@ def score_fights(
                 # 但一点输出没打」，其实是「他不在场」（2026-11-10 实测第 15 波）。
                 # 判据只要「有动作」：伤害 / 施法 / 用物 / 阵亡，任一即可。
                 # 不能用``healing``：被动回血、范围光环都会漏一点，实测有 6 点。
-                "engaged": bool(damage
-                                or (entry.get("ability_uses") or {})
-                                or (entry.get("item_uses") or {})
-                                or _int(entry, "deaths")),
+                #
+                # ⚠️ 没有逐人伤害数据时（STRATZ）**不能**用 ``has_damage`` 兜底
+                # 判「没到场」：那会把十个人全判成没到场（伤害键都没有 ⇒ 0）。
+                # 这一类只有 ``deaths`` 是真有证据的，就只用它 —— 「这波他死了」
+                # 至少能证明他在场，没死则**不作判断**（返回 None，渲染层不写状态）。
+                "engaged": True if not has_damage else bool(
+                    damage
+                    or (entry.get("ability_uses") or {})
+                    or (entry.get("item_uses") or {})
+                    or _int(entry, "deaths")
+                ),
+                # 没有伤害数据时，「他死没死」是唯一能确定的事；死了必在场。
+                "died": _int(entry, "deaths") > 0,
             })
 
         out.append({
@@ -536,6 +565,9 @@ def score_fights(
             "duration": duration,
             "deaths": deaths,
             "engaged": engaged,
+            #: 这波有没有逐人伤害数据（OpenDota 有 / STRATZ 聚类没有）。
+            #: 渲染层与 :func:`_fight_tag` 都靠它决定「能写什么、不能写什么」。
+            "has_damage": has_damage,
             "gold_delta": gold_rad - gold_dire,
             "score": round(score, 1),
             # ``focus`` 保留「第一位焦点玩家」以兼容既有调用方与测试，
@@ -572,6 +604,11 @@ def pick_candidates(cands: list[dict], top_n: int = DEFAULT_TOP_N) -> list[dict]
         # 多焦点时逐个判：任意一位「没死 + 伤害占比 ≥25%」都算高光，
         # 取占比最高的那一波。只看 ``focus``（第一位）会漏掉另一位的高光。
         for note in c.get("focus_all") or ([c["focus"]] if c.get("focus") else []):
+            # ⚠️ 没有逐人伤害数据时 ``share`` 恒为 0（不是「他打得差」，
+            # 而是「这个数据源不给逐波伤害」）。此时**判不出高光**，
+            # 就不标 —— 宁可少一个标签，也不能凭 0 占比去挑一波夸。
+            if not note.get("has_damage", True):
+                continue
             if note["deaths"] == 0 and note["share"] >= 25.0:
                 if best is None or note["share"] > best[1]:
                     best = (c, note["share"])
@@ -618,7 +655,12 @@ def _fight_tag(cand: dict, all_cands: list[dict]) -> str:
     elif deaths >= 6:
         tags.append("大规模团战")
     delta = cand["gold_delta"]
-    if abs(delta) >= 5000:
+    # ⚠️ 只有**这个数据源的经济差可信**时才敢写「哪边经济 +多少」。
+    # OpenDota 的 ``gold_delta`` 是「团战期间净赚」；STRATZ 聚类团战的
+    # ``gold_delta`` 是「这段里这些人阵亡掉了多少钱」（负值），方向正好相反 ——
+    # 照原样渲染会把「这波团这边死了三个人」写成「这边经济 +5000」，
+    # 是句反话。判据用「这波有没有逐人伤害数据」代指数据源，与渲染层同一口径。
+    if abs(delta) >= 5000 and cand.get("has_damage", True):
         # 必须写清是哪边拉开的。原来只写「经济差拉开 6164」，读者无从判断
         # 这波是谁赚了 —— 顺风局里这句话可能是夸夜魇的（delta 是
         # 「天辉 − 夜魇」的净额，正数才是天辉赚）。
@@ -718,6 +760,25 @@ def render_candidates(
                 hero = hero_name(note.get("hero_id"))
             else:
                 hero = "本命"
+            # ---- 没有逐人伤害数据时：只说「能确定的事」----
+            #
+            # ⚠️ 绝不能写「伤害 0（占全队 0%）」。那是把「数据源没给这个字段」
+            # 渲染成了「他打了，但一点输出没有」—— 同一个 0，两种事实，
+            # 模型和用户都会当真（实测 2026-11-11：主数据源 STRATZ 时每一波
+            # 都长这样，用户直接问「为什么都显示伤害 0」）。
+            #
+            # 这一类（STRATZ 事件聚类）本来就只有 ``deaths`` / ``killed``
+            # 是**真有证据**的，见 dota_stratz_events 模块头的三条铁律：
+            # 「缺失返回空，不返回 0」。这里照着那条铁律办。
+            if not note.get("has_damage", True):
+                bits = []
+                if note.get("kills"):
+                    bits.append("击杀 %d" % note["kills"])
+                if note.get("died"):
+                    bits.append("阵亡")
+                text = "、".join(bits) if bits else "本波无逐人数据"
+                lines.append("  - %s · %s：%s" % (label, hero, text))
+                continue
             # 没到场的人不要写成「伤害 0、存活」—— 那是「去了没打」的意思。
             # 「没给 / 真是 0 / 没做」是三件事，这里属于「没做」。
             if not note.get("engaged", True):
@@ -763,6 +824,15 @@ def _fight_cast(
     一行一队，只给「伤害占全队比例 / 是否阵亡 / 是否买活」，
     因为判「他在这一波是什么角色」只需要这三样：
     输出位伤害是 0，和坦克伤害是 0，完全是两件事。
+
+    ⚠️ **没有逐人伤害数据时，一个百分比都不许写。** 这一段是直接拼进
+    **提示词**的，写出来的每个数字模型都会当证据用。原来对 STRATZ
+    （按死亡事件聚类的团战，entry 里没有 ``damage`` 键）会渲染成
+    「天辉：敌法师 0% ｜ 某某 0% ｜ …」，模型读到的就是
+    「十个人全程零输出」—— 于是一边把真实失职判成团队问题，
+    一边又凭空给所有人扣一条「这波没打出伤害」。这不是少给信息，
+    是给了错的信息。所以这里退回「只报伤亡」，与
+    :func:`dota_format._render_fight_lines` 的 ``_clustered`` 分支同一口径。
     """
     fights = match.get("teamfights") or []
     if not (1 <= impact.index <= len(fights)):
@@ -772,6 +842,8 @@ def _fight_cast(
         [p for p in (match.get("players") or []) if isinstance(p, dict)],
         key=lambda p: int(p.get("player_slot") or 0),
     )
+    # 判据只能看「键在不在」，不能看值大不大 —— 见 score_fights 里的同款说明。
+    has_damage = any("damage" in p for p in entries if isinstance(p, dict))
 
     out: list[str] = []
     for label, rng in (("天辉", range(0, 5)), ("夜魇", range(5, 10))):
@@ -803,9 +875,18 @@ def _fight_cast(
                 tail += " 死"
             if buybacks:
                 tail += " 买活"
-            bits.append("%s %.0f%%%s" % (name, share, tail))
+            if has_damage:
+                bits.append("%s %.0f%%%s" % (name, share, tail))
+            else:
+                # 没有伤害数据：只报确定的事。没死也没买活的人不占位，
+                # 否则会变成「XXX  ｜ YYY  ｜ ZZZ」一串空壳。
+                if tail:
+                    bits.append(name + tail)
         if bits:
             out.append("    %s：%s" % (label, " ｜ ".join(bits)))
+        elif not has_damage:
+            # 整队都没有可报的动作：如实写一句，别让模型以为「这一段忘了写」。
+            out.append("    %s：这波无逐人伤亡记录" % label)
     return out
 
 
@@ -1123,7 +1204,11 @@ def render_responsibility_block(
     lines.append(
         "权重口径：|胜率变化| × 距 50% 的接近程度。同样十几个点，"
         "在五五开附近是翻盘，在九成以上只是垃圾时间 —— "
-        "**判「最差」必须有至少一个【决定性】窗口作证**；只有【影响有限】的窗口"
+        "**判「最差」有两条通路**：① 有至少一个【决定性】窗口作证；"
+        "② 判出「贯穿型失职」（一个位置从头到尾没干过自己岗位该干的事，"
+        "比如一号位整局没有输出端、辅助整局没有视野）—— 这类失败**本来就不会**"
+        "落在任何单一窗口上，所以「找不到那个决定性窗口」**不等于**他没责任。"
+        "只有【影响有限】的窗口"
         "最多算过程瑕疵；【基本无关】的窗口一个字都不许用来说谁打得差。"
     )
 

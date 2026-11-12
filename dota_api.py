@@ -3,7 +3,8 @@
 设计要点：
 - 全异步（httpx.AsyncClient），不阻塞事件循环。
 - 内置令牌桶式限流，保护 OpenDota 免费配额。
-- 网络抖动 / 429 / 5xx 自动重试，带指数退避。
+- 网络抖动 / 5xx 自动重试，带指数退避；**429 不重试**，直接进冷却期
+  （被拒的请求同样扣额度，重试只会把日额度挖得更深）。
 - 英雄常量等低频数据本地缓存，避免重复请求。
 """
 
@@ -26,6 +27,27 @@ STEAM_ID_64_BASE = 76561197960265728
 
 #: OpenDota API 根地址
 BASE_URL = "https://api.opendota.com/api"
+
+#: 撞上 429 之后的最短冷却（秒）。
+#:
+#: 分钟窗口打满的情况，等一个窗口就自动恢复；日额度耗尽的情况则要用下面那个。
+RATE_LIMIT_COOLDOWN_MINUTE = 60.0
+
+#: **日额度耗尽**后的冷却（秒）。
+#:
+#: 为什么是 30 分钟而不是等到第二天：额度按出口 IP 的某个整日窗口重置，
+#: 但重置时刻不由我们控制（2026-11-11 实测 UTC 零点并未恢复）。冷却期
+#: 只是让「探测是否恢复」的频率从每轮一次降到每半小时一次 —— 每次探测
+#: 只花 1 次额度，而不是继续按轮询节奏往里填。
+#:
+#: 为什么必须停手：被 429 拒掉的请求**同样计入日额度**（实测：连发 3 次
+#: 全被拒 + 1 次读状态，``x-rate-limit-remaining-day`` 从 -3534 掉到 -3538）。
+#: 也就是说额度耗尽后继续请求，不是「试试看能不能过」，而是**把坑越挖越深**。
+RATE_LIMIT_COOLDOWN_DAY = 1800.0
+
+#: 429 响应里表示「日额度余量」的响应头（OpenDota 自有的非标准命名，
+#: 不是常见的 ``x-ratelimit-*``；同批还有 ``-minute`` 那个）。
+HEADER_REMAINING_DAY = "x-rate-limit-remaining-day"
 
 #: 英雄常量缓存有效期（秒）
 HERO_CACHE_TTL = 12 * 3600
@@ -183,6 +205,63 @@ class OpenDotaClient:
         #: 战队索引（``/teams``，评分前 1000）。同上：None 未拉过、空 list 拉过但失败。
         self._teams_index_cache: list[dict] | None = None
         self._teams_index_at = 0.0
+        #: 429 冷却截止时刻（``time.monotonic()`` 基准，不受系统时钟跳变影响）。
+        #: 0 表示当前不在冷却期。见 :meth:`_enter_rate_limit_cooldown`。
+        self._blocked_until = 0.0
+        #: 当前这次冷却的原因（给用户和日志看的一句话）。
+        self._blocked_reason = ""
+        #: 被冷却挡下、因而**没有真正发出去**的请求数。它只有统计意义：
+        #: 这个数字越大，说明省下来的额度越多。
+        self._blocked_skips = 0
+
+    # ------------------------------------------------------------------
+    # 429 冷却
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _remaining_day(resp: httpx.Response) -> int | None:
+        """从响应头读日额度余量；缺失或不合法时返回 ``None``。
+
+        余量为 **负数** 表示已经超额（2026-11-11 实测到 -3538）。这种情况下
+        「还能不能再试一次」的答案是确定的：不能。
+        """
+        raw = resp.headers.get(HEADER_REMAINING_DAY)
+        if raw is None:
+            return None
+        try:
+            return int(float(raw))
+        except (TypeError, ValueError):
+            return None
+
+    def _enter_rate_limit_cooldown(self, *, day_exhausted: bool) -> None:
+        """进入 429 冷却期：期间所有请求直接失败，不发出。
+
+        Args:
+            day_exhausted: True 表示日额度已耗尽（长冷却），False 表示只是
+                分钟窗口打满（等一个窗口即可）。
+        """
+        span = RATE_LIMIT_COOLDOWN_DAY if day_exhausted else RATE_LIMIT_COOLDOWN_MINUTE
+        self._blocked_until = time.monotonic() + span
+        if day_exhausted:
+            self._blocked_reason = (
+                f"OpenDota 当天额度已用完，暂停请求 {int(span // 60)} 分钟"
+                f"（继续请求也会被拒，而且被拒同样扣额度）"
+            )
+        else:
+            self._blocked_reason = (
+                f"OpenDota 触发限流，暂停请求 {int(span)} 秒"
+            )
+        logger.warning(f"[dota2] {self._blocked_reason}")
+
+    def _rate_limit_blocked(self) -> str:
+        """当前若在冷却期则返回原因，否则返回空串（并顺手清掉过期状态）。"""
+        if not self._blocked_until:
+            return ""
+        left = self._blocked_until - time.monotonic()
+        if left <= 0:
+            self._blocked_until = 0.0
+            self._blocked_reason = ""
+            return ""
+        return f"{self._blocked_reason}（还剩 {int(left)} 秒）"
 
     # ------------------------------------------------------------------
     # 底层请求
@@ -242,6 +321,14 @@ class OpenDotaClient:
         verb = method.upper()
         last_error: Exception | None = None
 
+        # 冷却期内**一个请求都不发**。这不是「快速失败」的优化，而是唯一
+        # 能止损的做法：日额度耗尽后每发一次都会继续扣额度（被拒也算），
+        # 发出去既拿不到数据、又把恢复时间推得更远。
+        blocked = self._rate_limit_blocked()
+        if blocked:
+            self._blocked_skips += 1
+            raise DataSourceUnavailableError(blocked)
+
         for attempt in range(self.max_retries + 1):
             await self._limiter.acquire()
             try:
@@ -276,16 +363,28 @@ class OpenDotaClient:
                 raise TargetNotFoundError(f"OpenDota 接口 {url} 返回 {status}")
 
             if status == 429:
-                retry_after = 5.0
-                try:
-                    retry_after = float(resp.headers.get("Retry-After", "") or 5.0)
-                except ValueError:
-                    retry_after = 5.0
-                last_error = OpenDotaError("OpenDota 请求频率超限（429）")
-                if attempt >= self.max_retries:
-                    break
-                await asyncio.sleep(min(30.0, max(2.0, retry_after)))
-                continue
+                # **429 不再重试**（2026-11-11 改）。
+                #
+                # 原实现按 ``Retry-After`` 退避重试最多 3 次。实测发现被 429
+                # 拒掉的请求**同样计入日额度**，于是一次失败被放大成四次扣额；
+                # 额度耗尽后每轮轮询都在这个循环里打转 —— 当天把 3000 的额度
+                # 用到了 -3533（即实际发出 6533 次请求）。越重试越超，越超越 429。
+                #
+                # 现在：读响应头判断是「日额度耗尽」还是「分钟窗口打满」，
+                # 进入对应时长的冷却期，冷却期内根本不发请求。
+                remaining_day = self._remaining_day(resp)
+                self._enter_rate_limit_cooldown(
+                    day_exhausted=(remaining_day is not None and remaining_day <= 0)
+                )
+                last_error = OpenDotaError(
+                    "OpenDota 请求频率超限（429）"
+                    + (
+                        f"，日额度余量 {remaining_day}"
+                        if remaining_day is not None
+                        else ""
+                    )
+                )
+                break
 
             # 5xx / 502 / 504 等
             last_error = OpenDotaError(f"OpenDota 接口 {url} 返回 {status}")

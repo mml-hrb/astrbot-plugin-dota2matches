@@ -39,7 +39,9 @@ try:  # 插件目录被作为包加载时的相对导入
         dota_chat,
         dota_cron,
         dota_esports,
+        dota_hero_kb,
         dota_history,
+        dota_jobs,
         dota_nlu,
         dota_parse,
         dota_pool,
@@ -47,6 +49,7 @@ try:  # 插件目录被作为包加载时的相对导入
         dota_replay_parse,
         dota_router,
         dota_schedule,
+        dota_steam,
         dota_tools,
         dota_zh,
     )
@@ -103,7 +106,9 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
     import dota_chat  # type: ignore[no-redef]
     import dota_cron  # type: ignore[no-redef]
     import dota_esports  # type: ignore[no-redef]
+    import dota_hero_kb  # type: ignore[no-redef]
     import dota_history  # type: ignore[no-redef]
+    import dota_jobs  # type: ignore[no-redef]
     import dota_nlu  # type: ignore[no-redef]
     import dota_parse  # type: ignore[no-redef]
     import dota_pool  # type: ignore[no-redef]
@@ -111,6 +116,7 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
     import dota_replay_parse  # type: ignore[no-redef]
     import dota_router  # type: ignore[no-redef]
     import dota_schedule  # type: ignore[no-redef]
+    import dota_steam  # type: ignore[no-redef]  # noqa: F401
     import dota_tools  # type: ignore[no-redef]
     import dota_zh  # type: ignore[no-redef]
     from dota_analyzer import (  # type: ignore[no-redef]
@@ -173,6 +179,37 @@ PLUGIN_NAME = "astrbot_plugin_dota2"
 #: pending 队列的处理节拍（秒）。必须显著小于 watch_interval，
 #: 否则 ``next_try_at`` 设成 60s 也要等满一个轮询周期才会被兑现。
 PENDING_TICK_SECONDS = 30
+
+#: 自动轮询间隔的上下限（秒）。
+#:
+#: 下限 120 秒：监听人数很少时公式算出来的间隔会很小（1 个人只要 48 秒），
+#: 但那等于把「反正额度用不完」当成不要钱 —— 配额是按**出口 IP** 算的，
+#: 同一台机器上还有用户主动查询、赛后短评和按 10 倍计费的解析申请。
+#: 上限 3600 秒：超过一小时的话，用户会以为监听坏了，而不是以为我们省着用。
+WATCH_AUTO_MIN_INTERVAL = 120
+WATCH_AUTO_MAX_INTERVAL = 3600
+
+#: 一天留给「轮询」的请求预算。
+#:
+#: OpenDota 无 Key 的额度是 3000 次/天、60 次/分钟（按 IP，且现在要更高额度
+#: 得绑卡付费）。这里只花 60% —— 剩下一千多次要留给人主动查战绩、赛后短评、
+#: 以及解析申请（``POST /request`` 按 10 倍计费）。
+#:
+#: 之所以按「天」而不是「分钟」来算：实测 6 位监听者每分钟才 1.2 次请求，
+#: 只占分钟额度的 2%，却被 429 打得很难看 —— 分钟配额是被同 IP 的其它消费者
+#: 占着的，我们控制不了。能控制的只有自己一天花多少，别把天额度吃干净。
+WATCH_DAILY_REQUEST_BUDGET = 1800
+
+#: 用户能把上面的预算调到多高。封顶在额度的 80%（3000 × 0.8）——
+#: 再往上就一定会撞天额度，那等于让主动查战绩、赛后短评、解析申请（按 10 倍
+#: 计费）全都拿不到额度。允许调高是因为有人就是想让监听更勤，但不允许调到
+#: 「把别的功能饿死」的地步。
+WATCH_DAILY_REQUEST_CAP = 2400
+
+#: OpenDota 无 Key 的每日额度。只用来在「人数太多」时区分严重程度：
+#: 撞上限后日消耗 2400 次只是把留给主动查询的余量吃掉了，4800 次才是真的
+#: 会被限流 —— 两种情况的建议完全不同，日志里不该混成一句话。
+OPENDOTA_DAILY_QUOTA = 3000
 
 #: 监听推送时，最多为几位焦点玩家附带「近期战绩」上下文。
 #: 同一局里被监听的玩家越多，这几段统计就会把提示词撑得越长，因此设上限。
@@ -316,6 +353,37 @@ WIN_CURVE_TOTAL_TIMEOUT = 150.0
 #: 否则旧算法算出来的曲线会被当成新数据用，而且**不会报错**。
 WIN_CURVE_CACHE_VERSION = 1
 
+#: 「催解析后等录像地址」的总预算（秒）。
+#:
+#: 为什么要等（2026-11-11 用户指出）：OpenDota **未解析的场次不写 ``replay_url``**
+#: —— 实测未解析时 25 个字段、``replay_salt`` 为 None；解析完成后 42 个字段才有值。
+#: 而解析不会自己发生，必须有人 ``POST /request/{id}``。所以原来「拿不到就放弃、
+#: 过几小时再试」是被动的，没人催过多久都没有。
+#:
+#: 为什么只给 60 秒：**解析是异步排队**的，通常几分钟到几十分钟，等不起。
+#: 这里只赌「排队快 + 刚好快解析完了」这种马上能好的情况；真正的长等待
+#: 由单场复盘的 ``_spawn_parse_task`` 负责（那条路最多等 ``parse_wait_timeout``）。
+#: 单次轮询是普通 ``get_match``（1 倍额度），60 秒 / 15 秒 = 4 次，成本可接受。
+#:
+#: ⚠️ **别往上调太多**：它是 ``_fetch_win_curve`` 里 ``WIN_CURVE_TOTAL_TIMEOUT``
+#: （150 秒）的一部分，而后者还要留出下载 + 解压 + 解析的时间（约 15 秒）。
+#: 原来给 120 秒会只剩 30 秒，正常局也可能被挤到超时 —— 那就变成
+#: 「为了补个可选段落，把已经能成的曲线弄丢了」。
+#: 用户要改可以调配置 ``replay_nudge_budget``（秒），0 表示不催不等。
+REPLAY_URL_NUDGE_BUDGET = 60.0
+
+#: 催解析后的轮询间隔（秒）。取 15 秒是「够快能赶上刚解析完、又不至于刷额度」的折中。
+REPLAY_URL_NUDGE_INTERVAL = 15.0
+
+#: 「上次没拿到录像地址」的记忆保持多久（秒）后才允许再问一次。
+#:
+#: 这个值与上面的 nudge 预算是配套的：预算只有 120 秒，而解析排队常常要
+#: 几十分钟 —— 所以一次失败**不代表这场没救**，只是还没排到。设成 10 分钟：
+#: 连点团战深挖不会反复烧额度（用户很难在 10 分钟内点几十次），
+#: 而隔一段时间再复盘又能重试一次。**不要改成 0 或永久** ——
+#: 前者每次都问，后者就是「一直拿不到」的老毛病（2026-11-11 实测）。
+REPLAY_URL_MISS_COOLDOWN = 600.0
+
 
 def _is_blank_histogram(
     hist: Sequence[int],
@@ -380,6 +448,16 @@ NLU_CANCEL_WORDS = frozenset(
 
 #: 等待确认的超时时间（秒）
 NLU_CONFIRM_TTL = 120
+
+#: 「上一份战报的焦点」记多久（秒）。
+#:
+#: 典型节奏是看完成报、挑一波团点进去深挖，间隔几分钟到几十分钟；
+#: 两小时足够覆盖「看一半去吃饭、回来接着点」。过期就当作没这份战报，
+#: 退回本会话绑定 —— 隔了一整天还拿旧焦点去复盘，多半是错的。
+REPORT_FOCUS_TTL = 2 * 3600
+
+#: 焦点记忆最多留多少场。长时间不重启时防止这张表无限长。
+REPORT_FOCUS_LIMIT = 24
 
 #: 看到这些开头的消息一律跳过：那是别的插件 / 本插件的指令，不该被截胡。
 NLU_SKIP_PREFIXES = ("/", "／", "!", "！", "#", "。", "~", "～")
@@ -604,6 +682,12 @@ HELP_TEXT = """🎮 Dota2 数据查询助手（数据来源：STRATZ / OpenDota 
 　　　　　等满仍未解析就自动改用现有数据出一份基础数据版报告）
 　　　　（加 skip 可跳过等待，立刻用现有数据出报告）
 /d2 催解析 <比赛ID>　　　　　 只催 OpenDota 解析这局，不等结果
+/d2 进度　　　　　　　　　　 看本会话的分析任务跑到哪一步了
+
+　复盘和团战都是后台任务（等解析十几分钟、生成几分钟），等的时候随时
+　可以用 `/d2 进度` 看一眼：在跑的显示已跑多久、卡在哪一步；已结束的
+　显示成没成、为什么没成。插件重启过的话，没跑完的任务也会留一条记录，
+　不会「等了半天发现它早就没了」。
 
 　「这个英雄现在怎么玩」不用记指令，直接说人话：
 　　`dota2助手 敌法师这版本怎么玩`　→ 高分段位置分布与场均、对线优劣、
@@ -905,6 +989,21 @@ class Dota2Plugin(Star):
         self.data_dir = self._resolve_data_dir()
         self.store = DotaStore(self.data_dir)
         self.store.load()
+        #: **分析任务台账**（见 :mod:`dota_jobs`）：用户在几分钟的等待里
+        #: 随时能查「现在跑到哪一步、有没有已经挂了」。
+        #:
+        #: 落盘是刻意的：进程重启等于内存清零，而「重启导致任务没了」
+        #: 恰恰是最需要被看见的情况 —— 启动时会把上次遗留的 running
+        #: 记录标成「中断」，用户再查就能看到「那次没跑完」。
+        self._jobs = dota_jobs.JobRegistry(self.data_dir / "jobs.json")
+        self._jobs.load()
+        #: 最近一次分析通道失败的原因 ``(时间戳, 类别, 文案)``。
+        #:
+        #: 存在的理由：``_call_report_llm`` 的契约是「失败返回 None」，
+        #: 上百个调用点只关心「有没有正文」。但**用户**要的是「为什么没有」——
+        #: 超时、Key 失效、还是被限流，三者该做的事完全不同。把它记在这里，
+        #: 由兜底文案和任务台账去取。
+        self._last_report_error: tuple[float, str, str] = (0.0, "", "")
         #: **会话对话历史**（用户说的 + 机器人说的 + 报告类产出），按 umo 分开存。
         #:
         #: 它解决的是「聊着聊着就接不上了」：以前历史里**只有用户自己说的话**
@@ -927,6 +1026,17 @@ class Dota2Plugin(Star):
             enabled=bool(self.cfg("zh_names", True)),
             learn=bool(self.cfg("zh_learn_missing", True)),
         ).load()
+        #: 英雄判读参考（人工整理的常见打法与复盘基准）。
+        #:
+        #: 用于复盘时把「这个英雄本来该做什么」交给模型 —— 没有它，模型判
+        #: 得失只能靠通用常识，换个模型结论就飘；面对非常规打法更容易误判。
+        #:
+        #: 三级查找：包内静态表 → 数据目录同名文件逐条覆盖 → 都没有就不注入。
+        #: **拿不到就静默跳过**，复盘照常进行（这份表是增强，不是必需品）。
+        self._hero_kb = dota_hero_kb.HeroKnowledge(
+            self.data_dir,
+            budget=int(self.cfg("hero_kb_budget", dota_hero_kb.DEFAULT_BUDGET) or 0),
+        )
         #: 职业赛事数据源（Liquipedia wiki）。
         #:
         #: 它是**懒连接**的：构造时不发请求，第一次真正查询才建 httpx 客户端，
@@ -950,6 +1060,11 @@ class Dota2Plugin(Star):
         #: 「日志十分钟没动静」既可能是正常静默、也可能是循环卡死，无法区分。
         #: 有了轮次号，只要它还在涨就说明循环是活的。
         self._poll_round = 0
+        #: 上一次「轮询间隔是多少、为什么」——只在变化时打一条日志。
+        #:
+        #: 自动间隔会随监听人数变化而变，如果每轮都打，几分钟一条会把日志刷满；
+        #: 只在变化时打，用户又能在群里加人之后立刻看到「间隔从 288 秒变成 480 秒」。
+        self._poll_plan_shown: tuple[int, str] = (0, "")
         #: 推送失败计数：``{match_id: {umo: 连续失败次数}}``。
         #:
         #: **这张表必须活在 pending 项之外。** pending 项在 :meth:`_finish` 里
@@ -1047,6 +1162,18 @@ class Dota2Plugin(Star):
         #: 录像深挖的后台任务：``{key: task}``。与「等待解析」分开两张表，
         #: 因为它们的并发约束不同 —— 等待解析受信号量限制，录像解析受队列限制。
         self._replay_tasks: dict[str, asyncio.Task] = {}
+        #: 上一份战报的焦点，按 ``(umo, match_id)`` 记 —— ``/d2 团战`` 没点名时沿用它。
+        #:
+        #: 为什么不直接回落「本会话绑定」：**第一步可能是手动指定的**。
+        #: ``/d2 单场 8995536921 以祈求者为主视角`` 里那个焦点和绑定没有关系，
+        #: 按绑定回落就会从「祈求者」跳到「我绑的那个号」，恰恰是用户
+        #: 2026-11-10 报的那个问题。所以要记的是**上一份战报实际用了谁**。
+        #:
+        #: 为什么 key 带 ``umo``：同一场比赛可能在群里和私聊各看了一遍，
+        #: 只按 ``match_id`` 记会让两个会话互相覆盖，在群里点的团战拿到私聊的焦点。
+        #:
+        #: 值：``(focus_ids, focus_names, 记录时间)``。
+        self._report_focus: dict[tuple[str, int], tuple[list[int], dict[int, str], float]] = {}
         #: AstrBot「未来任务」的桥接器（见 :mod:`dota_cron`）。
         #:
         #: 时间型任务一律建在 AstrBot 的任务库里（``basic`` 任务），好处是
@@ -1110,6 +1237,62 @@ class Dota2Plugin(Star):
         第二份报告还要再下载、再解析一遍录像，云端单线队列被白白占住几分钟。
         """
         return f"{umo}|{int(match_id)}|{int(index)}"
+
+    # ------------------------------------------------------------------
+    # 任务台账（用户可见的「跑到哪一步了」）
+    # ------------------------------------------------------------------
+    # 台账本身在 dota_jobs 里，这里只负责「按本项目的语境造 key / 登记」。
+    # key 的构成与去重表同构：一场比赛一个 key、一波团一个 key —— 同一件事
+    # 不会有两份记录，查询时也不必按字段拼条件。
+    def _job_key_match(self, umo: str, match_id: int) -> str:
+        return f"match|{umo}|{int(match_id)}"
+
+    def _job_key_fight(self, umo: str, match_id: int, index: int) -> str:
+        return f"fight|{umo}|{int(match_id)}|{int(index)}"
+
+    def _job_begin_match(
+        self, umo: str, match_id: int, uid: str = "", *, stage: str = "已受理"
+    ) -> dota_jobs.Job:
+        """登记（或接续）一场比赛的分析任务。
+
+        「接续」是必要的：同一场可能先由「催解析」那条路登记，然后同一个
+        任务体里继续走到生成；工具路径的 inline 分支也是同一个协程。
+        **覆盖**会把这些阶段全部丢掉，用户查到的就只剩最后一句。
+        """
+        key = self._job_key_match(umo, match_id)
+        existing = self._jobs.get(key)
+        if existing is not None and existing.status == dota_jobs.RUNNING:
+            dota_jobs.use_key(key)
+            self._jobs.stage(stage, key=key)
+            return existing
+        return self._jobs.begin(
+            key=key,
+            kind="单场复盘",
+            title=f"比赛 {match_id}",
+            umo=umo,
+            uid=uid,
+            match_id=match_id,
+            stage=stage,
+        )
+
+    def _job_begin_fight(
+        self, umo: str, match_id: int, index: int, uid: str = "", *, stage: str = "已受理"
+    ) -> dota_jobs.Job:
+        key = self._job_key_fight(umo, match_id, index)
+        existing = self._jobs.get(key)
+        if existing is not None and existing.status == dota_jobs.RUNNING:
+            dota_jobs.use_key(key)
+            self._jobs.stage(stage, key=key)
+            return existing
+        return self._jobs.begin(
+            key=key,
+            kind="团战复盘",
+            title=f"比赛 {match_id} 第 {index} 波",
+            umo=umo,
+            uid=uid,
+            match_id=match_id,
+            stage=stage,
+        )
 
     def _start_parse_task(
         self,
@@ -1274,6 +1457,51 @@ class Dota2Plugin(Star):
         focus_names: dict[int, str],
         platform: str = "",
     ) -> None:
+        """后台任务入口：先登记台账，再交给真正的流水线，最后记账。
+
+        台账是用户能查的那份（``/d2 进度``）：它必须覆盖**整条**流水线
+        （等解析十几分钟 + 生成几分钟），所以包在最外层；里面每一处 return
+        都要带一个「成没成、为什么」，否则任务结束时就说不清结果。
+        """
+        job = self._job_begin_match(
+            umo, match_id, uid, stage="已受理，准备检查解析状态"
+        )
+        current = asyncio.current_task()
+        if current is not None:
+            # 任务被取消（插件重载）或异常退出时，由台账自己标「中断」——
+            # 人肉 finish 只覆盖正常路径。
+            self._jobs.watch(job.key, current)
+        try:
+            ok, note = await self._parse_and_analyze_body(
+                umo=umo,
+                uid=uid,
+                match_id=match_id,
+                focus_ids=focus_ids,
+                focus_names=focus_names,
+                platform=platform,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - 后台任务不能把异常抛给事件循环
+            logger.exception(f"[dota2] 比赛 {match_id} 的复盘任务异常退出：{e}")
+            await self._parse_notify(
+                umo,
+                f"❌ 比赛 {match_id} 的复盘任务异常退出：{e}\n"
+                f"可以稍后重试 `/d2 单场 {match_id}`，或用 `/d2 进度` 看记录。",
+            )
+            ok, note = False, f"任务异常退出：{e}"
+        self._jobs.finish(ok=ok, note=note if ok else "", error="" if ok else note)
+
+    async def _parse_and_analyze_body(
+        self,
+        *,
+        umo: str,
+        uid: str,
+        match_id: int,
+        focus_ids: list[int],
+        focus_names: dict[int, str],
+        platform: str = "",
+    ) -> tuple[bool, str]:
         """后台任务：催解析 → 每分钟检查 → 解析完成后出复盘报告。
 
         **超时不等于放弃**：等满配置的上限仍未解析时，只要手上还有这场比赛
@@ -1282,6 +1510,9 @@ class Dota2Plugin(Star):
         真拿不到数据、或用户主动取消等待时才只发收尾通知。
 
         无论成功、超时还是异常，都会给用户一个明确的收尾消息。
+
+        Returns:
+            ``(是否给用户交付了东西, 说明)``。说明只用于台账，不是给用户看的正文。
         """
         options = self._parse_wait_options()
         interval = int(options["check_interval"])
@@ -1290,7 +1521,9 @@ class Dota2Plugin(Star):
         submit = bool(self.cfg("parse_submit_request", True))
         minutes = max(1, round(timeout / 60))
 
+        self._jobs.stage("排队等待解析名额（同一时刻只跑若干个）")
         async with self._parse_semaphore():
+            self._jobs.stage("等待解析（数据源每几分钟才会更新一次）")
             try:
                 result = await dota_parse.wait_for_parse(
                     self.api,
@@ -1324,12 +1557,13 @@ class Dota2Plugin(Star):
                     f"❌ 等待比赛 {match_id} 解析时出错：{e}\n"
                     f"可以稍后重试 `/d2 单场 {match_id}`。",
                 )
-                return
+                return False, f"等待解析时出错：{e}"
 
         if not result.parsed:
             # 等不到了，但**不等于什么都不给**：用超时那一刻手上的数据直接出
             # 一份「未解析版」复盘（与 `/d2 单场 <id> skip` 同一条链路）。
             # 拿不到数据、或用户是主动取消等待时才退回 fail_text。
+            self._jobs.stage("等解析超时，改用现有数据出报告")
             if (
                 self.cfg("parse_fallback_unparsed", True)
                 and result.reason in dota_parse.FALLBACK_REASONS
@@ -1342,9 +1576,9 @@ class Dota2Plugin(Star):
                     limit_minutes=minutes,
                 )
             ):
-                return
+                return True, "解析没等完，已用现有数据出报告"
             await self._parse_notify(umo, result.fail_text(match_id))
-            return
+            return False, f"没等到解析，也没有数据可出报告（{result.reason}）"
 
         # `result.parsed` 为真**意味着**拿到过 match（dota_parse 的等待循环里
         # 先 `result.match = match`、再由 `parse_state(match).parsed` 置位），
@@ -1353,14 +1587,15 @@ class Dota2Plugin(Star):
         match_data = result.match
         if match_data is None:
             await self._parse_notify(umo, result.fail_text(match_id))
-            return
+            return False, "解析状态为完成，但没拿到比赛数据"
 
         await self._parse_notify(
             umo,
             f"✅ 比赛 {match_id} 已解析完成（等待 {_fmt_clock(result.waited)}，"
             f"共检查 {result.checks} 次），开始生成复盘报告…",
         )
-        await self._analyze_match_data(
+        self._jobs.stage("解析完成，正在整理数据")
+        return await self._analyze_match_data(
             umo=umo,
             match_id=match_id,
             match=match_data,
@@ -1472,6 +1707,12 @@ class Dota2Plugin(Star):
     ) -> None:
         """每分钟的进度播报。"""
         left = max(0.0, limit_minutes * 60 - elapsed)
+        # 每分钟的这条播报同时也是台账的心跳：用户查 `/d2 进度` 时看到的
+        # 「第 3 次检查、已等 3 分」就是从这儿来的。
+        self._jobs.stage(
+            f"等待解析（第 {checks} 次检查，已等 {_fmt_clock(elapsed)}）",
+            key=self._job_key_match(umo, match_id),
+        )
         await self._parse_notify(
             umo,
             f"⏳ 比赛 {match_id} 解析进度（第 {checks} 次检查，已等待 "
@@ -1486,11 +1727,15 @@ class Dota2Plugin(Star):
         match: dict,
         focus_ids: list[int],
         focus_names: dict[int, str],
-    ) -> None:
+    ) -> tuple[bool, str]:
         """数据就绪后生成单场复盘并推送到会话。
 
         与 ``d2_match`` 共用同一套提示词构造逻辑，保证「等解析出来的复盘」
         与「直接查已解析比赛的复盘」完全一致。
+
+        Returns:
+            ``(是否拿到模型正文, 说明)``。模型没出正文时也算「交付了东西」
+            由调用方判断 —— 这里只如实说明发生了什么。
         """
         # 幂等：d2_match 那条路径已经踢过了，这里再踢一次是为另外几条
         # 直接进来的路径（监听推送、工具调用）兜底。
@@ -1503,6 +1748,7 @@ class Dota2Plugin(Star):
             heroes, items = {}, {}
 
         focus_ids = [int(i) for i in (focus_ids or []) if int(i or 0)]
+        self._jobs.stage("正在整理这一场的数据并拼提示词")
         headline, prompt = await self._build_match_prompt(
             match=match,
             heroes=heroes,
@@ -1510,6 +1756,7 @@ class Dota2Plugin(Star):
             match_id=match_id,
             focus_ids=focus_ids,
             focus_names=focus_names,
+            umo=umo,
         )
         report = await self._generate_report_for_umo(umo, prompt)
 
@@ -1521,15 +1768,17 @@ class Dota2Plugin(Star):
             # 标题不再单独先发：先发就等于告诉用户「好了」，然后要对着
             # 5~7 分钟的出图干等（2026-11-05 用户原话）。
             await self._deliver_report(umo, headline, report, label="复盘")
-            return
+            return True, "复盘已发出"
 
         # 兜底路径自己要拿渲染常量（原先靠上游算好的局部变量，
         # 而那两个变量在收进 _build_match_prompt 时被一起搬走了 —— 见
         # _match_render_constants 的说明）。
+        self._jobs.stage("模型没出正文，正在发原始数据（含团战清单）")
         await self._parse_notify(umo, headline)
         abilities, curve_ids = await self._match_render_constants(match, focus_ids)
         raw = (
-            "⚠️ 未启用大模型分析或模型不可用，以下为从数据源获取的完整原始数据：\n\n"
+            self._llm_failure_notice()
+            + "\n以下为从数据源获取的完整原始数据：\n\n"
             + build_match_data_text(
                 match,
                 heroes,
@@ -1546,6 +1795,7 @@ class Dota2Plugin(Star):
         )
         # 同上：裸循环换成统一分块出口（逐块隔离 + 带块号的日志）。
         await self._send_chunked(umo, raw, label="原文")
+        return False, "模型没出正文，已发原始数据"
 
     async def _generate_report_for_umo(self, umo: str, prompt: str) -> str | None:
         """在指定会话下调用大模型生成报告（供后台任务使用）。"""
@@ -1561,6 +1811,10 @@ class Dota2Plugin(Star):
         降级原则：**任何一步拿不到东西都退回单步**。多一步是为了更准，
         不是为了多一次失败机会 —— 用户等的是战报，不是流程完整性。
 
+        ⚠️ 唯一的例外是**超时**：归因步等到超时说明这条通道此刻就是慢，
+        退回单步等于把同一轮等待再走一遍（而用户已经等了一整轮）。
+        这种情况直接认输，交给「原始数据」兜底。
+
         Args:
             prompt: :func:`build_single_match_analysis_prompt` 的完整输出。
             umo: 会话来源，回退到 AstrBot 提供商时用来解析默认模型。
@@ -1574,16 +1828,24 @@ class Dota2Plugin(Star):
             logger.debug("[dota2] 提示词里没有输出要求标记，跳过两步生成")
             return await self._call_report_llm(prompt, umo=umo)
 
+        self._jobs.stage("正在拆责任归因（模型第 1/2 步）")
         started = time.time()
         table = await self._call_report_llm(build_attribution_prompt(common), umo=umo)
         if not table or len(table.strip()) < 40:
+            if self._is_timeout_error():
+                logger.warning(
+                    "[dota2] 归因步超时，不再退回单步（重跑一次还是等一整轮）"
+                )
+                return None
             logger.warning("[dota2] 归因步没有拿到有效结果，退回单步生成")
+            self._jobs.stage("归因没拿到结果，改走单步生成")
             return await self._call_report_llm(prompt, umo=umo)
         logger.info(
             f"[dota2] 归因步完成（{len(table.strip())} 字 · "
             f"{time.time() - started:.1f}s）"
         )
 
+        self._jobs.stage("归因完成，正在写正文（模型第 2/2 步）")
         text = await self._call_report_llm(
             inject_attribution(prompt, table), umo=umo
         )
@@ -1804,6 +2066,7 @@ class Dota2Plugin(Star):
         match_id: int,
         focus_ids: list[int],
         focus_names: dict[int, str],
+        umo: str = "",
     ) -> tuple[str, str]:
         """组装单场复盘要用的**头部文案**与**提示词**。
 
@@ -1819,6 +2082,10 @@ class Dota2Plugin(Star):
         Returns:
             ``(headline, prompt)`` —— 头部文案给用户看，提示词给模型。
         """
+        # 记下这份战报用的焦点 —— 用户随后点某一波团时（``/d2 团战``），
+        # 没点名就沿用它。第一步可能是**手动指定**的（「以祈求者为主视角」），
+        # 那个人和「本会话绑定」没有必然关系，所以只能照实际用的记下来。
+        self._remember_report_focus(umo, match_id, focus_ids, focus_names)
         headline = self.match_headline(match, heroes, focus_ids or None, focus_names)
         extra_context = await self._build_recent_context(
             match_id, focus_ids, focus_names, heroes
@@ -1838,8 +2105,33 @@ class Dota2Plugin(Star):
             abilities=abilities,
             curve_ids=curve_ids,
             win_curve=win_block,
+            hero_block=self._hero_kb_block(match, heroes, focus_ids),
         )
         return headline, prompt
+
+    def _hero_kb_block(
+        self,
+        match: dict,
+        heroes: dict | None,
+        focus_ids: list[int] | None = None,
+    ) -> str:
+        """渲染「十人英雄判读参考」；关掉开关或没有数据时返回空串。
+
+        为什么容错包在这一层而不是 :mod:`dota_hero_kb` 里：那边只在「读文件」
+        这一步吞异常（那是预期内的缺失），而**渲染**出错属于代码 bug ——
+        这里兜一层只是为了不让它把整份战报带崩，同时留下 warning 便于定位。
+        """
+        if not bool(self.cfg("hero_kb_enabled", True)):
+            return ""
+        try:
+            return self._hero_kb.render_review_block(
+                match.get("players") if isinstance(match, dict) else None,
+                heroes,
+                focus_ids or [],
+            )
+        except Exception as e:  # noqa: BLE001 - 参考缺失不该影响战报产出
+            logger.warning(f"[dota2] 英雄判读参考渲染失败，本次不注入: {e}")
+            return ""
 
     async def _match_render_constants(
         self, match: dict, focus_ids: list[int]
@@ -1905,22 +2197,42 @@ class Dota2Plugin(Star):
     # ==================================================================
     # 数据源组装（主 STRATZ + 后备 OpenDota，自动降级）
     # ==================================================================
-    #: 数据源优先级取值 → (主源名, 说明)。``stratz`` 为默认。
+    #: 数据源优先级取值 → (主源名, 说明)。
+    #:
+    #: ⚠️ **默认是 ``opendota``（2026-11-11 用户定）**，不是 ``stratz``。
+    #: 两个源的 ``teamfights`` 形状不一样，而团战复盘的核心指标只有一边有：
+    #:
+    #: * OpenDota 给的是**服务端聚合好的团战段**，每人有逐波 ``damage`` /
+    #:   ``gold_delta`` / ``ability_uses`` / ``item_uses``；
+    #: * STRATZ 的团战是按死亡事件聚出来的（``dota_stratz_events``），
+    #:   只有「谁在哪一刻死了」，**没有任何逐波伤害**。
+    #:
+    #: 用户实测反馈：「关键团战板块都显示伤害 0」—— 根因就是主源是 STRATZ，
+    #: 渲染层拿到的是不存在的字段。渲染层已经改成「没数据就不写」，
+    #: 但那是止损；要真的看到伤害，只能让主源是 OpenDota。
+    #:
+    #: 代价（用户已知情并接受）：控制次数与时长明细、带天赋的技能加点、
+    #: 扫描/塔防次数、野区与建筑收益、反眼收益这几块 STRATZ 独有字段会缺席，
+    #: 相关小节自动不显示（消费方都是 ``if any(...)`` 条件渲染，不会报错）。
     DATA_SOURCE_CHOICES = ("stratz", "opendota")
+
+    #: 配置缺省 / 非法值时的回落目标。**与 ``_conf_schema.json`` 的 default 必须一致**，
+    #: 否则「新装用户」与「配置项缺失的老用户」会走到两个不同的数据源上。
+    DEFAULT_DATA_SOURCE = "opendota"
 
     def _stratz_api_key(self) -> str:
         """读取 STRATZ API Key（去空白，兼容误粘贴换行）。"""
         return str(self.cfg("stratz_api_key", "") or "").strip()
 
     def _data_source_choice(self) -> str:
-        """读取配置里的「数据源优先级」，非法值一律回落到 ``stratz``。"""
-        choice = str(self.cfg("data_source_priority", "stratz") or "").strip().lower()
-        return choice if choice in self.DATA_SOURCE_CHOICES else "stratz"
+        """读取配置里的「数据源优先级」，非法值回落到 :attr:`DEFAULT_DATA_SOURCE`。"""
+        choice = str(self.cfg("data_source_priority", self.DEFAULT_DATA_SOURCE) or "").strip().lower()
+        return choice if choice in self.DATA_SOURCE_CHOICES else self.DEFAULT_DATA_SOURCE
 
     def _source_name(self) -> str:
         """当前生效的数据源名，用于给用户看的提示文案。
 
-        不要在提示里硬编码「OpenDota」——STRATZ 才是默认主源，
+        不要在提示里硬编码「OpenDota」——主源可由用户切换，
         写死会让用户拿着错误的线索去排查。
         """
         api = getattr(self, "api", None)
@@ -1933,6 +2245,33 @@ class Dota2Plugin(Star):
             except Exception:  # noqa: BLE001
                 pass
         return "STRATZ" if self._data_source_choice() == "stratz" else "OpenDota"
+
+    def _watch_source(self):
+        """**轮询**用哪个数据源。
+
+        这和「主数据源」不是一回事。主数据源决定复盘、战绩、英雄数据这些
+        用户发起的查询走哪边；轮询只是「看看被监听的几个人有没有新比赛」，
+        却是唯一会把额度吃穿的功能 —— 它一天要发上千次请求，而用户一天
+        查不了几次。
+
+        优先 STRATZ 的理由是**计量维度不同**：
+
+        - OpenDota 免费层无 key，额度按**出口 IP** 算，3000 次/天，且**被
+          429 拒掉的请求同样扣额度**；
+        - STRATZ 默认 token 免费，额度按 **token** 算，10,000 次/天，
+          和其他人共用 IP 毫无影响。
+
+        把轮询挪到 STRATZ 之后，OpenDota 只剩「发现新比赛后拉详情」和
+        「申请解析」，一天几十次，免费额度绰绰有余。
+
+        STRATZ 没填 Key 时回落到主数据源，行为与改动前完全一致。
+        """
+        if not bool(self.cfg("watch_use_stratz", True)):
+            return self.api
+        client = getattr(self, "_stratz_client", None)
+        if client is not None and bool(getattr(client, "configured", False)):
+            return client
+        return self.api
 
     def _build_esports(self):
         """构造职业赛事数据源（Liquipedia）。关掉开关时返回 ``None``。
@@ -1961,14 +2300,20 @@ class Dota2Plugin(Star):
     def _build_data_source(self):
         """按配置组装数据源。
 
-        默认策略：**STRATZ 为主、OpenDota 为后备**。
+        默认策略：**OpenDota 为主、STRATZ 为后备**（见 :attr:`DEFAULT_DATA_SOURCE`）。
 
-        - ``stratz_api_key`` 没填时，STRATZ 会被视为「未配置」，
-          所有请求直接落到 OpenDota（行为与升级前完全一致）。
-        - ``data_source_priority`` 选 ``opendota`` 时，两者对调：
-          OpenDota 为主、STRATZ 为后备。
+        - ``data_source_priority`` 选 ``stratz`` 时，两者对调：
+          STRATZ 为主、OpenDota 为后备。
+        - ``stratz_api_key`` 没填时，STRATZ 会被视为「未配置」；
+          它在后备位置时等同于没有后备（OpenDota 挂了就直接报错）。
         - 任一主源抛「不可用」类异常（未配置/鉴权/限流/网络）时，
           :class:`FallbackDataSource` 会自动切到后备并记一条 warning。
+
+        ⚠️ **``get_match`` 是整包切换，不是逐字段合并。** 主源是谁，
+        ``match`` 里就是谁那套字段：
+        OpenDota 给逐波团战伤害与经济变化，STRATZ 给控制时长 / 加点天赋 /
+        扫描塔防 / 野区收益。切换会**整体丢失**另一方的那几块，
+        不会「两边各拿一部分」—— 想要那种效果得改 ``get_match`` 本身。
         """
         opendota = OpenDotaClient(
             api_key=self.cfg("opendota_api_key", ""),
@@ -1992,6 +2337,12 @@ class Dota2Plugin(Star):
             primary, secondary = stratz, opendota
             primary_label, secondary_label = "STRATZ", "OpenDota"
 
+        # 两个客户端都留引用：轮询要单独指定走哪一端（见 :meth:`_watch_source`）。
+        # ``FallbackDataSource`` 内部也能按 ``SOURCE_KIND`` 找到它们，但轮询
+        # 需要的语义是「优先用 STRATZ，没配就用主源」，不是「坏了才换」。
+        self._opendota_client = opendota
+        self._stratz_client = stratz
+
         source = FallbackDataSource(
             primary=primary,
             secondary=secondary,
@@ -2002,6 +2353,13 @@ class Dota2Plugin(Star):
             logger.info(
                 "[dota2] 未配置 STRATZ API Key，数据源将直接使用 OpenDota；"
                 "填写「STRATZ API Key」后即可启用 STRATZ 主数据源。"
+            )
+        elif primary_label == "OpenDota" and not opendota.api_key:
+            # 没有 Key 不是错，只是额度小得多，且**被 429 拒掉的请求照样扣**。
+            # 不提示的话，用户遇到限流时完全不知道为什么、也不知道怎么解。
+            logger.info(
+                "[dota2] 未配置 OpenDota API Key：额度按出口 IP 计（3000 次/天），"
+                "且被限流拒绝的请求同样计数。到 opendota.com 免费注册可大幅提高额度。"
             )
         return source
 
@@ -2305,6 +2663,7 @@ class Dota2Plugin(Star):
             # 渲染期间先吱一声：5~7 分钟一句话都没有，用户会以为任务死了。
             # 措辞刻意写「正在排版成图片」而不是「报告已生成」——
             # 后者听起来像下一秒就到，正好是用户抱怨的那句。
+            self._jobs.stage("正文已写完，正在排版成图片")
             if progress:
                 await self._parse_notify(umo, progress)
             image_path = await self._render_image(report)
@@ -2491,6 +2850,77 @@ class Dota2Plugin(Star):
                 focus_ids.append(account_id)
                 focus_names[account_id] = name
         return focus_ids, focus_names, failed
+
+    def _remember_report_focus(
+        self,
+        umo: str,
+        match_id: int,
+        focus_ids: list[int],
+        focus_names: dict[int, str],
+    ) -> None:
+        """记下「这份战报实际用了谁」，供之后点某一波团时沿用。
+
+        调用点在 :meth:`_build_match_prompt` —— 单场复盘的提示词**只从这里出**
+        （指令、工具、等到解析完、监听推送四条路径共用），所以不必在四个入口
+        各记一次，也就不会出现「某条路径没记住」这种漏。
+
+        焦点为空时**主动清掉**旧记录：用户随后不带焦点重出了一份战报，
+        再点团战就该回到上帝视角，而不是拿上一份的焦点去凑。
+        """
+        try:
+            mid = int(match_id or 0)
+        except (TypeError, ValueError):
+            return
+        if not mid:
+            return
+        key = (str(umo or ""), mid)
+        if not focus_ids:
+            self._report_focus.pop(key, None)
+            return
+        now = time.time()
+        self._report_focus[key] = (
+            [int(i) for i in focus_ids],
+            {int(k): str(v) for k, v in (focus_names or {}).items()},
+            now,
+        )
+        self._prune_report_focus(now)
+
+    def _prune_report_focus(self, now: float | None = None) -> None:
+        """清掉过期记录；条数超上限时丢最旧的。"""
+        now = time.time() if now is None else now
+        stale = [k for k, v in self._report_focus.items() if now - v[2] > REPORT_FOCUS_TTL]
+        for k in stale:
+            self._report_focus.pop(k, None)
+        excess = len(self._report_focus) - REPORT_FOCUS_LIMIT
+        if excess > 0:
+            for k in sorted(self._report_focus, key=lambda k: self._report_focus[k][2])[:excess]:
+                self._report_focus.pop(k, None)
+
+    def _recall_report_focus(
+        self, umo: str, match_id: int, players: list[dict]
+    ) -> tuple[list[int], dict[int, str]]:
+        """取「同一会话、同一场比赛上一份战报的焦点」。没有/过期/人不在本局都返回空。"""
+        try:
+            mid = int(match_id or 0)
+        except (TypeError, ValueError):
+            return [], {}
+        key = (str(umo or ""), mid)
+        entry = self._report_focus.get(key)
+        if not entry:
+            return [], {}
+        ids, names, recorded = entry
+        if time.time() - recorded > REPORT_FOCUS_TTL:
+            self._report_focus.pop(key, None)
+            return [], {}
+        present = {
+            int(p.get("account_id") or 0)
+            for p in players
+            if isinstance(p, dict)
+        }
+        kept = [i for i in ids if i in present]
+        if not kept:
+            return [], {}
+        return kept, {i: names.get(i, "") for i in kept}
 
     def _auto_focus_binding(
         self,
@@ -2703,6 +3133,19 @@ class Dota2Plugin(Star):
         """查看 Dota2 助手的使用说明"""
         yield event.plain_result(HELP_TEXT)
 
+    @d2.command("progress", alias={"进度", "分析进度", "跑哪了", "在跑什么"})
+    @take_over_event
+    async def d2_progress(self, event: AstrMessageEvent):
+        """查看本会话的分析任务跑到哪一步了：/d2 进度
+
+        复盘与团战都是后台任务（等解析十几分钟、生成几分钟），只发零散的
+        进度消息时，用户分不清「还在跑」和「早就挂了」。这份台账是那条链路
+        唯一的可查询状态，也负责把「插件重启导致任务没了」如实说出来。
+        """
+        yield event.plain_result(
+            self._jobs.render(str(event.unified_msg_origin))
+        )
+
     # ==================================================================
     # 自然语言入口：不用记指令，直接说人话
     # ==================================================================
@@ -2710,6 +3153,7 @@ class Dota2Plugin(Star):
     #: 保证「说人话」与「打指令」两条路径的行为完全一致。
     NLU_DISPATCH: dict[str, str] = {
         "help": "d2_help",
+        "progress": "d2_progress",
         "bind": "d2_bind",
         "unbind": "d2_unbind",
         "my": "d2_my",
@@ -3781,8 +4225,18 @@ class Dota2Plugin(Star):
         # 「同一波排两次、发两份报告」的坑（第二份还要再下载一次录像）。
         if kind == "teamfight":
             index = int(params.get("fight_index") or 0)
+            # 工具路径的自动聚焦只认**提问者本人**的绑定，不用 `_effective_binding`
+            # 的会话级回落 —— 理由同单场复盘那条，见 `_auto_focus_binding`。
+            try:
+                tool_binding = self.store.get_binding(umo, uid)
+            except Exception:  # noqa: BLE001
+                tool_binding = None
             note = self._spawn_fight_task(
-                umo, match_id, index, str(params.get("focus") or "").strip()
+                umo,
+                match_id,
+                index,
+                str(params.get("focus") or "").strip(),
+                tool_binding,
             )
             logger.info(
                 f"[dota2] 工具发起后台任务 teamfight: "
@@ -3991,7 +4445,8 @@ class Dota2Plugin(Star):
                     f"AI 复盘依赖逐分钟经济、团战与出装数据，"
                     f"{'已提交催解析并' if self.cfg('parse_submit_request', True) else ''}"
                     f"开始等待（最多 {minutes} 分钟，{fallback_hint}）。\n"
-                    "报告出来后会自动发到本会话，可以先忙别的。",
+                    "报告出来后会自动发到本会话，可以先忙别的。\n"
+                    "想确认它还在跑：`/d2 进度`。",
                 )
                 if spawn == "inline":
                     # 本任务就是那个等待任务：原地等，等完直接出报告并推送。
@@ -4052,47 +4507,67 @@ class Dota2Plugin(Star):
         是这条路径（「分析这盘」），于是用户看到的是「新命令又只给文字」
         （2026-11-05 反馈）。
         """
+        self._job_begin_match(umo, match_id, stage="正在整理这一场的数据")
+        job_ok, job_note = False, ""
         try:
-            headline, prompt = await self._build_match_prompt(
-                match=match,
-                heroes=heroes,
-                items=items,
-                match_id=match_id,
-                focus_ids=focus_ids,
-                focus_names=focus_names,
-            )
-            report = await self._generate_report_for_umo(umo, prompt)
-        except Exception as e:  # noqa: BLE001 - 生成失败要发出去，不能只留日志
-            logger.error(f"[dota2] 工具复盘：生成报告失败 {match_id}: {e}", exc_info=True)
-            await self._send_to_session(umo, f"⚠️ 比赛 {match_id} 的复盘生成失败：{e}")
-            return
+            try:
+                headline, prompt = await self._build_match_prompt(
+                    match=match,
+                    heroes=heroes,
+                    items=items,
+                    match_id=match_id,
+                    focus_ids=focus_ids,
+                    focus_names=focus_names,
+                    umo=umo,
+                )
+                report = await self._generate_report_for_umo(umo, prompt)
+            except Exception as e:  # noqa: BLE001 - 生成失败要发出去，不能只留日志
+                logger.error(
+                    f"[dota2] 工具复盘：生成报告失败 {match_id}: {e}", exc_info=True
+                )
+                await self._send_to_session(
+                    umo, f"⚠️ 比赛 {match_id} 的复盘生成失败：{e}"
+                )
+                job_note = f"生成报告失败：{e}"
+                return
 
-        if report:
-            # 清单并进正文，跟指令路径出的战报是同一份东西。
-            report = await self._append_fight_candidates(
-                report, match, focus_ids, focus_names, heroes
+            if report:
+                # 清单并进正文，跟指令路径出的战报是同一份东西。
+                report = await self._append_fight_candidates(
+                    report, match, focus_ids, focus_names, heroes
+                )
+                await self._deliver_report(umo, headline, report, label="复盘")
+                logger.info(f"[dota2] 工具复盘已推送: 比赛 {match_id} → {umo}")
+                job_ok, job_note = True, "复盘已发出"
+                return
+            # 模型不可用：退化成原始数据，至少让用户拿到东西
+            abilities, curve_ids = await self._match_render_constants(
+                match, focus_ids
             )
-            await self._deliver_report(umo, headline, report, label="复盘")
-            logger.info(f"[dota2] 工具复盘已推送: 比赛 {match_id} → {umo}")
-            return
-        # 模型不可用：退化成原始数据，至少让用户拿到东西
-        abilities, curve_ids = await self._match_render_constants(match, focus_ids)
-        raw = (
-            f"{headline}\n\n"
-            "⚠️ 未启用大模型分析或模型不可用，以下为从数据源获取的完整原始数据：\n\n"
-            + build_match_data_text(
-                match,
-                heroes,
-                items,
-                focus_account_ids=focus_ids or None,
-                abilities=abilities,
-                curve_ids=curve_ids,
+            raw = (
+                f"{headline}\n\n"
+                + self._llm_failure_notice()
+                + "\n以下为从数据源获取的完整原始数据：\n\n"
+                + build_match_data_text(
+                    match,
+                    heroes,
+                    items,
+                    focus_account_ids=focus_ids or None,
+                    abilities=abilities,
+                    curve_ids=curve_ids,
+                )
             )
-        )
-        raw = await self._append_fight_candidates(
-            raw, match, focus_ids, focus_names, heroes
-        )
-        await self._send_to_session(umo, raw)
+            raw = await self._append_fight_candidates(
+                raw, match, focus_ids, focus_names, heroes
+            )
+            await self._send_to_session(umo, raw)
+            job_note = "模型没出正文，已发原始数据"
+        finally:
+            self._jobs.finish(
+                ok=job_ok,
+                note=job_note if job_ok else "",
+                error="" if job_ok else job_note,
+            )
 
     async def _run_tool_loop(
         self,
@@ -5230,7 +5705,8 @@ class Dota2Plugin(Star):
             summary = summarize_matches(matches, economy_samples=economy_samples)
             fallback = (
                 f"{header}\n\n"
-                "⚠️ 未启用大模型分析或模型不可用，以下为原始统计数据：\n\n"
+                + self._llm_failure_notice()
+                + "\n\n以下为原始统计数据：\n\n"
                 + format_summary_block(summary, heroes)
                 + "\n\n"
                 + format_match_list(name, account_id, matches, heroes, title="逐场明细")
@@ -5426,6 +5902,276 @@ class Dota2Plugin(Star):
         except OSError as e:
             logger.debug(f"[dota2] 胜率缓存写入失败（不影响出报告）：{e}")
 
+    #: 本进程内「上次没拿到录像地址」的比赛 → 那次失败的 ``time.monotonic()`` 时刻。
+    #:
+    #: 不加这个记忆的话，同一场比赛被反复复盘、反复点团战深挖时，每一次都会
+    #: 再向 OpenDota 要一遍 —— 而没解析完的比赛（响应只有 25 个字段、没有
+    #: ``replay_salt``）**当下确实拿不到**，这些请求纯属白烧额度。
+    #:
+    #: ⚠️ 但**不能让它变成永久拉黑**（2026-11-11 改）。原来它是 ``set``，
+    #: 一旦失手同一进程内就永不再问 —— 而缺地址的真实原因通常是「还没解析完」，
+    #: 催过之后过一会儿就好了。永久拉黑的表现就是用户看到的「一直拿不到」。
+    #: 现在记时间戳，超过 :data:`REPLAY_URL_MISS_COOLDOWN` 允许重试。
+    _replay_url_misses: "dict[int, float]" = {}
+
+    #: 本进程内已经为哪几场提交过解析申请。
+    #:
+    #: ``/request/{id}`` 按 **10 倍额度**计费，所以每场每进程只催一次；
+    #: 轮询用的是普通 ``get_match``（1 倍），不在这里限。
+    _replay_parsed_nudged: "set[int]" = set()
+
+    def _replay_url_cache_path(self, match_id: int) -> str:
+        """录像地址的落盘位置；与录像产物同目录，删缓存时一起清掉。"""
+        return os.path.join(
+            self._replay_engine_dir(), "replays", str(match_id), "replay_url.txt"
+        )
+
+    def _replay_url_cache_read(self, match_id: int) -> str:
+        try:
+            with open(self._replay_url_cache_path(match_id), encoding="utf-8") as fh:
+                return fh.read().strip()
+        except OSError:
+            return ""
+
+    def _replay_url_cache_write(self, match_id: int, url: str) -> None:
+        path = self._replay_url_cache_path(match_id)
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(url)
+        except OSError as e:
+            # 写不进去只是下次多为一次请求，不该拖垮本次下载。
+            logger.debug(f"[dota2] 录像地址缓存写入失败（不影响本次下载）：{e}")
+
+    def _replay_url_miss_fresh(self, match_id: int) -> bool:
+        """这场的「上次没拿到」是否还在冷却期内。
+
+        返回 True 表示**别再去问** —— 刚失败过，短时间内再问也是白烧额度。
+        返回 False 表示可以再试（可能解析已经好了）。
+        """
+        misses = self._replay_url_misses
+        if match_id not in misses:
+            return False
+        try:
+            last = float(misses[match_id])
+        except (TypeError, ValueError):
+            # 老格式（纯 set）或脏数据：当作已过期，允许重试。
+            return False
+        return (time.monotonic() - last) < REPLAY_URL_MISS_COOLDOWN
+
+    def _replay_url_mark_miss(self, match_id: int) -> None:
+        """记一笔「这次没拿到」，并更新冷却起点。"""
+        self._replay_url_misses[match_id] = time.monotonic()
+
+    async def _match_replay_url(self, match: dict, match_id: int) -> str:
+        """取这场比赛可下载的录像地址；实在没有就返回空串。
+
+        为什么不直接用 ``match["replay_url"]``
+        ----------------------------------------
+        OpenDota 主数据源本来就会带这个字段，**但 STRATZ 不给**：它的
+        ``MatchType`` 确实有 ``clusterId`` 与 ``replaySalt``，可实测
+        ``replaySalt`` 恒为 ``null``（连盐值早已确定的老比赛也是 null），
+        拼不出 Valve 的下载地址。而胜率曲线、责任窗口、团战深挖这些能力
+        **全都要下载录像** —— ``data_source_priority=stratz`` 之后，
+        它们会一起静默失效。
+
+        取址顺序（2026-11-11 简化）
+        ---------------------------
+        1. ``match`` 自带（OpenDota 为主源时走这条，一次请求都不发）；
+        2. 本地缓存 ``replays/{id}/replay_url.txt``；
+        3. **OpenDota ``/matches/{id}``** 补取 —— 这是唯一的外部来源。
+        4. 还拿不到 ⇒ **先催解析，再轮询等 ``replay_salt`` 出现**（见下）。
+
+        ⚠️ **第 4 步是 2026-11-11 补的，缺了它就会出现「一直拿不到地址」。**
+        用户原话：「opendota 未解析的局没有 url，而你的补录像逻辑没有催解析和等解析」。
+
+        判据（实测，不是猜的）：未解析的场次在 OpenDota 上只有 **25 个字段**，
+        里面有 ``cluster``（413）但 ``replay_salt`` 是 ``None`` ——
+        **``replay_url`` 要等解析完成才会被写出来**。已解析的场次是 42 个字段，
+        ``replay_salt`` 有值。所以「拿不到地址」的常见原因不是「OpenDota 没收录」，
+        而是**这场比赛还没被解析**，而解析是要有人催的。
+
+        ⚠️ 不催就永远等不到的情况特别多：OpenDota 只在有人 ``POST /request/{id}``、
+        或有其他用户恰好解析过时才会解析某场。**靠「过几小时再试」是被动的**，
+        实测用户反复复盘同一场几千次也还是没有。
+
+        ⚠️ **Steam 官方那一级已从主链路移除**（用户 2026-11-11 定）。
+        它本该是最快的一条（直接给 ``cluster`` + ``replay_salt``，不必等第三方同步），
+        但 Valve 自 7.36 起就把 ``GetMatchDetails`` 打坏了，恒返回 HTTP 500 + 空 body，
+        官方 issue 已标 not planned；国内到 ``api.steampowered.com`` 还经常整段不可达。
+        留着它只会让**每份战报都多等一段必然失败的请求**。模块 ``dota_steam`` 保留，
+        等 Valve 修好可以直接接回来。
+
+        失败**不写缓存**：刚打完的比赛 OpenDota 可能还没同步，过几小时用同一场
+        再复盘就该能拿到。但同一进程内会记住这次没拿到（见
+        :attr:`_replay_url_misses`），避免连点团战深挖时反复烧额度。
+        ⚠️ 那个记忆**在内存里**，重启容器即清空 —— 重启后重复复盘同一场拿不到的
+        比赛，会把 OpenDota 再问一遍（这是要的行为，但也解释了「重启后变慢」）。
+
+        ⚠️ **misses 现在只管「同一进程内不重复烧额度」，不再等于「这场永远没有」。**
+        催过一次之后解析在排队，过一会儿可能就好了 —— 所以这里加了一层
+        **冷却**（:data:`REPLAY_URL_MISS_COOLDOWN`）：距上次失败超过冷却时间，
+        允许再问一次。原先是「进程内一旦失手就永久跳过」，用户实测的表现就是
+        「一直拿不到」—— 那既等不到解析完成，也不会再催一次。
+        """
+        url = str(match.get("replay_url") or "").strip()
+        if url:
+            return url
+        if not match_id:
+            return ""
+        cached = self._replay_url_cache_read(match_id)
+        if cached:
+            return cached
+        if self._replay_url_miss_fresh(match_id):
+            return ""
+
+        # ⚠️ **不再向 Steam 官方接口取址（2026-11-11 用户定）。**
+        # 原先是「Steam 官方 → OpenDota」两级兜底，Steam 排在前面是因为它不受第三方
+        # 同步节奏影响。但那一路实测恒返回 HTTP 500（Valve 自 7.36 起就坏了，官方
+        # issue 已标 not planned），每次都要纯等到超时；而国内到 api.steampowered.com
+        # 还经常整段不可达。**留着它只会给每一份战报增加一段必然失败的网络等待。**
+        # 结论：录像地址一律只从 OpenDota 取 —— 它会等 GC 同步，刚打完的局要过几小时，
+        # 但那是"慢一点拿到"，而 Steam 那条是"确定拿不到"。
+        # `dota_steam` 模块本身保留（测试与将来 Valve 修好后可直接接回来），
+        # 只是不再进入主链路。
+
+        client = getattr(self, "_opendota_client", None)
+        if client is None:
+            return ""
+        try:
+            data = await client.get_match(match_id)
+        except Exception as e:  # noqa: BLE001 - 兜底补地址，失败不能影响出报告
+            logger.info(
+                f"[dota2] 比赛 {match_id} 补取录像地址失败：{type(e).__name__}: {e}"
+            )
+            self._replay_url_mark_miss(match_id)
+            return ""
+
+        url = str((data or {}).get("replay_url") or "").strip()
+        if not url:
+            # ---------- 第 4 步：催解析 + 短暂等 salt ----------
+            #
+            # 走到这里说明 OpenDota 有这场、但还没解析完（``replay_salt`` 为 None，
+            # ``replay_url`` 自然也没有）。**光记一笔 misses 然后放弃是错的** ——
+            # 那等于把「还没被解析」当成「永远不会被解析」，而这恰恰是可以推一把的。
+            url = await self._nudge_replay_url(match_id, client)
+            if url:
+                return url
+            self._replay_url_mark_miss(match_id)
+            logger.info(
+                f"[dota2] 比赛 {match_id} 在 OpenDota 上还没有录像地址"
+                "（已催过解析，仍未完成；过几小时再试）"
+            )
+            return ""
+
+        self._replay_url_cache_write(match_id, url)
+        logger.info(f"[dota2] 比赛 {match_id} 的录像地址已从 OpenDota 补齐")
+        return url
+
+    async def _nudge_replay_url(
+        self, match_id: int, client, *, budget: float | None = None
+    ) -> str:
+        """催 OpenDota 解析这场比赛，并在预算内轮询等 ``replay_url`` 出现。
+
+        为什么需要这个方法（2026-11-11 用户指出）
+        ----------------------------------------
+        OpenDota **未解析的场次根本不会写 ``replay_url``** —— 实测未解析时只有
+        25 个字段，``cluster`` 有值（413）但 ``replay_salt`` 是 ``None``；解析完成后
+        变成 42 个字段，``replay_salt`` 才有值。而解析**不会自己发生**：
+        OpenDota 只在你 ``POST /request/{id}``、或有别的用户恰好解析过时才做。
+
+        所以「过几小时再试」是被动的 —— 没人催，过多久都还是没有。
+        原来的 `_match_replay_url` 拿不到地址就记一笔 misses 放弃，等于
+        把「还没被解析」误判成「永远不会被解析」。
+
+        代价控制
+        --------
+        - 解析是**异步**的：提交后 OpenDota 排队，通常几分钟到几十分钟。
+          所以这里**不长时间等**（默认 120 秒），只赌「排队快 + 刚好快好了」。
+          真正长等的场景是「单场复盘等数据完整」，那条路已有
+          ``_spawn_parse_task`` 在管，这里不重复等。
+        - ``/request/{id}`` 按 **10 倍额度**计费，所以本进程内**每场只催一次**
+          （记在 ``_replay_parsed_nudged``），轮询则用普通 ``get_match``（1 倍）。
+        - 预算耗尽就返回空串，**不写缓存** —— 下次复盘继续催，这才是对的语义。
+
+        Args:
+            match_id: 比赛 ID。
+            client: OpenDota 客户端（调用方已确认非 None）。
+            budget: 轮询等待的总秒数；None 表示用默认值。
+
+        Returns:
+            拿到的录像地址；预算内没等到则返回空串。
+        """
+        if not match_id:
+            return ""
+
+        # ---- 催一次（每场每进程只催一次）----
+        nudged = getattr(self, "_replay_parsed_nudged", None)
+        if nudged is None:
+            nudged = set()
+            self._replay_parsed_nudged = nudged
+
+        if match_id not in nudged:
+            nudged.add(match_id)
+            if self.cfg("parse_submit_request", True):
+                request = getattr(client, "request_parse", None)
+                if request is not None:
+                    try:
+                        ok = await request(match_id)
+                        logger.info(
+                            f"[dota2] 比赛 {match_id} 录像地址缺失，已提交解析申请"
+                            f"（{'成功' if ok else '未受理，可能已在队列中'}）"
+                        )
+                    except Exception as e:  # noqa: BLE001 - 催解析失败不影响出报告
+                        logger.info(
+                            f"[dota2] 比赛 {match_id} 提交解析申请失败："
+                            f"{type(e).__name__}: {e}"
+                        )
+
+        # ---- 轮询等 salt 出现 ----
+        if budget is None:
+            # 用户在配置里可以直接关掉（设 0），比如额度紧张时。
+            raw = self.cfg("replay_nudge_budget", REPLAY_URL_NUDGE_BUDGET)
+            try:
+                budget = max(0.0, float(raw))
+            except (TypeError, ValueError):
+                budget = REPLAY_URL_NUDGE_BUDGET
+        total = max(0.0, budget)
+        if total <= 0:
+            return ""
+        interval = REPLAY_URL_NUDGE_INTERVAL
+        waited = 0.0
+        attempt = 0
+        while waited < total:
+            await asyncio.sleep(min(interval, total - waited))
+            waited += interval
+            attempt += 1
+            try:
+                data = await client.get_match(match_id)
+            except Exception as e:  # noqa: BLE001 - 网络抖一下就再等一轮
+                logger.debug(
+                    f"[dota2] 比赛 {match_id} 轮询录像地址第 {attempt} 次失败："
+                    f"{type(e).__name__}"
+                )
+                continue
+            url = str((data or {}).get("replay_url") or "").strip()
+            if url:
+                self._replay_url_cache_write(match_id, url)
+                logger.info(
+                    f"[dota2] 比赛 {match_id} 催解析后等到录像地址"
+                    f"（第 {attempt} 次轮询，共 {waited:.0f}s）"
+                )
+                return url
+            logger.debug(
+                f"[dota2] 比赛 {match_id} 第 {attempt} 次轮询仍无录像地址"
+                f"（已等 {waited:.0f}s）"
+            )
+        logger.info(
+            f"[dota2] 比赛 {match_id} 催解析后 {waited:.0f}s 内仍未出录像地址"
+            "（解析在排队，下次复盘会再查）"
+        )
+        return ""
+
     async def _fetch_win_curve(
         self, match: dict, match_id: int, engine: str, workdir: str
     ) -> dict:
@@ -5434,7 +6180,7 @@ class Dota2Plugin(Star):
         if not status.ok:
             raise dota_replay_parse.ReplayError("录像解析环境未就绪")
 
-        url = str(match.get("replay_url") or "").strip()
+        url = await self._match_replay_url(match, match_id)
         if not url:
             raise dota_replay_parse.ReplayError("这场比赛没有可用的录像地址")
 
@@ -5530,8 +6276,10 @@ class Dota2Plugin(Star):
         match_id = int(match.get("match_id") or 0)
         if not match_id:
             return
-        if not str(match.get("replay_url") or "").strip():
-            return
+        # 这里**故意不判** ``match["replay_url"]``：STRATZ 主数据源的 match 里
+        # 本来就没有这个字段，判了就等于「STRATZ 模式下永远不预取」。地址缺失
+        # 由 :meth:`_match_replay_url` 在任务内部现补，补不到再安静地放弃 ——
+        # 预取本来就是这个任务唯一的目的，没必要在入口处多拦一道。
         try:
             self._win_curve_task(match, match_id)
         except Exception as e:  # noqa: BLE001 - 起任务失败不该影响主流程
@@ -5760,6 +6508,7 @@ class Dota2Plugin(Star):
                     f"开始等待：每 {_fmt_clock(seconds)} 检查一次，"
                     f"最多等 {minutes} 分钟，{fallback_hint}。\n"
                     f"报告出来后会自动发到本会话，你可以先去忙别的。\n"
+                    f"想确认它还在跑：`/d2 进度`。\n"
                     f"（不想等待：`/d2 单场 {match_id} skip` 直接用基础数据出报告）"
                 )
                 return
@@ -5790,45 +6539,65 @@ class Dota2Plugin(Star):
 
         # 附上焦点玩家近期的整体状态，让复盘更有上下文。
         # 焦点可能不止一位，逐位取；超过上限的只做本场复盘，避免提示词被撑爆。
-        headline, prompt = await self._build_match_prompt(
-            match=match,
-            heroes=heroes,
-            items=items,
-            match_id=match_id,
-            focus_ids=focus_ids,
-            focus_names=focus_names,
+        #
+        # 这条路径**也登记台账**：它虽然跑在 handler 里（用户刚发完指令，
+        # 能感觉到「在处理」），但模型这一步要等好几分钟，中途一句话都没有。
+        # 有了台账，用户随时可以 `/d2 进度` 看它是不是卡在写正文。
+        self._job_begin_match(
+            str(event.unified_msg_origin),
+            match_id,
+            str(event.get_sender_id()),
+            stage="正在整理这一场的数据",
         )
+        job_ok, job_note = False, ""
+        try:
+            headline, prompt = await self._build_match_prompt(
+                match=match,
+                heroes=heroes,
+                items=items,
+                match_id=match_id,
+                focus_ids=focus_ids,
+                focus_names=focus_names,
+                umo=event.unified_msg_origin,
+            )
 
-        report = await self._generate_report(event, prompt)
-        if report:
-            # 清单并进正文再发：图片版与文本版是同一份战报，
-            # 而不是「报告一条、清单一条」两份东西。
-            report = await self._append_fight_candidates(
-                report, match, focus_ids, focus_names, heroes
-            )
-            async for item in self._emit_report(event, headline, report):
-                yield item
-        else:
-            abilities, curve_ids = await self._match_render_constants(
-                match, focus_ids
-            )
-            raw = (
-                f"{headline}\n\n"
-                "⚠️ 未启用大模型分析或模型不可用，以下为从数据源获取的完整原始数据：\n\n"
-                + build_match_data_text(
-                    match,
-                    heroes,
-                    items,
-                    focus_account_ids=focus_ids or None,
-                    abilities=abilities,
-                    curve_ids=curve_ids,
+            report = await self._generate_report(event, prompt)
+            if report:
+                # 清单并进正文再发：图片版与文本版是同一份战报，
+                # 而不是「报告一条、清单一条」两份东西。
+                report = await self._append_fight_candidates(
+                    report, match, focus_ids, focus_names, heroes
                 )
+                async for item in self._emit_report(event, headline, report):
+                    yield item
+                job_ok, job_note = True, "复盘已发出"
+            else:
+                abilities, curve_ids = await self._match_render_constants(
+                    match, focus_ids
+                )
+                raw = (
+                    f"{headline}\n\n"
+                    + self._llm_failure_notice()
+                    + "\n以下为从数据源获取的完整原始数据：\n\n"
+                    + build_match_data_text(
+                        match,
+                        heroes,
+                        items,
+                        focus_account_ids=focus_ids or None,
+                        abilities=abilities,
+                        curve_ids=curve_ids,
+                    )
+                )
+                raw = await self._append_fight_candidates(
+                    raw, match, focus_ids, focus_names, heroes
+                )
+                for result in self._text_results(event, raw):
+                    yield result
+                job_note = "模型没出正文，已发原始数据"
+        finally:
+            self._jobs.finish(
+                ok=job_ok, note=job_note if job_ok else "", error="" if job_ok else job_note
             )
-            raw = await self._append_fight_candidates(
-                raw, match, focus_ids, focus_names, heroes
-            )
-            for result in self._text_results(event, raw):
-                yield result
 
     # ==================================================================
     # 指令：录像级团战复盘
@@ -5875,18 +6644,35 @@ class Dota2Plugin(Star):
             yield event.plain_result(status.describe())
             return
 
-        yield event.plain_result(self._spawn_fight_task(
-            event.unified_msg_origin, match_id, index, focus_raw
-        ))
+        yield event.plain_result(
+            self._spawn_fight_task(
+                event.unified_msg_origin,
+                match_id,
+                index,
+                focus_raw,
+                # 没点名时以「战报里那位焦点玩家」为主视角 —— 用指令路径的
+                # 取法（可回落本会话唯一绑定），与 `/d2 单场` 保持一致。
+                self._effective_binding(event)[0],
+            )
+        )
 
     def _spawn_fight_task(
-        self, umo: str, match_id: int, index: int, focus_raw: str
+        self,
+        umo: str,
+        match_id: int,
+        index: int,
+        focus_raw: str,
+        binding: dict | None = None,
     ) -> str:
         """起一个「单波团战深挖」后台任务，返回要告诉用户的那句话。
 
         指令（``/d2 团战``）与 AI 工具（``analyze_teamfight``）共用这一个入口：
         去重 key、排队提示、异常回调三处只要有一处各写一份，就会出现
         「同一波排两次」或者「工具路径漏了排队提示」这类不一致。
+
+        Args:
+            binding: 没点名焦点时用来回落的对象（本会话绑定）。两个入口取法不同，
+                见 :meth:`_analyze_fight_inner` 里那段注释。
         """
         key = self._fight_task_key(umo, match_id, index)
         existing = self._replay_tasks.get(key)
@@ -5898,7 +6684,9 @@ class Dota2Plugin(Star):
         except RuntimeError:  # pragma: no cover - 两个入口都在事件循环里
             return "[后台任务启动失败] 当前没有运行中的事件循环。"
 
-        task = loop.create_task(self._analyze_fight(umo, match_id, index, focus_raw))
+        task = loop.create_task(
+            self._analyze_fight(umo, match_id, index, focus_raw, binding)
+        )
         self._replay_tasks[key] = task
 
         # 具名闭包 + 默认参数：既躲开晚绑定，也能让类型推断过 mypy
@@ -5911,37 +6699,70 @@ class Dota2Plugin(Star):
         if waiting:
             return (
                 f"⏳ 已排队：前面还有 {waiting} 个解析任务。"
-                "（同一时刻只跑一个，避免把容器内存撑爆）"
+                "（同一时刻只跑一个，避免把容器内存撑爆）\n"
+                "随时可以用 `/d2 进度` 看排到哪一步了。"
             )
-        return "⏳ 开始解析录像并复盘这一波团，大约 1–3 分钟，完成后发到本会话。"
+        return (
+            "⏳ 开始解析录像并复盘这一波团，大约 1–3 分钟，完成后发到本会话。\n"
+            "等的时候可以用 `/d2 进度` 看它卡在哪一步。"
+        )
 
     async def _analyze_fight(
-        self, umo: str, match_id: int, index: int, focus_raw: str
+        self,
+        umo: str,
+        match_id: int,
+        index: int,
+        focus_raw: str,
+        binding: dict | None = None,
     ) -> None:
-        """后台任务：解析录像某一波团并让模型复盘（``/d2 团战`` 的落地）。"""
+        """后台任务：解析录像某一波团并让模型复盘（``/d2 团战`` 的落地）。
+
+        与单场复盘一样先登记台账：录像解析要下 37 MB 的 demo、再跑三次
+        JVM，用户完全看不到进度，`/d2 进度` 是唯一能分辨「在跑」和「挂了」
+        的地方。
+        """
+        job = self._job_begin_fight(
+            umo, match_id, index, stage="已受理，检查录像解析环境"
+        )
+        current = asyncio.current_task()
+        if current is not None:
+            self._jobs.watch(job.key, current)
+
+        ok, note = False, ""
         # 环境检测在**两条入口**都要做：指令路径在 d2_fight 里已经拦过一次，
         # 但工具路径（模型自己发起的）也走这里，缺 JRE 时同样得给安装提示。
         status = self._replay_runtime()
         if not status.ok:
             await self._send_to_session(umo, status.describe())
-            return
-        try:
-            await self._analyze_fight_inner(umo, match_id, index, focus_raw)
-        except asyncio.CancelledError:
-            raise
-        except dota_replay_parse.ReplayError as e:
-            await self._send_to_session(umo, f"❌ 录像解析失败：{e}")
-        except Exception as e:  # noqa: BLE001 - 后台任务不能把异常抛给事件循环
-            logger.exception(f"[dota2] 团战复盘失败：{e}")
-            await self._send_to_session(umo, f"❌ 团战复盘出错：{e}")
+            note = "录像解析环境不完整（缺 JRE 或解析引擎）"
+        else:
+            try:
+                ok, note = await self._analyze_fight_inner(
+                    umo, match_id, index, focus_raw, binding
+                )
+            except asyncio.CancelledError:
+                raise
+            except dota_replay_parse.ReplayError as e:
+                await self._send_to_session(umo, f"❌ 录像解析失败：{e}")
+                note = f"录像解析失败：{e}"
+            except Exception as e:  # noqa: BLE001 - 后台任务不能把异常抛给事件循环
+                logger.exception(f"[dota2] 团战复盘失败：{e}")
+                await self._send_to_session(umo, f"❌ 团战复盘出错：{e}")
+                note = f"团战复盘出错：{e}"
+        self._jobs.finish(ok=ok, note=note if ok else "", error="" if ok else note)
 
     async def _analyze_fight_inner(
-        self, umo: str, match_id: int, index: int, focus_raw: str
-    ) -> None:
+        self,
+        umo: str,
+        match_id: int,
+        index: int,
+        focus_raw: str,
+        binding: dict | None = None,
+    ) -> tuple[bool, str]:
         match = await self.api.get_match(match_id)
         if not match:
             await self._send_to_session(umo, f"❌ 查不到比赛 {match_id}。")
-            return
+            return False, f"查不到比赛 {match_id}"
         fights = match.get("teamfights") or []
         if not (1 <= index <= len(fights)):
             await self._send_to_session(
@@ -5949,7 +6770,7 @@ class Dota2Plugin(Star):
                 f"❌ 这场比赛只识别出 {len(fights)} 波团，没有第 {index} 波。\n"
                 f"用 `/d2 单场 {match_id}` 重新看一遍候选清单。",
             )
-            return
+            return False, f"这场比赛只有 {len(fights)} 波团，没有第 {index} 波"
 
         heroes = await self._heroes()
         items_const = await self._items()
@@ -5968,14 +6789,48 @@ class Dota2Plugin(Star):
                     + "\n".join(f"· {item}" for item in failed)
                     + "\n可以直接用 32 位账号 ID 再试一次。",
                 )
-                return
-        # 后台任务手里没有 event，刻意不做「会话绑定自动聚焦」：
-        # 绑定可能是别人的，自动聚焦到错的人比不聚焦更糟。没点名就按全局视角复盘。
+                return False, "点名的焦点玩家没解析出来"
+        # 没点名时的两级回落 —— 「以第一步战报里的焦点玩家为主视角」。
+        #
+        # 这里原本写的是「后台任务手里没有 event，刻意不做自动聚焦」，理由是
+        # 「绑定可能是别人的，聚焦到错的人比不聚焦更糟」。2026-11-10 用户推翻：
+        # 真实流程是**先看战报、再从战报里点名某一波团**，点进去却退回上帝视角，
+        # 等于把上一句问话丢了。
+        #
+        # ⚠️ 回落**不能只按绑定**（第一版就是这么写错的）：第一步的焦点可能是
+        # **手动指定**的（`/d2 单场 <id> 以祈求者为主视角`），那个人和本会话
+        # 绑定没有必然关系；按绑定回落会从「祈求者」跳到「我绑的号」。
+        # 所以顺序是：① 上一份战报实际用了谁 → ② 本会话绑定。
+        #
+        # ② 的 binding 由入口传进来，两个入口各按既有约定取：指令路径
+        # `_effective_binding(event)`（可回落本会话唯一绑定），工具路径
+        # `store.get_binding(umo, uid)`（只认提问者本人）—— 与
+        # `_auto_focus_binding` docstring 里那条差异保持一致。
+        if not focus_ids:
+            players_in_match = [
+                p for p in (match.get("players") or []) if isinstance(p, dict)
+            ]
+            recalled, recalled_names = self._recall_report_focus(
+                umo, match_id, players_in_match
+            )
+            if recalled:
+                focus_ids, focus_names = recalled, recalled_names
+                logger.info(
+                    f"[dota2] 团战复盘沿用上一份战报的焦点：{focus_names}"
+                )
+            elif binding:
+                self._auto_focus_binding(match, focus_ids, focus_names, binding)
 
         fight = fights[index - 1]
         label = f"比赛 {match_id} 第 {index} 波"
 
         # 真正的重活从这里开始，**必须**过队列：同一时刻只允许一个 JVM 在跑。
+        waiting = self.replay_queue.pending()
+        self._jobs.stage(
+            f"排队等录像解析（前面还有 {waiting} 个）"
+            if waiting
+            else "正在下载并解析录像（需要跑三次解析器）"
+        )
         block = await self.replay_queue.run(
             label,
             lambda: self._build_replay_block(
@@ -5984,19 +6839,22 @@ class Dota2Plugin(Star):
         )
 
         await self._send_to_session(umo, f"🔍 {label} 录像解析完成，正在生成复盘…")
+        self._jobs.stage("录像解析完成，正在整理数据并写复盘")
         prompt = self._fight_prompt(
-            match, fight, index, block, focus_ids, focus_names, heroes
+            match, fight, index, block, focus_ids, focus_names, heroes,
+            hero_block=self._hero_kb_block(match, heroes, focus_ids),
         )
         report = await self._generate_report_for_umo(umo, prompt)
         if report:
             # 团战复盘同样是「长报告」：走统一出口，先出图再发。
             # headline 传空 —— 上面那句「正在生成复盘」已经交代过上下文了。
             await self._deliver_report(umo, "", report, label="团战复盘")
-        else:
-            await self._send_to_session(
-                umo,
-                "⚠️ 未启用大模型分析或模型不可用，以下是这一波的原始数据：\n\n" + block,
-            )
+            return True, "团战复盘已发出"
+        await self._send_to_session(
+            umo,
+            self._llm_failure_notice() + "\n\n以下是这一波的原始数据：\n\n" + block,
+        )
+        return False, "模型没出正文，已发这一波的原始数据"
 
     async def _build_replay_block(
         self,
@@ -6037,7 +6895,7 @@ class Dota2Plugin(Star):
                 logger.info(f"[dota2] 比赛 {match_id} 的录像缓存版本过旧，已清理待重解析")
 
         if not os.path.exists(combat_path):
-            url = str(match.get("replay_url") or "").strip()
+            url = await self._match_replay_url(match, match_id)
             if not url:
                 raise dota_replay_parse.ReplayError(
                     "这场比赛没有可用的录像地址（录像通常只保留两周，过期就下不到了）"
@@ -6109,11 +6967,17 @@ class Dota2Plugin(Star):
         focus_ids: list[int],
         focus_names: dict[int, str],
         heroes: dict | None = None,
+        hero_block: str = "",
     ) -> str:
         """构造「以某个人为主视角复盘这一波团」的提示词。
 
         口径写死的几条：不许编造没给的字段；没有数据就说没有；
         判定失误必须同时给出「替代方案」和「当时来不来得及执行」。
+
+        Args:
+            hero_block: 已渲染好的「十人英雄判读参考」。放在数据块**之后** ——
+                这波团发生了什么先由数据说，参考只用来衡量「他本来该做什么」。
+                空串表示没有这份数据，整段跳过。
         """
         who = ""
         focus_hero = ""
@@ -6160,6 +7024,14 @@ class Dota2Plugin(Star):
                 "评价他之前先交代条件：经济差、等级差、装备差、队友在不在。"
                 "如果这波团本身就是「条件上打不过」，要明说，不要把必败团算成他的失误。"
             )
+            # 焦点是「谁」定的，不因这一波的战况而改。没有这条约束时，模型
+            # 会滑向「这一波谁数据最现眼就评谁」—— 那样主视角等于白设，
+            # 用户问的是「我这一波怎么样」，拿到的却是别人的发挥。
+            head.append(
+                "主视角自始至终是他，不因为这波谁的表现更出彩而换人。"
+                "如果他这一波没在场（数据里没有他的记录），就直接说这一波他没到场，"
+                "再顺带说清这波是怎么打完的，不要改去点评别人。"
+            )
         else:
             head.append("请复盘这波团：谁打得对、谁出了问题、关键转折在哪。")
 
@@ -6184,6 +7056,8 @@ class Dota2Plugin(Star):
             "",
             block,
         ]
+        if hero_block:
+            tail.extend(["", hero_block])
         return "\n".join(head + tail)
 
     # ==================================================================
@@ -7565,14 +8439,15 @@ class Dota2Plugin(Star):
             match_id=match_id,
             focus_ids=focus_ids,
             focus_names=focus_names,
+            umo=umo,
         )
         report = await self._generate_report_for_umo(umo, prompt)
         if not report:
             await self._send_quiet(
                 umo,
-                "⚠️ 比赛已经解析好了，但复盘没生成出来（大模型不可用或未启用）。\n"
-                f"可以先用 `/d2 模型测试` 自检，也可以手动看一次："
-                f"`/d2 单场 {match_id} skip`",
+                "⚠️ 比赛已经解析好了，但复盘没生成出来。\n"
+                f"{self._llm_failure_notice()}\n"
+                f"也可以手动看一次：`/d2 单场 {match_id} skip`",
             )
             return
         await self._send_quiet(umo, headline)
@@ -7830,7 +8705,7 @@ class Dota2Plugin(Star):
             api_key=api_key,
             base_url=str(self.cfg("llm_base_url", "") or ""),
             model=str(self.cfg("llm_model", "") or ""),
-            timeout=float(self.cfg("llm_timeout", 120) or 120),
+            timeout=float(self.cfg("llm_timeout", 300) or 300),
             proxy=str(self.cfg("llm_proxy", "") or ""),
         )
 
@@ -7880,10 +8755,68 @@ class Dota2Plugin(Star):
             logger.error(f"[dota2] 闲聊走专用模型出现异常：{e}", exc_info=True)
         return None
 
+    def _note_report_error(self, err: LLMRequestError) -> None:
+        """记住最近一次分析通道的失败原因，供兜底文案与任务台账取用。"""
+        self._last_report_error = (time.time(), err.kind, str(err).strip())
+
+    def _recent_report_error(
+        self, *, within: float = 900.0
+    ) -> tuple[str, str] | None:
+        """最近一次失败原因的 ``(类别, 文案)``；太久远（默认 15 分钟）则算无效。
+
+        时间窗是必须的：``_last_report_error`` 是实例级字段，上一场复盘超时
+        留下的记录如果一直有效，下一场正常的「模型未启用」也会被解释成超时。
+        """
+        at, kind, message = self._last_report_error
+        if not kind or not message:
+            return None
+        if time.time() - at > within:
+            return None
+        return kind, message
+
+    def _is_timeout_error(self, *, within: float = 300.0) -> bool:
+        """最近一次失败是不是超时（判据用，不是展示用）。"""
+        info = self._recent_report_error(within=within)
+        return bool(info and info[0] == "timeout")
+
+    def _llm_failure_notice(self) -> str:
+        """「为什么没出报告」的一句人话。
+
+        原来所有失败都共用一句「未启用大模型分析或模型不可用」，用户既分不清
+        该去改配置还是该重试，也看不出到底等了多久。这里按类别分开说，并且
+        **只陈述事实**（超时就说超时、限流就说限流），不猜原因。
+        """
+        info = self._recent_report_error()
+        if info is None:
+            return "⚠️ 未启用大模型分析（或本次没有可用的模型通道）"
+        kind, message = info
+        timeout = float(self.cfg("llm_timeout", 300) or 300)
+        if kind == "timeout":
+            return (
+                f"⏱ 模型 {timeout:.0f} 秒没有返回，这次放弃了。\n"
+                "没有自动换通道重试 —— 重试只会让你再等一轮。"
+                "可以过几分钟再发一次，或换一份更短的问法。"
+            )
+        if kind == "auth":
+            return "🔑 模型鉴权失败（Key 无效或没权限）。可以用 `/d2 模型测试` 自检。"
+        if kind == "config":
+            return "🔧 模型名或接口地址配置不对。可以用 `/d2 模型测试` 自检。"
+        if kind == "rate_limit":
+            return "⏳ 模型服务商限流了，等一会儿再试。"
+        if kind in ("network", "server"):
+            return f"🌐 连不上模型服务（{message}），稍后重试。"
+        return f"⚠️ 模型调用失败：{message}"
+
     async def _call_report_llm(
         self, prompt: str, *, umo: str = "", system_prompt: str = ""
     ) -> str | None:
         """生成**报告 / 分析**用的大模型调用：专用 Key 优先，失败回退 AstrBot。
+
+        **超时不回退**（2026-11-10 起）：换一条通道意味着从头再等一整轮，
+        用户看到的就是「十分钟什么都没发生，最后说模型不可用」。超时说明的
+        是「这个提示词+这个模型太慢」，不是「这个 Key 坏了」—— 重试解决不了
+        它，只会把等待时间翻倍。鉴权 / 限流 / 连不上 / 服务端 5xx 仍然回退，
+        因为那几类换通道**确实**有救。
 
         Args:
             prompt: 用户提示词。
@@ -7906,6 +8839,7 @@ class Dota2Plugin(Star):
         client = self._dedicated_client()
         if client is not None:
             started = time.time()
+            last_error: LLMRequestError | None = None
             try:
                 max_tokens = int(self.cfg("llm_max_tokens", 0) or 0)
                 text = await client.chat(
@@ -7915,9 +8849,18 @@ class Dota2Plugin(Star):
                     max_tokens=max_tokens or None,
                 )
             except LLMRequestError as e:
-                logger.error(f"[dota2] 专用模型调用失败（{client.endpoint}）：{e}")
+                last_error = e
+                logger.error(
+                    f"[dota2] 专用模型调用失败（{client.endpoint}，"
+                    f"类别 {e.kind}）：{e}"
+                )
+                self._note_report_error(e)
             except Exception as e:  # noqa: BLE001
+                last_error = LLMRequestError(
+                    f"专用模型调用出现异常：{e}", kind="other"
+                )
                 logger.error(f"[dota2] 专用模型调用出现异常：{e}", exc_info=True)
+                self._note_report_error(last_error)
             else:
                 # **成功也要留痕**。这里原来只 return，一声不响 —— 事后查
                 # 「这份战报到底走了哪条 key」时，日志里只有入口那轮的默认模型，
@@ -7928,6 +8871,23 @@ class Dota2Plugin(Star):
                     f"{len(text or '')} 字 · {time.time() - started:.1f}s）"
                 )
                 return text
+
+            # ---- 超时：立刻认输，不回退 ----
+            #
+            # 这一步是 2026-11-10 线上事故的直接修复：写作步 120 秒超时后
+            # 原代码回退到 AstrBot 提供商，回退通道又超时、又重试 5 次，
+            # 用户从 16:54 等到 17:06 只拿到「模型不可用」。
+            # 默认行为定为「不回退」，但仍留一个开关，方便用户在网络抖动
+            # 频繁、宁可多等也要出报告时改回去。
+            if (
+                last_error is not None
+                and last_error.kind == "timeout"
+                and not self.cfg("llm_fallback_on_timeout", False)
+            ):
+                logger.warning(
+                    "[dota2] 专用模型超时，不回退重试（再等一轮只会让用户多等一倍）"
+                )
+                return None
 
             if not self.cfg("llm_fallback_on_error", True):
                 logger.warning("[dota2] 已关闭回退，本次不做 AI 分析")
@@ -7947,6 +8907,9 @@ class Dota2Plugin(Star):
             text = await call_llm(provider, system_prompt, prompt)
         except Exception as e:  # noqa: BLE001
             logger.error(f"[dota2] 调用大模型失败: {e}", exc_info=True)
+            self._note_report_error(
+                LLMRequestError(f"回退通道调用失败：{e}", kind="other")
+            )
             return None
         # 回退成功同样要留痕 —— 只有这样「专用通道没走成」才在日志里可见。
         logger.info(
@@ -7989,12 +8952,80 @@ class Dota2Plugin(Star):
         """AstrBot 初始化完成后确保监听任务已启动。"""
         self._start_watcher()
 
+    def _watch_poll_plan(self, watchers: list[dict]) -> tuple[int, str]:
+        """算出这一轮该隔多久再轮询，外加一句给人看的理由。
+
+        **为什么按人数算。** 一轮的请求数等于「去重后的被监听玩家数」——
+        每位玩家一次 ``get_player_matches``。固定间隔在小规模时浪费额度、
+        在大规模时又把天额度吃光：插件来自市场，一个 bot 被多个群共用是常态，
+        监听 3 个人和监听 30 个人完全是两笔账，不该共用同一个 180 秒。
+
+        **按去重后的玩家数算，不是按监听条数**：同一位玩家被 5 个群监听，
+        一轮仍然只发一次请求（``_check_watchers`` 里的 ``groups`` 就是这个口径）。
+
+        **公式**：人数 × 86400 ÷ 每日预算。一轮发 N 次、一天要跑
+        86400/间隔 轮，两者相乘就是日消耗，反解出间隔。
+
+        **为什么按「天」而不按「分钟」**：实测 6 位玩家每分钟才 1.2 次请求，
+        只占 60 次/分钟里的 2%，日志里却每分钟都有 429 —— 分钟配额被同一个
+        出口 IP 上的其它消费者占着，我们发多少都控制不了它。能控制的只有
+        一天花掉多少，别把 3000 次/天 的天额度吃干净。
+
+        Args:
+            watchers: 当前监听者列表（``store.list_watchers()`` 的原样输出）。
+
+        Returns:
+            ``(间隔秒数, 理由)``。理由串只用来打日志，不参与任何判断。
+        """
+        fixed = max(60, int(self.cfg("watch_interval", 180) or 180))
+        if not bool(self.cfg("watch_auto_interval", True)):
+            return fixed, "配置里关掉了自动间隔"
+
+        accounts = {
+            w.get("account_id")
+            for w in watchers
+            if isinstance(w, dict) and isinstance(w.get("account_id"), int)
+        }
+        count = len(accounts)
+        if count == 0:
+            # 没人监听时根本不会发请求，间隔只影响 pending 队列的兑现频率，
+            # 用配置值空转即可（真正的兑现节拍是 PENDING_TICK_SECONDS）。
+            return fixed, "当前没有监听者"
+
+        raw = int(self.cfg("watch_daily_budget", WATCH_DAILY_REQUEST_BUDGET) or 0)
+        budget = raw if raw > 0 else WATCH_DAILY_REQUEST_BUDGET
+        budget = max(120, min(budget, WATCH_DAILY_REQUEST_CAP))
+
+        ideal = count * 86400 / budget
+        if ideal > WATCH_AUTO_MAX_INTERVAL:
+            # 撞上限了：人太多，按最长间隔也还是会超预算。如实说，别假装没问题。
+            # 但两种严重程度要分开说：3000 以内只是把余量吃掉了，
+            # 超过 3000 是真的会被限流，用户该做的处置完全不同。
+            need = count * 86400 // WATCH_AUTO_MAX_INTERVAL
+            if need > OPENDOTA_DAILY_QUOTA:
+                tail = (
+                    f"已超过 OpenDota 每天 {OPENDOTA_DAILY_QUOTA} 次的额度，"
+                    "这规模只能减少监听人数或拆分到多台机器")
+            else:
+                tail = (
+                    f"超过轮询预算 {budget}（仍在 {OPENDOTA_DAILY_QUOTA} 次额度内，"
+                    "但留给主动查战绩的余量变少）")
+            return WATCH_AUTO_MAX_INTERVAL, (
+                f"{count} 位玩家，已撞上限 {WATCH_AUTO_MAX_INTERVAL} 秒；"
+                f"这样一天仍要约 {need} 次，{tail}")
+        interval = int(round(max(WATCH_AUTO_MIN_INTERVAL, ideal)))
+        note = f"{count} 位玩家，预算 {budget} 次/天"
+        if ideal < WATCH_AUTO_MIN_INTERVAL:
+            note += f"（公式算得 {int(ideal)} 秒，已按下限 {WATCH_AUTO_MIN_INTERVAL} 秒）"
+        return interval, note
+
     async def _watch_loop(self) -> None:
         """监听主循环。
 
         内部是两个彼此独立的节拍：
 
-        - **轮询节拍**（``watch_interval``）：拉取被监听玩家的比赛列表，发现新比赛；
+        - **轮询节拍**（自动按监听人数计算，见 :meth:`_watch_poll_plan`）：
+          拉取被监听玩家的比赛列表，发现新比赛；
         - **处理节拍**（``PENDING_TICK_SECONDS``）：兑现 pending 队列里的 ``next_try_at``。
 
         两者必须解耦：早先只有一个节拍，导致 ``next_try_at`` 即使设成 60 秒，
@@ -8002,18 +9033,30 @@ class Dota2Plugin(Star):
         """
         # 启动后稍等一会，避免与 AstrBot 自身的启动流程抢资源
         await asyncio.sleep(15)
+        _start_interval, start_note = self._watch_poll_plan(
+            self.store.list_watchers()
+        )
+        self._poll_plan_shown = (_start_interval, start_note)
         logger.info(
-            f"[dota2] 监听循环已就绪：开始轮询（间隔 "
-            f"{max(60, int(self.cfg('watch_interval', 180)))} 秒，"
-            f"队列处理节拍 {PENDING_TICK_SECONDS} 秒）"
+            f"[dota2] 监听循环已就绪：开始轮询（间隔 {_start_interval} 秒 · "
+            f"{start_note}，队列处理节拍 {PENDING_TICK_SECONDS} 秒）"
         )
         while not self._stopping:
             try:
                 now = time.time()
                 if now >= self._next_poll_at:
-                    poll_interval = max(60, int(self.cfg("watch_interval", 180)))
+                    poll_interval, poll_note = self._watch_poll_plan(
+                        self.store.list_watchers()
+                    )
                     self._next_poll_at = now + poll_interval
                     self._poll_round += 1
+                    # 只在间隔或理由变化时打一条：加人 / 删人之后用户能立刻
+                    # 在日志里看到「为什么变慢了」，又不至于每几分钟刷一行。
+                    if (poll_interval, poll_note) != self._poll_plan_shown:
+                        self._poll_plan_shown = (poll_interval, poll_note)
+                        logger.info(
+                            f"[dota2] 轮询间隔调整为 {poll_interval} 秒（{poll_note}）"
+                        )
                     await self._check_watchers()
                 else:
                     await self._process_pending()
@@ -8109,7 +9152,9 @@ class Dota2Plugin(Star):
         （含测试）忽略它也不会改变行为。
         """
         try:
-            matches = await self.api.get_player_matches(account_id, limit=8)
+            # 轮询走**便宜的**那端（默认 STRATZ token），不占 OpenDota 的
+            # 出口 IP 日额度。见 :meth:`_watch_source`。
+            matches = await self._watch_source().get_player_matches(account_id, limit=8)
         except OpenDotaError as e:
             logger.warning(f"[dota2] 拉取玩家 {account_id} 比赛列表失败：{e}")
             return {"account_id": account_id, "error": str(e)}
@@ -8816,7 +9861,7 @@ class Dota2Plugin(Star):
         if not comment:
             return await self._send_quiet(
                 umo,
-                "⚠️ 未启用大模型分析或模型不可用，仅提供上述比赛概览。",
+                f"{self._llm_failure_notice()}\n仅提供上述比赛概览。",
                 match_id=None,
             )
 

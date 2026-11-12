@@ -38,6 +38,8 @@ from typing import Any, Callable
 from astrbot.api import logger
 
 try:  # 插件目录被作为包加载时的相对导入
+    from . import dota_stratz_events as stratz_events
+    from . import dota_stratz_rich as stratz_rich
     from .dota_api import (
         OpenDotaError,
     )
@@ -46,6 +48,8 @@ except ImportError:  # 兜底：以普通模块方式加载时，把插件目录
     import sys
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import dota_stratz_events as stratz_events  # type: ignore[no-redef]
+    import dota_stratz_rich as stratz_rich  # type: ignore[no-redef]
     from dota_api import (  # type: ignore[no-redef]
         OpenDotaError,
     )
@@ -124,6 +128,34 @@ STRATZ_LANE_ROLE: dict[str, int] = {
 }
 
 
+def _as_int(value: Any) -> int | None:
+    """安全转 int：``bool`` / ``None`` / 非数字一律返回 ``None``。"""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _trim_series(series: Any, duration: int | None) -> Any:
+    """把逐分钟曲线截到比赛实际分钟数。
+
+    STRATZ 的 ``radiantNetworthLeads`` / ``radiantExperienceLeads`` 比比赛
+    实际分钟数**多一个点**，而且最后那个点是赛后结算值：实测 9084367738
+    （44:02，46 个点）前一个点 +35011、最后一个点 -30429，经验曲线则直接归零。
+    不截断的话，提示词里会出现「天辉领先 35.7k」紧跟「44 分钟 -30.4k」的
+    自相矛盾数据。
+    """
+    if not isinstance(series, list) or not series:
+        return series
+    minutes = _as_int(duration)
+    if not minutes or minutes <= 0:
+        return series
+    limit = max(1, minutes // 60 + 1)
+    return series[:limit] if len(series) > limit else series
+
+
 class StratzUnavailableError(OpenDotaError):
     """STRATZ 通道不可用（未配置 Key / 鉴权失败 / 网络异常）。
 
@@ -189,6 +221,8 @@ class StratzClient:
         self._hero_cache_at = 0.0
         self._item_cache: dict[str, dict] | None = None
         self._item_cache_at = 0.0
+        self._ability_cache: dict[int, dict] | None = None
+        self._ability_cache_at = 0.0
 
     # ------------------------------------------------------------------
     # 底层请求
@@ -423,6 +457,9 @@ class StratzClient:
             "hero_name": hero.get("displayName"),
             "position": node.get("position"),
             "is_radiant": is_radiant,
+            # STRATZ 独有的表现分位指标（-100~100，相对同段位同英雄的偏差）。
+            # 只存不渲染：口径没在本仓库钉死前，不让它进提示词。
+            "imp": node.get("imp"),
             # 胜负的权威来源（STRATZ 直接给），player_win 会优先用它
             "isVictory": node.get("isVictory"),
         }
@@ -561,7 +598,13 @@ class StratzClient:
         """获取道具常量表。
 
         STRATZ 的 items 常量很大（含全部属性），这里按 OpenDota 的形状做一层
-        裁剪：只保留 ``id`` / ``dname`` / ``img`` 这些业务层真正用到的字段。
+        裁剪：只保留 ``id`` / ``dname`` / ``cost`` 这些业务层真正用到的字段。
+
+        ⚠️ ``cost`` 必须取 —— 它在 STRATZ 的 ``ItemType.stat.cost`` 下（实测
+        ``item_blink`` = 2250），不在顶层。早期版本没取，于是
+        ``ItemIndex.cost()`` 恒为 0，``summarize_item_timeline`` 的
+        「只看 ≥2000 的大件」条件把整段出装时间线全过滤掉了 ——
+        表现是「出装」小节静默消失，而不是报错。
         """
         import time
 
@@ -579,7 +622,7 @@ class StratzClient:
                 """
                 query Items {
                   constants {
-                    items { id name displayName }
+                    items { id name displayName stat { cost } }
                   }
                 }
                 """
@@ -589,9 +632,11 @@ class StratzClient:
                 key = str(row.get("name") or row.get("id") or "")
                 if not key:
                     continue
+                stat = row.get("stat") or {}
                 items[key] = {
                     "id": row.get("id"),
                     "dname": row.get("displayName"),
+                    "cost": stat.get("cost") if isinstance(stat, dict) else None,
                 }
         except OpenDotaError as e:
             logger.debug(f"[dota2] STRATZ 获取道具常量失败: {e}")
@@ -601,15 +646,83 @@ class StratzClient:
         self._item_cache_at = now
         return items
 
-    async def get_ability_names(self) -> dict[int, str]:
-        """技能常量表。
+    async def _ability_constants_raw(self) -> dict[int, dict]:
+        """技能常量表的原始缓存 ``abilityId → {name, display}``。
 
-        STRATZ 侧的 GraphQL 没有 OpenDota ``/constants/ability_ids`` 那种
-        「技能 ID → 技能名」的扁平映射，而且 STRATZ 的 ``get_match`` 也不返回
-        ``ability_upgrades_arr``，所以这里没有可复用的数据，直接返回空字典。
-        调用方按「拿不到就不输出技能加点小节」处理。
+        只发一次请求，:meth:`get_ability_names` 与
+        :meth:`get_ability_display_names` 都从这份缓存投影出来。
         """
-        return {}
+        import time
+
+        now = time.time()
+        if (
+            self._ability_cache is not None
+            and now - self._ability_cache_at < HERO_CACHE_TTL
+        ):
+            return self._ability_cache
+
+        rows: dict[int, dict] = {}
+        try:
+            data = await self._gql(
+                """
+                query Abilities {
+                  constants {
+                    abilities { id name language { displayName } }
+                  }
+                }
+                """
+            )
+            for row in ((data.get("constants") or {}).get("abilities")) or []:
+                ability_id = _as_int(row.get("id"))
+                name = row.get("name")
+                if ability_id is None or not isinstance(name, str) or not name:
+                    continue
+                language = row.get("language") or {}
+                display = language.get("displayName") if isinstance(language, dict) else None
+                rows[ability_id] = {
+                    "name": name,
+                    "display": display if isinstance(display, str) else None,
+                }
+        except OpenDotaError as e:
+            logger.debug(f"[dota2] STRATZ 获取技能常量失败: {e}")
+            rows = {}
+
+        self._ability_cache = rows
+        self._ability_cache_at = now
+        return rows
+
+    async def get_ability_names(self) -> dict[int, str]:
+        """技能常量表 ``abilityId → 内部名``（``dragon_knight_breathe_fire``）。
+
+        这里曾经直接 ``return {}``，注释写的是「STRATZ 没有扁平映射」——
+        **那是错的**：``constants.abilities`` 就是扁平表（实测 3041 条，
+        含天赋 ``special_bonus_unique_*``）。没有它，即使拿到了
+        ``abilityLearnEvents`` 也只能显示成一串数字。
+
+        返回**内部名**而不是 ``displayName``：渲染层
+        :func:`dota_format.ability_label` 会把 ``furion_sprout`` 转成
+        ``Furion Sprout``，与 OpenDota 链路的写法保持一致。``displayName``
+        只在少数条目上有值（天赋大多为空），拿它当主键会出现大量空标签。
+
+        拉取失败返回空表（调用方按「拿不到就不输出加点/技能小节」处理），
+        不让整场复盘因为一张常量表挂掉。
+        """
+        raw = await self._ability_constants_raw()
+        return {key: row["name"] for key, row in raw.items() if row.get("name")}
+
+    async def get_ability_display_names(self) -> dict[int, str]:
+        """技能显示名 ``abilityId → displayName``（``Sprout``）。
+
+        **只给天赋用**。天赋的内部名形如 ``special_bonus_unique_furion_6``，
+        经 :func:`dota_format.ability_label` 处理成
+        ``special bonus unique furion 6`` —— 那等于没翻译。它的
+        ``displayName`` 才是 ``-10s Nature\'s Call Cooldown`` 这种能读的东西。
+
+        普通技能不用它：内部名带英雄前缀（``furion_sprout``），比单独的
+        ``Sprout`` 更清楚是哪个英雄的技能。
+        """
+        raw = await self._ability_constants_raw()
+        return {key: row["display"] for key, row in raw.items() if row.get("display")}
 
     # ------------------------------------------------------------------
     # 玩家相关
@@ -1171,8 +1284,62 @@ class StratzClient:
     # ------------------------------------------------------------------
     # 比赛相关
     # ------------------------------------------------------------------
+    async def _event_constants(
+        self,
+    ) -> tuple[dict[int, str], dict[int, str], dict[int, str], dict[int, str]]:
+        """取事件映射需要的常量表：``heroId→npc 名``、``道具 id→内部名``、
+        ``技能 id→内部名``、``技能 id→显示名``。
+
+        四张表都有 12 小时缓存（:meth:`get_heroes` / :meth:`get_items` /
+        :meth:`get_ability_names` / :meth:`get_ability_display_names`，后两者
+        共用同一份原始缓存、只发一次请求），正常复盘不会额外发请求。
+        取失败时返回空表 —— 映射层会自己跳过需要常量的那几项
+        （``kills_log`` / ``purchase_log`` / 技能名），而不是让整场复盘因为
+        一张常量表挂掉。
+        """
+        hero_npc: dict[int, str] = {}
+        item_name_by_id: dict[int, str] = {}
+        ability_name_by_id: dict[int, str] = {}
+        ability_display_by_id: dict[int, str] = {}
+        try:
+            heroes = await self.get_heroes()
+        except OpenDotaError as e:
+            logger.debug(f"[dota2] STRATZ 取英雄常量失败，跳过击杀日志映射: {e}")
+            heroes = {}
+        for hero_id, info in (heroes or {}).items():
+            name = info.get("name") if isinstance(info, dict) else None
+            if isinstance(name, str) and name:
+                hero_npc[int(hero_id)] = name
+        try:
+            items = await self.get_items()
+        except OpenDotaError as e:
+            logger.debug(f"[dota2] STRATZ 取道具常量失败，跳过出装日志映射: {e}")
+            items = {}
+        for name, info in (items or {}).items():
+            item_id = info.get("id") if isinstance(info, dict) else None
+            if isinstance(item_id, int) and isinstance(name, str) and name:
+                item_name_by_id[item_id] = name
+        try:
+            ability_name_by_id = await self.get_ability_names()
+            ability_display_by_id = await self.get_ability_display_names()
+        except OpenDotaError as e:
+            logger.debug(f"[dota2] STRATZ 取技能常量失败，跳过加点/技能映射: {e}")
+            ability_name_by_id = {}
+            ability_display_by_id = {}
+        return hero_npc, item_name_by_id, ability_name_by_id, ability_display_by_id
+
     async def get_match(self, match_id: int, timeout_factor: float = 3.0) -> dict | None:
-        """获取单场比赛完整数据（OpenDota ``/matches/{id}`` 形状）。"""
+        """获取单场比赛完整数据（OpenDota ``/matches/{id}`` 形状）。
+
+        STRATZ 的原始形态与 OpenDota 差得远：它给的是**事件流**
+        （逐次击杀/死亡/插眼/购买/拆建筑），而 OpenDota 给的是**聚合结果**
+        （``teamfights`` / ``objectives`` / ``purchase_log`` / ``obs_log``）。
+        聚合工作全部委托给 :mod:`dota_stratz_events`，这里只负责取数与改名。
+
+        ``playbackData`` 里**故意不取** ``playerUpdatePositionEvents`` ——
+        那是每秒一条的全场轨迹，一场几十万条，拉一次几十 MB，而业务层
+        没有任何地方消费它。
+        """
         data = await self._gql(
             """
             query Match($id: Long!) {
@@ -1183,12 +1350,19 @@ class StratzClient:
                 didRadiantWin
                 gameMode
                 lobbyType
+                firstBloodTime
                 radiantKills
                 direKills
                 parsedDateTime
                 averageRank
                 radiantNetworthLeads
                 radiantExperienceLeads
+                towerDeaths { time npcId isRadiant attacker }
+                pickBans { isPick heroId order bannedHeroId isRadiant }
+                playbackData {
+                  buildingEvents { time npcId type isRadiant }
+                  roshanEvents { time hp }
+                }
                 players {
                   steamAccountId
                   playerSlot
@@ -1207,6 +1381,9 @@ class StratzClient:
                   heroHealing
                   networth
                   level
+                  imp
+                  award
+                  invisibleSeconds
                   lane
                   position
                   steamAccount { name }
@@ -1218,6 +1395,41 @@ class StratzClient:
                   item4Id
                   item5Id
                   neutral0Id
+                  stats {
+                    killEvents { time target byAbility byItem gold xp isSolo isGank }
+                    deathEvents { time attacker target byAbility goldFed xpFed timeDead positionX positionY goldLost isDieBack isBurst isEngagedOnDeath isAttemptTpOut isWardWalkThrough }
+                    wards { time type positionX positionY }
+                    itemPurchases { time itemId }
+                    runes { time rune }
+                    heroDamageReport {
+                      dealtTotal { physicalDamage magicalDamage pureDamage selfHeal allyHeal stunCount stunDuration disableCount disableDuration slowCount slowDuration }
+                      receivedTotal { physicalDamage magicalDamage pureDamage heal stunCount stunDuration disableCount disableDuration slowCount slowDuration }
+                      dealtSourceAbility { abilityId count amount }
+                      dealtSourceItem { itemId count amount }
+                      dealtTargets { target amount }
+                    }
+                    abilityCastReport { abilityId count targets { target count damage duration } }
+                    itemUsed { itemId count }
+                    actionReport { moveToPosition moveToTarget attackPosition attackTarget castPosition castTarget castNoTarget heldPosition glyphCast scanUsed pingUsed }
+                    farmDistributionReport {
+                      creepType { id count gold xp }
+                      neutralLocation { id count gold xp }
+                      ancientLocation { id count gold xp }
+                      buildings { id count gold xp }
+                      buyBackGold
+                      bountyGold { id count gold xp }
+                    }
+                    wardDestruction { time gold experience isWard }
+                    tripsFountainPerMinute
+                    campStack
+                  }
+                  playbackData {
+                    goldEvents { time amount }
+                    experienceEvents { time amount }
+                    csEvents { time }
+                    buyBackEvents { time }
+                    abilityLearnEvents { time abilityId levelObtained level isUltimate isTalent isMaxLevel }
+                  }
                 }
               }
             }
@@ -1227,6 +1439,12 @@ class StratzClient:
         match = data.get("match")
         if not isinstance(match, dict) or not match.get("players"):
             return None
+
+        # 事件映射需要的两张常量表（英雄 npc 名、道具 id→名）。都有 12h 缓存，
+        # 正常复盘只会命中缓存；拿不到就降级成「少映射几项」，绝不让整场失败。
+        hero_npc, item_name_by_id, ability_name_by_id, ability_display_by_id = (
+            await self._event_constants()
+        )
 
         players = [
             self._normalize_player(p)
@@ -1253,12 +1471,84 @@ class StratzClient:
                 normalized["player_slot"] = 128 + dire_idx
                 dire_idx += 1
             normalized["is_radiant"] = bool(is_radiant)
+            # 事件映射吃的是**原始节点**（stats / playbackData 都在它下面），
+            # 但聚类要按 slot 排序、要按阵营归属，所以把这两项回写到 raw 上。
+            # 不这么做就只能传 normalize 后的 dict，而它没有 stats 字段 ——
+            # 第一版就是这么写的，结果 teamfights 恒为 0。
+            raw["player_slot"] = normalized["player_slot"]
+            raw["hero_id"] = normalized["hero_id"]
+            raw["is_radiant"] = normalized["is_radiant"]
+
+            # ---- 事件流 → 逐分钟曲线 / 出装 / 击杀 / 视野 / 吃符 ----
+            normalized.update(
+                stratz_events.build_player_series(raw, match.get("durationSeconds"))
+            )
+            purchases = stratz_events.build_purchase_log(raw, item_name_by_id)
+            if purchases:
+                normalized["purchase_log"] = purchases
+            kills = stratz_events.build_kills_log(raw, hero_npc)
+            if kills:
+                normalized["kills_log"] = kills
+            normalized.update(stratz_events.build_ward_logs(raw))
+            # 十人数据行与「视野收支」小节读的是这三个汇总字段，而不是日志本身。
+            # 不补就会出现「这个辅助明明插了 34 个眼，表里却写假眼-」。
+            if normalized.get("obs_log"):
+                normalized["obs_placed"] = len(normalized["obs_log"])
+            if normalized.get("sen_log"):
+                normalized["sen_placed"] = len(normalized["sen_log"])
+            if purchases:
+                normalized["purchase_ward_observer"] = sum(
+                    1 for row in purchases if "ward_observer" in str(row.get("key"))
+                )
+                normalized["purchase_ward_sentry"] = sum(
+                    1 for row in purchases if "ward_sentry" in str(row.get("key"))
+                )
+            runes = stratz_events.build_runes_log(raw)
+            if runes:
+                normalized["runes_log"] = runes
+            buybacks = stratz_events.build_buyback_log(raw)
+            if buybacks:
+                normalized["buyback_log"] = buybacks
+
+            # ---- STRATZ 独有数据：不转译，原样保留结构 ----
+            # 这些是 OpenDota 给不了的东西（加点明细含天赋、控制次数与时长、
+            # 技能施放对象、扫描/塔防次数、经济来源分解、反眼收益）。
+            # 塞进 OpenDota 字段会把多维信息压扁，所以各占各的键。
+            normalized.update(
+                stratz_rich.build_ability_build(
+                    raw, ability_name_by_id, ability_display_by_id
+                )
+            )
+            normalized.update(
+                stratz_rich.build_damage_report(
+                    raw, ability_name_by_id, item_name_by_id, hero_npc
+                )
+            )
+            normalized.update(
+                stratz_rich.build_usage_report(
+                    raw, ability_name_by_id, item_name_by_id, hero_npc
+                )
+            )
+            normalized.update(stratz_rich.build_action_report(raw))
+            normalized.update(stratz_rich.build_farm_report(raw))
+            normalized.update(stratz_rich.build_ward_destruction(raw))
+            normalized.update(stratz_rich.build_profile(raw, hero_npc))
+            # 十人表读的是 ``stuns``（单值，单位秒）。STRATZ 把它藏在
+            # heroDamageReport.dealtTotal 里，OpenDota 则是顶层字段 ——
+            # 这里补一个同名键，让十人表与焦点行不用区分数据源。
+            # ``0.0`` 也要落：那是「本场确实没打出眩晕」的观测值，
+            # 与「拿不到控制数据」是两件事（后者才该显示成 ``-``）。
+            control_dealt = normalized.get("control_dealt") or {}
+            stun = control_dealt.get("stun") or {}
+            if stun.get("seconds") is not None and stun.get("count") is not None:
+                normalized["stuns"] = stun["seconds"]
 
         radiant_win = match.get("didRadiantWin")
         radiant_kills = match.get("radiantKills") or []
         dire_kills = match.get("direKills") or []
+        duration = _as_int(match.get("durationSeconds"))
 
-        return {
+        result: dict[str, Any] = {
             "match_id": match.get("id"),
             "start_time": match.get("startDateTime"),
             "duration": match.get("durationSeconds"),
@@ -1271,8 +1561,12 @@ class StratzClient:
             if radiant_kills
             else None,
             "dire_score": sum(int(x or 0) for x in dire_kills) if dire_kills else None,
-            "radiant_gold_adv": match.get("radiantNetworthLeads"),
-            "radiant_xp_adv": match.get("radiantExperienceLeads"),
+            # ⚠️ STRATZ 的这两条曲线比比赛实际分钟数**多一个点**，且最后那个点
+            # 是赛后结算值：实测 9084367738（44:02）长度 46，前一个点 +35011，
+            # 最后一个点 -30429；经验曲线则直接归零。不截断的话提示词里会出现
+            # 「天辉领先 35.7k」紧跟着「44 分钟变成 -30.4k」的自相矛盾。
+            "radiant_gold_adv": _trim_series(match.get("radiantNetworthLeads"), duration),
+            "radiant_xp_adv": _trim_series(match.get("radiantExperienceLeads"), duration),
             "average_rank": match.get("averageRank"),
             # 供 is_parsed 判定：STRATZ 有 parsedDateTime 即视为已解析
             "od_data": {
@@ -1283,6 +1577,33 @@ class StratzClient:
             },
             "_stratz": True,
         }
+
+        first_blood = _as_int(match.get("firstBloodTime"))
+        if first_blood is not None and first_blood >= 0:
+            result["first_blood_time"] = first_blood
+
+        # ---- 比赛级事件聚合（空就不写键，免得渲染层看到空列表还去开小节）----
+        # 注意传的是 raw_rows：build_* 需要 stats / playbackData 这些原始子树，
+        # 上面已经补好了 player_slot / hero_id / is_radiant 三个键。
+        objectives = stratz_events.build_objectives({**match, "players": raw_rows})
+        if objectives:
+            result["objectives"] = objectives
+        picks_bans = stratz_events.build_picks_bans(match)
+        if picks_bans:
+            result["picks_bans"] = picks_bans
+        teamfights = stratz_events.build_teamfights(
+            {**match, "players": raw_rows}, hero_npc
+        )
+        if teamfights:
+            result["teamfights"] = teamfights
+        result["_stratz_events"] = {
+            "focusable": {
+                "objectives": len(objectives),
+                "picks_bans": len(picks_bans),
+                "teamfights": len(teamfights),
+            }
+        }
+        return result
 
     async def request_parse(self, match_id: int) -> bool:
         """STRATZ 不支持用户主动提交解析（它自己排队解析）。
