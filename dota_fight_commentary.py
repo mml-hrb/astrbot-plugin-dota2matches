@@ -5,7 +5,6 @@ import json
 import math
 import re
 from collections import defaultdict
-from typing import Any
 
 
 def evidence(data: dict, combat: list, t0: float, t1: float, norm, label) -> dict:
