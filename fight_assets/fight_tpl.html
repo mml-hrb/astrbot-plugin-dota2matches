@@ -1,0 +1,2029 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>团战回放</title>
+<style>
+  :root{
+    --bg:#0f1218; --panel:#171c25; --panel2:#1e242f; --line:#2a3242;
+    --txt:#e6ebf2; --dim:#8a94a6; --dim2:#5c6678;
+    --radiant:#4caf7d; --dire:#d9534f;
+    --stun:#f0a020; --sil:#9b6df0; --slow:#3aa0c8;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--txt);
+    font:13px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+    padding:14px;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1560px;margin:0 auto}
+
+  header{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;
+    padding-bottom:10px;border-bottom:1px solid var(--line);margin-bottom:12px}
+  h1{font-size:17px;font-weight:600;letter-spacing:.03em}
+  .sub{color:var(--dim);font-size:12px}
+  .clock{margin-left:auto;font:600 20px/1 ui-monospace,monospace;
+    color:#7fd0ff;letter-spacing:.04em}
+
+  .grid{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:12px;
+    align-items:start}
+  @media(max-width:1180px){.grid{grid-template-columns:1fr}}
+
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+    padding:10px;margin-bottom:10px}
+  .card h2{font-size:12px;font-weight:600;color:var(--dim);
+    letter-spacing:.08em;text-transform:uppercase;margin-bottom:8px}
+
+  #mapWrap{position:relative;background:#0b0e13;border-radius:6px;overflow:hidden}
+  #map{display:block;width:100%;height:auto;cursor:grab}
+  #map.drag{cursor:grabbing}
+  .legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px;font-size:11px;color:var(--dim)}
+  .legend i{display:inline-block;width:8px;height:8px;border-radius:50%;
+    margin-right:4px;vertical-align:middle}
+
+  .ctrl{display:flex;align-items:center;gap:10px;margin-top:10px}
+  .btn{background:var(--panel2);border:1px solid var(--line);color:var(--txt);
+    border-radius:6px;padding:6px 12px;cursor:pointer;font-size:12px;
+    transition:.15s;font-family:inherit;white-space:nowrap}
+  .btn:hover{background:#252d3a;border-color:#3a4557}
+  .btn.pri{background:#1d4d7a;border-color:#2b6ea8}
+  .btn.pri:hover{background:#23608f}
+  input[type=range]{flex:1;accent-color:#3aa0c8;height:4px}
+
+  .grid > *{min-width:0}
+  .comment-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+  .comment-head h2{margin:0}
+  .comment-status{font-size:11px;color:#7fd0ff}
+  .comment-title{font-size:14px;margin-bottom:6px;overflow-wrap:anywhere}
+  .comment-text{white-space:pre-wrap;overflow-wrap:anywhere;color:#c3cddd}
+  .comment-time{font:11px/1.5 ui-monospace,monospace;color:#7fd0ff}
+  #commentaryList{max-height:320px;overflow-y:auto;scrollbar-width:thin}
+  .cue{display:block;width:100%;text-align:left;background:transparent;color:var(--txt);
+    border:1px solid transparent;border-radius:5px;padding:8px;margin-bottom:4px;
+    cursor:pointer;font:inherit;overflow-wrap:anywhere}
+  .cue:hover{background:var(--panel2)}
+  .cue:focus-visible{outline:2px solid #7fd0ff;outline-offset:-2px}
+  .cue.now{background:#1d3350;border-color:#2b6ea8}
+  .cue strong{display:block;margin:3px 0}
+  .cue p{white-space:pre-wrap;color:var(--dim)}
+  #conclusion{transition:border-color .2s,box-shadow .2s}
+  #conclusion.ended{border-color:#e6b862;box-shadow:0 0 0 2px rgba(230,184,98,.18)}
+  #conclusion.ended h2{color:#e6b862}
+  .conclusion-field{margin-top:10px}
+  .conclusion-field dt{font-size:11px;color:var(--dim);margin-bottom:3px}
+  .conclusion-field dd{white-space:pre-wrap;overflow-wrap:anywhere}
+  @media(max-width:600px){
+    body{padding:8px}
+    .ctrl{gap:6px;flex-wrap:wrap}
+    #seek{min-width:70px}
+    #commentaryList{max-height:260px}
+  }
+
+  #heroes{display:grid;grid-template-columns:1fr 1fr;gap:2px 8px}
+  @media(max-width:820px){#heroes{grid-template-columns:1fr}}
+  .hero{display:grid;grid-template-columns:auto 1fr auto;gap:7px;
+    align-items:center;padding:4px 5px;border-radius:5px;
+    cursor:pointer;transition:.12s;border:1px solid transparent}
+  .hero:hover{background:var(--panel2)}
+  .hero.on{background:#1b2534;border-color:#2b6ea8}
+  .hero.dead{opacity:.38}
+  .av{width:26px;height:26px;border-radius:4px;display:block;object-fit:cover;
+    box-shadow:0 0 0 1.5px rgba(0,0,0,.5)}
+  .av.fb{background:#2a3242}
+  .hname{font-size:12px;display:flex;align-items:baseline;gap:5px;min-width:0}
+  .hname b{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .hpbar{position:relative;height:4px;background:#232a36;border-radius:2px;
+    overflow:hidden;margin-top:2px}
+  .hpbar i{position:absolute;left:0;top:0;bottom:0;border-radius:2px}
+  .hpnum{font:10px/1 ui-monospace,monospace;color:var(--dim);min-width:62px;
+    text-align:right}
+
+  #feed{max-height:700px;overflow-y:auto;font-size:12px;scrollbar-width:thin}
+  #feed::-webkit-scrollbar{width:6px}
+  #feed::-webkit-scrollbar-thumb{background:#2f3849;border-radius:3px}
+  .ev{display:grid;grid-template-columns:44px 1fr;gap:6px;padding:3px 5px;
+    border-radius:4px;margin-bottom:1px;line-height:1.45;cursor:pointer}
+  .ev:hover{background:var(--panel2)}
+  .ev.now{background:#1d3350;box-shadow:inset 2px 0 0 #3aa0c8}
+  .ev .ts{font:10px/1.5 ui-monospace,monospace;color:var(--dim2)}
+  .ev .tx{min-width:0;overflow-wrap:anywhere}
+  .tag{display:inline-block;font-size:9px;padding:1px 4px;border-radius:3px;
+    margin-right:4px;vertical-align:1px;font-weight:600;letter-spacing:.04em}
+  .t-spell{background:#1d4d7a;color:#9fd4f7}
+  .t-item{background:#4a3a1d;color:#f0c674}
+  .t-kill{background:#4d1d1d;color:#ff9b9b}
+  .t-ctrl{background:#3d2a5a;color:#c4a8f7}
+
+  .who{font-weight:600}
+  .r0{color:var(--radiant)} .r1{color:var(--dire)}
+  .muted{color:var(--dim2)}
+  .kbd{font:10px/1 ui-monospace,monospace;background:var(--panel2);
+    border:1px solid var(--line);border-radius:3px;padding:3px 6px;color:var(--dim);
+    cursor:pointer;user-select:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>团战回放</h1>
+    <span class="sub" id="meta"></span>
+    <span class="clock" id="clock">00:00.0</span>
+  </header>
+
+  <div class="grid">
+    <div>
+      <div class="card">
+        <div id="mapWrap"><canvas id="map"></canvas></div>
+        <div class="legend">
+          <span><i style="background:var(--radiant)"></i>天辉</span>
+          <span><i style="background:var(--dire)"></i>夜魇</span>
+          <span><i style="background:var(--stun)"></i>眩晕</span>
+          <span><i style="background:var(--sil)"></i>沉默</span>
+          <span><i style="background:var(--slow)"></i>减速</span>
+          <span class="muted">拖拽平移 · 滚轮缩放 · 双击复位</span>
+          <span>技能标签色条＝施法阵营 · ○ 范围 / → 直线 / ◇ 单体 · 图形仅作示意</span>
+        </div>
+        <div class="ctrl">
+          <button class="btn pri" id="play">▶ 播放</button>
+          <input type="range" id="seek" min="0" max="1000" value="0" step="1">
+          <span class="kbd" id="speed">1x</span>
+          <span class="kbd" id="follow">跟随镜头</span>
+        </div>
+      </div>
+
+      <div class="card" id="currentCommentary">
+        <div class="comment-head">
+          <h2>当前解说</h2><span class="comment-status" id="commentaryStatus"></span>
+          <span class="comment-time" id="commentaryTime"></span>
+        </div>
+        <h3 class="comment-title" id="commentaryTitle">暂无解说</h3>
+        <p class="comment-text" id="commentaryText">此回放未附带文字解说。</p>
+      </div>
+
+      <div class="card">
+        <h2>参战英雄</h2>
+        <div id="heroes"></div>
+      </div>
+    </div>
+
+    <div>
+      <div class="card" id="conclusion">
+        <h2 id="conclusionHeading">最终结论</h2>
+        <h3 class="comment-title" id="conclusionVerdict">暂无结论</h3>
+        <dl id="conclusionFields"></dl>
+      </div>
+      <div class="card">
+        <h2 id="commentaryListTitle">解说列表 · 点击跳转</h2>
+        <div id="commentaryList"></div>
+      </div>
+      <div class="card">
+        <h2>事件流</h2>
+        <div id="feed"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+/*__DATA__*/
+
+// =====================================================================
+// 基础
+// =====================================================================
+const D = DATA, M = D.meta, H = D.heroes, F = D.frames;
+const DUR = M.dur;
+const IDX = {};                       // slug -> 英雄下标
+H.forEach((m, i) => { IDX[m.slug] = i; });
+const CN = i => H[i].n;
+
+const $ = s => document.querySelector(s);
+const cv = $('#map'), g = cv.getContext('2d');
+
+let cur = 0, playing = false, speed = 1;
+const SPEEDS = [0.25, 0.5, 1, 2, 4];
+
+// =====================================================================
+// 坐标系 —— 这里是最容易错的地方，写清楚
+// =====================================================================
+// • DOTA2 英雄坐标来自 CBodyComponent 的 cell*128 + vec，范围 0–32768。
+// • 官方小地图底图只画 **实心区域**，对应世界坐标 [WORLD_LO, WORLD_HI]。
+//   按 0–32768 直接铺，整张图会偏移并缩小一遍。
+// • 世界 y 轴向上、画布 y 轴向下，**必须翻转**。
+//   天辉泉水在左下 → 世界坐标 (9600,9600)；夜魇在右上 → (23300,22800)。
+//   少了翻转就把天辉画到左上角去（这正是上一版「位置不对」的原因）。
+const WORLD_LO = (M.world && M.world[0]) || 8192;
+const WORLD_HI = (M.world && M.world[1]) || 24576;
+const WORLD_SPAN = WORLD_HI - WORLD_LO;
+
+// 底图自然尺寸（内联 data URI 加载后填）
+let MAPW = 1024, MAPH = 1024;
+
+const mapImg = new Image();
+let mapReady = false;
+mapImg.onload = () => { mapReady = true; MAPW = mapImg.naturalWidth; MAPH = mapImg.naturalHeight; draw(); };
+if (D.map) mapImg.src = D.map;
+
+// 头像
+const AV = {};
+for (const [slug, uri] of Object.entries(D.avatars || {})) {
+  const im = new Image(); im.src = uri; AV[slug] = im;
+}
+
+// =====================================================================
+// 视口：世界坐标 <-> 屏幕像素
+// =====================================================================
+const view = { cx: 16384, cy: 16384, scale: 1, base: 1 };
+
+function W2S(x, y) {
+  const w = cv.clientWidth, h = cv.clientHeight;
+  return [
+    (x - view.cx) * view.scale + w / 2,
+    // 负号 = 翻转 y
+    (view.cy - y) * view.scale + h / 2,
+  ];
+}
+function S2W(sx, sy) {
+  const w = cv.clientWidth, h = cv.clientHeight;
+  return [
+    (sx - w / 2) / view.scale + view.cx,
+    view.cy - (sy - h / 2) / view.scale,
+  ];
+}
+
+// =====================================================================
+// 取景：以「主战场」为中心，远处的人用边缘箭头提示
+// =====================================================================
+// 为什么不直接把 10 个人全框进来：一场团战常有人在上路带线、在后排站桩、
+// 刚从泉水走过来，10 人包围盒能横跨半张图 —— 全框进来，团战区就被缩成一团看不清。
+// 反过来「只框主簇、把远处的剪掉」也不行，人会凭空消失。
+// 所以取折中：框住「最近的大多数」，超出的在画面边缘画箭头指方向。
+function liveBox(t) {
+  const i = fi(t), pts = [];
+  for (const h of Object.keys(F.x)) {
+    if (F.al[h][i] === 0) continue;
+    const x = F.x[h][i], y = F.y[h][i];
+    if (x == null || y == null) continue;
+    pts.push({ h, x, y });
+  }
+  if (pts.length < 2) return null;
+
+  const med = k => {
+    const a = pts.map(p => p[k]).sort((u, v) => u - v);
+    return a[Math.floor(a.length / 2)];
+  };
+  const mx = med('x'), my = med('y');
+
+  // ---- 先剔除「脱节者」，再定框 ----
+  // 这是画面糊成一片的真正原因：团战 10 个人里总有 1~2 个在远处（狙击手站高地、
+  // 有人刚复活从泉水赶来），10 人包围盒能横跨半张地图。旧算法用 MAX_SPAN=13000
+  // 兜底，结果 t=8 时把人框在 11500 单位的窗口里 —— 头像只有 25px，
+  // 72px 的原图缩到这个尺寸，全糊成色块，谁也认不出谁。
+  //
+  // 现在按「到中位点的距离」取 80 分位，明显超出的先不算进框。
+  // 他们不会消失 —— 仍然会在画面边缘画箭头 + 小头像指过去。
+  const dists = pts.map(p => ({ p, d: Math.hypot(p.x - mx, p.y - my) }))
+    .sort((a, b) => a.d - b.d);
+  const q80 = dists[Math.floor((dists.length - 1) * 0.8)].d;
+  const OUTLIER = Math.max(1500, q80 * 1.35);     // 下限 1500：打得再散也不至于只框两人
+
+  let core = dists.filter(o => o.d <= OUTLIER).map(o => o.p);
+  // 主簇至少留 6 人：开局大家还在各条路上走时，别把框收得太窄
+  if (core.length < Math.min(6, pts.length)) {
+    core = dists.slice(0, Math.min(6, pts.length)).map(o => o.p);
+  }
+
+  let box = null;
+  for (const p of core) {
+    box = box ? {
+      x0: Math.min(box.x0, p.x), x1: Math.max(box.x1, p.x),
+      y0: Math.min(box.y0, p.y), y1: Math.max(box.y1, p.y),
+    } : { x0: p.x, x1: p.x, y0: p.y, y1: p.y };
+  }
+  if (!box) return null;
+
+  // 留白：够放头像半径 + 技能特效半径即可。之前 12% / 420 偏松，
+  // 因为框本身就大，再留白等于又缩了一圈。
+  const pad = Math.max(380, Math.max(box.x1 - box.x0, box.y1 - box.y0) * 0.10);
+  return { x0: box.x0 - pad, y0: box.y0 - pad, x1: box.x1 + pad, y1: box.y1 + pad };
+}
+
+/** 把视野框夹进地图实心区域内。
+ *  底图只覆盖 [WORLD_LO, WORLD_HI]，视野一旦越出去，越出去的部分就是纯黑 ——
+ *  看起来像「地图没铺满」，实际是取景框比地图大（这个坑踩过一次）。*/
+function clampToMap(box) {
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (!w || !h) return box;
+  const span = WORLD_HI - WORLD_LO;
+  const want = w / h;
+  let bw = Math.max(1, box.x1 - box.x0), bh = Math.max(1, box.y1 - box.y0);
+  // 先按画布比例撑开
+  if (bw / bh > want) bh = bw / want; else bw = bh * want;
+  // 视野不可能比地图还大
+  const maxSide = Math.max(bw, bh);
+  if (maxSide > span) { const k = span / maxSide; bw *= k; bh *= k; }
+  let cx = (box.x0 + box.x1) / 2, cy = (box.y0 + box.y1) / 2;
+  // 平移回地图内（不是裁掉，是整体挪进去，保证团战区仍在画面里）
+  if (bw >= span) cx = (WORLD_LO + WORLD_HI) / 2;
+  else cx = Math.min(WORLD_HI - bw / 2, Math.max(WORLD_LO + bw / 2, cx));
+  if (bh >= span) cy = (WORLD_LO + WORLD_HI) / 2;
+  else cy = Math.min(WORLD_HI - bh / 2, Math.max(WORLD_LO + bh / 2, cy));
+  return { x0: cx - bw / 2, y0: cy - bh / 2, x1: cx + bw / 2, y1: cy + bh / 2 };
+}
+
+function fitBox(box, instant) {
+  box = clampToMap(box);
+
+  // ---- 视野跨度上限（要克制，不能一刀切）----
+  // 目的：别让 1~2 个脱节的人把视野撑到 11000 单位，把主角压成 25px 色块。
+  // 但**上限不能小于「框住大多数人所需要的大小」** —— 试过按「头像至少 40px」
+  // 死算上限，t=2 时人散在三条路上，视野被砍到 7000，结果 10 个人里 5 个被推出画面，
+  // 画面中间只剩 2 个人，比之前更糟。
+  // 现在的规则：上限取「最大簇的 1.8 倍跨度」，且不低于 6000 —— 只削掉极端值，不动正常队形。
+  const wpx = cv.clientWidth;
+  const spanNow = Math.max(box.x1 - box.x0, box.y1 - box.y0);
+  const MAX_SPAN = Math.max(6000, Math.min(9000, (wpx * HERO_WORLD) / 32));
+  if (spanNow > MAX_SPAN) {
+    const k = MAX_SPAN / spanNow;
+    const cx0 = (box.x0 + box.x1) / 2, cy0 = (box.y0 + box.y1) / 2;
+    const bw2 = (box.x1 - box.x0) * k, bh2 = (box.y1 - box.y0) * k;
+    box = clampToMap({
+      x0: cx0 - bw2 / 2, y0: cy0 - bh2 / 2,
+      x1: cx0 + bw2 / 2, y1: cy0 + bh2 / 2,
+    });
+  }
+
+  const w = cv.clientWidth, h = cv.clientHeight;
+  const fw = Math.max(1, box.x1 - box.x0), fh = Math.max(1, box.y1 - box.y0);
+  const s = Math.min(w / fw, h / fh);
+  const cx = (box.x0 + box.x1) / 2, cy = (box.y0 + box.y1) / 2;
+  if (instant) { view.scale = s; view.cx = cx; view.cy = cy; }
+  else {
+    const k = 0.16;
+    view.scale += (s - view.scale) * k;
+    view.cx += (cx - view.cx) * k;
+    view.cy += (cy - view.cy) * k;
+  }
+  view.base = s;
+}
+
+function fitAll() {
+  // 整个窗口内所有英雄的最小包围盒（用于「复位」时的兜底）
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9, n = 0;
+  for (const h of Object.keys(F.x)) {
+    for (let i = 0; i < F.x[h].length; i++) {
+      const x = F.x[h][i], y = F.y[h][i];
+      if (x == null || y == null) continue;
+      if (x < x0) x0 = x; if (x > x1) x1 = x;
+      if (y < y0) y0 = y; if (y > y1) y1 = y;
+      n++;
+    }
+  }
+  if (!n) return { x0: WORLD_LO, y0: WORLD_LO, x1: WORLD_HI, y1: WORLD_HI };
+  const pad = Math.max(500, Math.max(x1 - x0, y1 - y0) * 0.12);
+  return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
+}
+
+let follow = true;
+
+// =====================================================================
+// 帧索引与插值
+// =====================================================================
+const NF = F.x[Object.keys(F.x)[0]] ? F.x[Object.keys(F.x)[0]].length : 1;
+const fi = t => Math.max(0, Math.min(NF - 1, Math.round(t / F.dt)));
+
+/** 位置插值：0.1 秒一帧，线性插值让移动顺滑（否则播放时一跳一跳）。*/
+function posAt(h, t) {
+  const f = t / F.dt;
+  const i = Math.max(0, Math.min(NF - 2, Math.floor(f)));
+  const p = Math.max(0, Math.min(1, f - i));
+  const ax = F.x[h][i], ay = F.y[h][i], bx = F.x[h][i + 1], by = F.y[h][i + 1];
+  if (ax == null || ay == null) return [bx, by];
+  if (bx == null || by == null) return [ax, ay];
+  return [ax + (bx - ax) * p, ay + (by - ay) * p];
+}
+
+/** 血量不插值 —— 掉血是阶跃的，插值会变成「慢慢流」且死亡时刻提前。*/
+function hpAt(h, t) {
+  const i = fi(t);
+  return [F.hp[h][i], F.mx[h][i]];
+}
+
+// =====================================================================
+// 绘制
+// =====================================================================
+function resize() {
+  const w = cv.parentElement.clientWidth;
+  const h = Math.round(w * 0.72);
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+  cv.style.width = w + 'px'; cv.style.height = h + 'px';
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const box = liveBox(cur) || fitAll();
+  fitBox(box, true);
+  draw();
+}
+
+function drawMapLayer() {
+  const w = cv.clientWidth, h = cv.clientHeight;
+  // 屏幕四角反算世界坐标，得到要贴的底图裁剪区
+  const [wx0, wy1] = S2W(0, 0);          // 左上 = 世界 (小x, 大y)
+  const [wx1, wy0] = S2W(w, h);          // 右下 = 世界 (大x, 小y)
+
+  if (mapReady) {
+    const px = (wx0 - WORLD_LO) / WORLD_SPAN * MAPW;
+    const py = (WORLD_HI - wy1) / WORLD_SPAN * MAPH;
+    const pw = (wx1 - wx0) / WORLD_SPAN * MAPW;
+    const ph = (wy1 - wy0) / WORLD_SPAN * MAPH;
+    g.globalAlpha = 0.92;
+    g.imageSmoothingEnabled = true;
+    g.imageSmoothingQuality = 'high';
+    g.drawImage(mapImg, px, py, pw, ph, 0, 0, w, h);
+    g.globalAlpha = 1;
+    // 压暗一层，让头像跳出来
+    g.fillStyle = 'rgba(8,10,14,.30)';
+    g.fillRect(0, 0, w, h);
+  } else {
+    g.fillStyle = '#0b0e13';
+    g.fillRect(0, 0, w, h);
+  }
+
+  // 战术网格：1000 世界单位一格（约一个中路宽度），提供「跑了多远」的参照
+  g.strokeStyle = 'rgba(150,170,200,.10)';
+  g.lineWidth = 1;
+  const gstep = 1000;
+  const gx0 = Math.ceil(wx0 / gstep) * gstep;
+  const gy0 = Math.ceil(wy0 / gstep) * gstep;
+  for (let x = gx0; x <= wx1; x += gstep) {
+    const [sx] = W2S(x, 0);
+    g.beginPath(); g.moveTo(sx, 0); g.lineTo(sx, h); g.stroke();
+  }
+  for (let y = gy0; y <= wy1; y += gstep) {
+    const [, sy] = W2S(0, y);
+    g.beginPath(); g.moveTo(0, sy); g.lineTo(w, sy); g.stroke();
+  }
+}
+
+/** 头像直径。
+ *
+ * 关键：**按世界尺度换算，而不是固定屏幕像素。**
+ *
+ * 之前用固定 48px，等于把英雄画成了「比兵线还宽的一大坨」——
+ * 底图 1024px 覆盖 16384 世界单位（16 世界单位/像素），
+ * 48px 的头像相当于 770 世界单位的直径，而真实英雄的可视体积只有 300 上下。
+ * 头像放大到 2.5 倍还硬要摆在同一片区域，必然糊成一团，
+ * 而且拉近拉远时头像大小不变，与地图的比例关系完全失真。
+ *
+ * 现在：直径 = HERO_WORLD * view.scale，跟着缩放一起变，
+ * 观感上就是「真实英雄在那个位置站着」。重叠就让它重叠 ——
+ * 真实团战里模型本来就会互相遮挡，这是正确的表现，不是缺陷。
+ * 只保留一个屏幕像素下限（拉远时别小到看不见）和一个上限（贴脸时别夸张）。
+ */
+const HERO_WORLD = 340;          // 英雄可视直径（世界单位），约等于模型宽度
+function avatarPx() {
+  const raw = HERO_WORLD * view.scale;
+  return Math.max(16, Math.min(64, raw));
+}
+
+// =====================================================================
+// 特效：把「技能事件」翻译成能看懂的动画
+// =====================================================================
+// 设计原则：
+//  **不做逐技能美术，只做「形态 + 色系」的通用映射。**
+//  DOTA 有 500+ 技能，逐个手绘做不完，换一场比赛也全用不上。
+//  真正要的是「一眼看出这波在发生什么」：谁放的、朝哪个方向、单体还是范围、
+//  是冰还是火。所以按 form 画通用几何体，按 hue 上色。
+//
+//  上一版「几乎看不见」，三个实打实的原因，这次逐个修掉：
+//   1) 特效全画在头像底下 —— 团战时 10 个头像正好压在技能中心，特效被吃干净。
+//      现在分两层：地面类（范围/光环/扇形/增益）留在头像下，空中类（弹道/
+//      射线/落点/爆点）改画到头像**上面**。真实游戏里这些东西本来就在人头顶飞。
+//   2) 用 source-over 描一层淡色线 —— 发灰，像铅笔稿。现在整层切到
+//      'lighter' 加色混合，叠加处自然变亮，接近游戏里的辉光。
+//   3) 尺寸写死屏幕像素 —— 拉近拉远时特效和英雄脱节。现在统一用「身位」
+//      U（= 英雄直径对应的屏幕像素），和头像同一把尺，缩放时一起变。
+//
+//  form：bolt 弹道 / aoe 圆形范围 / cone 扇形 / line 直线 / aura 光环
+//        selfbuf 自身增益 / point 落点 / chain 弹跳 / burst 通用爆炸
+// =====================================================================
+const HUE = D.hue || {};
+const FX_TAIL = 0.30;                 // 主时长之后的余晖，别让东西「啪」一下消失
+
+/** 英雄下标 -> slug 反向表（原来每个特效都要 find 一遍，纯浪费） */
+const SLUG_OF = [];
+Object.keys(F.x).forEach(h => { SLUG_OF[IDX[h]] = h; });
+
+/** 取色：hue 名 -> [主色, 亮色] */
+function hueOf(h) {
+  return HUE[h] || ['#ffd98a', '#fff4d8'];
+}
+
+/**
+ * 1 个「身位」= 多少屏幕像素。
+ * 和 avatarPx() 共用同一把尺：视线拉近时头像变大，特效也一起变大，
+ * 两者比例才稳定。上下限防止贴脸时特效糊满屏、拉远时细到看不见。
+ */
+function fxU() {
+  return Math.max(20, Math.min(72, HERO_WORLD * view.scale));
+}
+
+/** 世界坐标 -> 屏幕坐标（统一入口，将来换投影只改这里） */
+function fxPos(wx, wy) { return W2S(wx, wy); }
+
+/** 英雄在某一帧的屏幕位置；没坐标（未出生 / 已消失）返回 null */
+function heroSX(h, i) {
+  if (!h) return null;
+  const x = F.x[h][i], y = F.y[h][i];
+  if (x == null || y == null) return null;
+  return W2S(x, y);
+}
+
+/** 命中点：优先取目标**当时**的位置，没有目标返回 null */
+function hitPointOf(fx, i) {
+  if (fx.g == null || fx.g < 0) return null;
+  return heroSX(SLUG_OF[fx.g], i);
+}
+
+/** 空中层形态：必须压在头像上面画，否则团战里被头像吃掉 */
+function isAirForm(f) {
+  return f === 'bolt' || f === 'line' || f === 'chain' ||
+         f === 'point' || f === 'burst';
+}
+
+/** 整体包络：快速淡入 → 保持 → 淡出 */
+function fxEnv(p) {
+  // 缓入要快（技能一出手就该亮），缓出要慢（别还没看清就没了）。
+  // 原来 0.80 起线性淡出，实际在 age/life=0.8 之后光效就急剧衰减，
+  // 一帧采样正好落在尾部就什么都看不见 —— 看起来像「特效漏了」。
+  // 现在维持到 0.88 才开始收，且用平方曲线让尾部有质感。
+  if (p < 0.08) return p / 0.08;                 // 快速淡入
+  if (p > 0.88) {                                // 缓慢淡出
+    const q = (p - 0.88) / 0.12;
+    return 1 - q * q;
+  }
+  return 1;
+}
+
+/** 确定性伪随机：同一特效同一时刻永远得到同一组粒子，重绘不会乱闪 */
+function rnd01(s) {
+  const x = Math.sin(s * 12.9898) * 43758.5453;
+  return x - Math.floor(x);
+}
+
+/** 径向光斑：中心亮、边缘透明。比平涂 fillStyle 更像「光」 */
+function blob(x, y, r, rgb, a) {
+  if (!(r > 0) || !(a > 0)) return;
+  const gr = g.createRadialGradient(x, y, 0, x, y, r);
+  gr.addColorStop(0, 'rgba(' + rgb + ',' + a + ')');
+  gr.addColorStop(0.40, 'rgba(' + rgb + ',' + (a * 0.40) + ')');
+  gr.addColorStop(1, 'rgba(' + rgb + ',0)');
+  g.fillStyle = gr;
+  g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill();
+}
+
+/**
+ * 辉光描边：宽而淡的外晕 + 窄而亮的光芯。
+ *
+ * 注意外晕的**宽度和亮度都要克制**：整层是 'lighter' 加色混合，
+ * 一旦用亮色画 3.4 倍宽的粗环，两三个环重叠处就会推到纯白，
+ * 变成傻大黑粗的几何圈 —— 实测 t=26 那帧就是「一圈白色甜甜圈套在头像外」。
+ * 现在外晕只给 2.2 倍宽、20% 亮度，靠光芯提供清晰度。
+ */
+function glowPath(fn, rgb, w, a) {
+  g.strokeStyle = 'rgba(' + rgb + ',' + (a * 0.20) + ')';
+  g.lineWidth = w * 2.2; fn(); g.stroke();
+  g.strokeStyle = 'rgba(' + rgb + ',' + a + ')';
+  g.lineWidth = w; fn(); g.stroke();
+}
+
+/**
+ * 不规则闭合轮廓。
+ *
+ * 这是「像技能」还是「像圆规画的圈」的分水岭。
+ * 正圆在真实团战里几乎不存在 —— 技能范围总是被地形裁、被特效扰动。
+ * 用几层不同频率的正弦叠在半径上，得到一个有机的、会呼吸的边界：
+ * 低频做整体变形，高频做细碎起伏。相位随 age 缓慢漂移，边界就在蠕动。
+ *
+ * pts 越多越平滑；32 段足够（再多肉眼也看不出来，白烧性能）。
+ */
+function wobblyRing(x, y, r, seed, age, amp) {
+  const N = 32;
+  g.beginPath();
+  for (let n = 0; n <= N; n++) {
+    const th = (n / N) * Math.PI * 2;
+    const w =
+      Math.sin(th * 2 + seed + age * 0.35) * 0.55 +
+      Math.sin(th * 3 - seed * 1.7 + age * 0.5) * 0.30 +
+      Math.sin(th * 5 + seed * 2.3 - age * 0.8) * 0.15;
+    const rr = r * (1 + w * amp);
+    const px = x + Math.cos(th) * rr;
+    const py = y + Math.sin(th) * rr;
+    if (n === 0) g.moveTo(px, py); else g.lineTo(px, py);
+  }
+  g.closePath();
+}
+
+/**
+ * 光带：一条有宽度、沿轴线由亮转暗的**实体**光束。
+ *
+ * 之前所有技能都是「stroke 一条线」—— 线再怎么加粗、加辉光，
+ * 都是一根线。真实技能的光是有体积的：中心最亮，向两侧衰减。
+ * 这里用横向渐变填充一个四边形，做出「中间实、两边散」的柱体感。
+ * 再叠一条更细的高光芯，就是游戏里那种「能量束」。
+ */
+function lightBeam(x0, y0, x1, y1, halfW, rgb, a) {
+  const dx = x1 - x0, dy = y1 - y0;
+  const L = Math.hypot(dx, dy) || 1;
+  const nx = -dy / L, ny = dx / L;
+
+  // 横向渐变：边透明 → 中心亮 → 边透明
+  const grd = g.createLinearGradient(
+    x0 + nx * halfW, y0 + ny * halfW,
+    x0 - nx * halfW, y0 - ny * halfW
+  );
+  grd.addColorStop(0, 'rgba(' + rgb + ',0)');
+  grd.addColorStop(0.5, 'rgba(' + rgb + ',' + a + ')');
+  grd.addColorStop(1, 'rgba(' + rgb + ',0)');
+  g.fillStyle = grd;
+  g.beginPath();
+  g.moveTo(x0 + nx * halfW, y0 + ny * halfW);
+  g.lineTo(x1 + nx * halfW, y1 + ny * halfW);
+  g.lineTo(x1 - nx * halfW, y1 - ny * halfW);
+  g.lineTo(x0 - nx * halfW, y0 - ny * halfW);
+  g.closePath();
+  g.fill();
+}
+
+/** 从一个点向某方向张开的锥形光（扇形/锥形技能的实体部分） */
+function lightCone(x, y, ang, spread, r, rgb, a0, a1) {
+  const grd = g.createRadialGradient(x, y, 0, x, y, r);
+  grd.addColorStop(0, 'rgba(' + rgb + ',' + a0 + ')');
+  grd.addColorStop(0.6, 'rgba(' + rgb + ',' + (a0 * 0.55) + ')');
+  grd.addColorStop(1, 'rgba(' + rgb + ',' + a1 + ')');
+  g.fillStyle = grd;
+  g.beginPath();
+  g.moveTo(x, y);
+  g.arc(x, y, r, ang - spread, ang + spread);
+  g.closePath();
+  g.fill();
+}
+
+/** 爆散粒子：命中 / 爆炸时向外飞的小光点 */
+function sparks(x, y, k, U, rgb, a, seed) {
+  if (!(a > 0)) return;
+  const n = 7;
+  for (let j = 0; j < n; j++) {
+    const ang = (j / n) * Math.PI * 2 + rnd01(seed + j) * 0.9;
+    const sp = 0.5 + rnd01(seed + j * 3.3) * 0.8;
+    const d = U * 0.55 * k * sp;
+    const px = x + Math.cos(ang) * d, py = y + Math.sin(ang) * d;
+    const r = Math.max(1.2, U * 0.055 * (1 - k * 0.75));
+    blob(px, py, r * 2.6, rgb, a * 0.85);
+    // 芯用亮色而非纯白：加色混合下纯白会让粒子失去色系，全变成白点
+    g.fillStyle = 'rgba(' + rgb + ',' + (a * 0.9) + ')';
+    g.beginPath(); g.arc(px, py, r * 0.62, 0, Math.PI * 2); g.fill();
+  }
+}
+
+/** 无落点/方向记录时只提示施法，不从附近英雄猜测目标。 */
+function unknownCast(cp, U, rgb, fade) {
+  g.strokeStyle = 'rgba(' + rgb + ',' + (0.7 * fade) + ')';
+  g.lineWidth = 1.8;
+  g.setLineDash([3, 4]);
+  g.beginPath(); g.arc(cp[0], cp[1], U * 0.72, 0, Math.PI * 2); g.stroke();
+  g.setLineDash([]);
+}
+
+// 只对可确认的技能名标注“大招”；不把高伤害或多人命中直接判成大招。
+const MAJOR_SPELL = /黑洞|时间结界|毁灭|回音击|两极反转|混乱之祭|超新星|极寒领域|死亡守卫|梦境缠绕|静态风暴|连环霜冻|无敌斩|安魂曲|神之浩劫|群蛇守卫|black hole|chronosphere|ravage|echo slam|reverse polarity/i;
+const SPELL_FX = (D.fx || []).filter(fx => fx.k !== 'aa');
+// 预关联元信息，避免每帧为每个标签搜索整张技能表。
+const FX_INFO = new Map(SPELL_FX.map(fx => {
+  const spell = (D.spells || []).find(s => s.c === fx.c && Math.abs(s.t - fx.t) < 0.3 && (!fx.n || s.n === fx.n));
+  const hero = H[fx.c];
+  let name = String(fx.n || (spell && spell.n) || '技能施放');
+  if (hero && name.startsWith(hero.n)) name = name.slice(hero.n.length).replace(/^\s*[·:：-]?\s*/, '') || name;
+  const control = (D.ctrl || []).some(c => c.tg === fx.g && Math.abs(c.t - fx.t) < 0.4 && c.n === (fx.n || (spell && spell.n)));
+  return [fx, { name, major: MAJOR_SPELL.test(name), control }];
+}));
+
+function fxShape(fx) {
+  if (fx.g == null || fx.g < 0) {
+    if (['bolt', 'line', 'cone', 'chain', 'point', 'aoe'].includes(fx.f)) return '落点未记录';
+  }
+  return ({ aoe: '○ 范围示意', cone: '◁ 扇形示意', line: '→ 直线示意',
+    bolt: '◇ 单体', chain: '↝ 弹跳', point: '◇ 目标', aura: '○ 光环示意',
+    selfbuf: '↑ 自身增益' })[fx.f] || '施法';
+}
+
+/** 普通混合的独立标签层：限量、避让英雄/其他标签，保持文字清楚。 */
+function drawSpellLabels(i) {
+  const w = cv.clientWidth, h = cv.clientHeight, mobile = w < 560;
+  const candidates = [];
+  for (const fx of SPELL_FX) {
+    const info = FX_INFO.get(fx), age = cur - fx.t;
+    const life = info.major || info.control ? 2.2 : 1.45;
+    if (age < 0 || age > life) continue;
+    const cp = heroSX(SLUG_OF[fx.c], fi(Math.max(0, fx.t)));
+    if (!cp || cp[0] < 0 || cp[0] > w || cp[1] < 0 || cp[1] > h) continue;
+    candidates.push({ fx, info, cp, age, life, priority: info.major ? 3 : info.control ? 2 : 1 });
+  }
+  candidates.sort((a, b) => b.priority - a.priority || b.fx.t - a.fx.t);
+  const boxes = [], used = new Set(), AP = avatarPx();
+  // 避开击杀横幅；屏幕越小，标签预算越紧。
+  const top = (D.kills || []).some(k => cur >= k.t && cur <= k.t + 2.6) ? 66 : 6;
+  const heroBoxes = H.map(m => heroSX(m.slug, i)).filter(Boolean)
+    .map(p => ({ x: p[0] - AP / 2 - 3, y: p[1] - AP / 2 - 13, w: AP + 6, h: AP + 24 }));
+  const overlaps = (a, b) => a.x < b.x + b.w + 3 && a.x + a.w + 3 > b.x && a.y < b.y + b.h + 3 && a.y + a.h + 3 > b.y;
+  g.save();
+  g.globalCompositeOperation = 'source-over';
+  g.textAlign = 'left'; g.textBaseline = 'middle';
+  for (const event of candidates) {
+    if (boxes.length >= (mobile ? 3 : 5)) break;
+    const { fx, info, cp, age, life } = event;
+    const key = fx.c + ':' + info.name;
+    if (used.has(key)) continue;
+    const hero = H[fx.c];
+    if (!hero) continue;
+    const title = (info.major ? '大招 · ' : info.control ? '控制 · ' : '') + info.name;
+    const detail = hero.n + ' · ' + fxShape(fx);
+    g.font = '600 ' + (mobile ? 11 : 12) + 'px sans-serif';
+    const bw = Math.min(w - 12, mobile ? 184 : 240, Math.max(g.measureText(title).width, g.measureText(detail).width) + 20);
+    const bh = 39;
+    let box = null;
+    for (const [ox, oy] of [[AP * 0.7, -AP * 0.5 - bh - 8], [AP * 0.7, AP * 0.5 + 12], [-bw - AP * 0.7, -AP * 0.5 - bh - 8], [-bw - AP * 0.7, AP * 0.5 + 12], [-bw / 2, -AP * 0.5 - bh * 2 - 12]]) {
+      const b = { x: Math.max(6, Math.min(w - bw - 6, cp[0] + ox)), y: Math.max(top, Math.min(h - bh - 6, cp[1] + oy)), w: bw, h: bh };
+      if (b.y + bh > h - 6 || boxes.some(o => overlaps(b, o)) || heroBoxes.some(o => overlaps(b, o))) continue;
+      box = b; break;
+    }
+    if (!box) continue;
+    used.add(key); boxes.push(box);
+    const team = hero.t === 0 ? '#69d69b' : '#ff8d82';
+    g.globalAlpha = Math.min(1, (life - age) / 0.3);
+    // 细来源线接回施法时的位置，避免多个同色技能混淆；不表示飞行轨迹。
+    const ex = Math.max(box.x, Math.min(box.x + bw, cp[0]));
+    const ey = Math.max(box.y, Math.min(box.y + bh, cp[1]));
+    const len = Math.hypot(ex - cp[0], ey - cp[1]) || 1;
+    g.strokeStyle = team; g.lineWidth = 1; g.setLineDash([2, 3]);
+    g.beginPath(); g.moveTo(cp[0] + (ex - cp[0]) / len * AP * 0.56, cp[1] + (ey - cp[1]) / len * AP * 0.56); g.lineTo(ex, ey); g.stroke();
+    g.setLineDash([]);
+    g.fillStyle = 'rgba(8,13,22,.93)'; roundRect(box.x, box.y, bw, bh, 5); g.fill();
+    g.strokeStyle = info.major ? '#efc76d' : info.control ? '#bba2fa' : team;
+    g.lineWidth = info.major ? 1.6 : 1; g.stroke();
+    g.fillStyle = team; g.fillRect(box.x + 1, box.y + 6, 3, bh - 12);
+    g.save();
+    g.beginPath(); g.rect(box.x + 9, box.y, bw - 16, bh); g.clip();
+    g.fillStyle = info.major ? '#ffe3a1' : info.control ? '#e0d2ff' : '#edf4ff';
+    g.font = '600 ' + (mobile ? 11 : 12) + 'px sans-serif';
+    const fitText = text => { let s = text; while (s.length > 1 && g.measureText(s + '…').width > bw - 20) s = s.slice(0, -1); return s === text ? text : s + '…'; };
+    g.fillText(fitText(title), box.x + 10, box.y + 13);
+    g.fillStyle = team; g.font = '10px sans-serif';
+    g.fillText(fitText(detail), box.x + 10, box.y + 28);
+    g.restore();
+  }
+  g.restore();
+}
+
+/**
+ * 一个特效播多久（秒）。
+ *
+ * 瞬发技能原来给 0.42 秒 —— 太快了。以 1x 速度播，0.42 秒只有 25 帧，
+ * 观众眼睛刚跟上去就没了；而团战时同一瞬间常有 3~5 个瞬发，
+ * 屏幕上是「闪一下、闪一下」，看不出发生了什么。
+ * 现在拉到 0.75 秒：既能看清形态，又不会和下一次施法重叠。
+ * 有实测时长（持续型）的仍用实测，只是给一个 0.45 的下限。
+ */
+function fxLife(fx) {
+  if (fx.d && fx.d > 0) return Math.max(fx.d, 0.45);
+  return 0.75;
+}
+
+/**
+ * 画一层特效。
+ *   air=false → 地面层，先画，会被头像盖住（范围圈、光环、扇形）
+ *   air=true  → 空中层，画在头像之上（弹道、射线、落点、爆点）
+ */
+function drawFxLayer(i, air) {
+  const list = D.fx || [];
+
+  g.save();
+  g.globalCompositeOperation = 'lighter';   // 加色混合：这是「有辉光」的关键
+  g.lineCap = 'round';
+  g.lineJoin = 'round';
+  g.setLineDash([]);
+
+  // 空中层要**绕开英雄头像**，否则弹道和爆点直接糊在脸上。
+  // 做法：把所有活着的头像用 clip('evenodd') 挖成洞。
+  // 洞 = 头像圆 + 一圈羽化边缘，所以特效会自然地「绕着人走」，
+  // 而不是硬切一刀。地面层不需要挖洞 —— 它本来就在头像下面。
+  if (air) {
+    g.save();
+    g.beginPath();
+    g.rect(0, 0, cv.clientWidth, cv.clientHeight);
+    const AP = avatarPx();
+    for (const h of Object.keys(F.x)) {
+      if (F.al[h][i] === 0) continue;
+      const s = heroSX(h, i);
+      if (!s) continue;
+      g.moveTo(s[0] + AP * 0.52, s[1]);
+      g.arc(s[0], s[1], AP * 0.52, 0, Math.PI * 2);
+    }
+    g.clip('evenodd');
+  }
+
+  for (const fx of list) {
+    g.setLineDash([]);
+    if (isAirForm(fx.f) !== air) continue;
+
+    const life = fxLife(fx);
+    const age = cur - fx.t;
+    if (age < 0 || age > life + FX_TAIL) continue;
+
+    const caster = SLUG_OF[fx.c];
+    if (!caster) continue;
+
+    // 施法者的位置取**施放那一刻**的，人跑开后特效不能跟着飘
+    const cp = heroSX(caster, fi(Math.max(0, fx.t)));
+    if (!cp) continue;
+
+    // 场地形态锁定事件时记录的目标位置；弹道仍可追随明确目标。
+    const tp = hitPointOf(fx, ['aoe', 'cone', 'line', 'point'].includes(fx.f) ? fi(Math.max(0, fx.t)) : i);
+    const col = hueOf(fx.h);
+    const rgbB = hex2rgb(col[1]), rgbA = hex2rgb(col[0]);
+    const U = fxU();
+    const p = Math.min(1, Math.max(0, age / life));
+    const e = fxEnv(p);
+    const fade = age > life ? Math.max(0, 1 - (age - life) / FX_TAIL) : 1;
+
+    // 起手闪光：技能施放的最初 0.2 秒，施法者身上亮一下 ——
+    // 团战里这一下比什么都重要，它回答了「这发是谁放的」。
+    if (air && fx.k !== 'aa' && age < 0.20) {
+      const a = (1 - age / 0.20) * fade;
+      blob(cp[0], cp[1], U * (0.22 + 0.55 * a), rgbB, 0.55 * a);
+    }
+
+    // -----------------------------------------------------------------
+    // 普攻：细、短、暗。45 个普攻要是和技能一样亮，画面就废了。
+    // -----------------------------------------------------------------
+    if (fx.k === 'aa') {
+      if (!tp) continue;
+      const fly = 0.14;
+      const k = Math.min(1, age / fly);
+      const hx = cp[0] + (tp[0] - cp[0]) * k;
+      const hy = cp[1] + (tp[1] - cp[1]) * k;
+      const dx = tp[0] - cp[0], dy = tp[1] - cp[1];
+      const L = Math.hypot(dx, dy) || 1;
+      const ux = dx / L, uy = dy / L;
+
+      const tl = Math.min(L * k, U * 1.6);
+      const grd = g.createLinearGradient(hx, hy, hx - ux * tl, hy - uy * tl);
+      grd.addColorStop(0, 'rgba(' + rgbB + ',' + (0.55 * fade) + ')');
+      grd.addColorStop(1, 'rgba(' + rgbA + ',0)');
+      g.strokeStyle = grd;
+      g.lineWidth = Math.max(1.2, U * 0.045);
+      g.beginPath();
+      g.moveTo(hx, hy);
+      g.lineTo(hx - ux * tl, hy - uy * tl);
+      g.stroke();
+
+      blob(hx, hy, U * 0.15, rgbB, 0.70 * fade);
+
+      if (k >= 1) {
+        const kk = Math.min(1, (age - fly) / 0.20);
+        if (kk < 1) {
+          sparks(tp[0], tp[1], kk, U * 0.30, rgbB, (1 - kk) * 0.85, fx.t * 91.7);
+        }
+      }
+      continue;
+    }
+
+    // -----------------------------------------------------------------
+    // 技能：按形态分支
+    // -----------------------------------------------------------------
+    // 范围以虚线表达示意，避免把轮廓误认为精确技能边界。
+    g.setLineDash(fx.f === 'aoe' || fx.f === 'cone' ? [5, 4] : []);
+    switch (fx.f) {
+
+      // ---- 弹道：从施法者飞向目标，带渐变尾迹 + 命中冲击波 ----
+      case 'bolt': {
+        if (!tp) {
+          // 没有目标：在施法者身上「聚气 → 迸发」
+          blob(cp[0], cp[1], U * 0.55 * e, rgbB, 0.55 * fade);
+          glowPath(() => {
+            g.beginPath();
+            g.arc(cp[0], cp[1], U * 0.30 * (0.4 + 0.6 * e), 0, Math.PI * 2);
+          }, rgbB, Math.max(1.5, U * 0.05), 0.9 * fade);
+          break;
+        }
+        const fly = Math.max(0.13, Math.min(life, 0.38));
+        const k = Math.min(1, age / fly);
+        const hx = cp[0] + (tp[0] - cp[0]) * k;
+        const hy = cp[1] + (tp[1] - cp[1]) * k;
+        const dx = tp[0] - cp[0], dy = tp[1] - cp[1];
+        const L = Math.hypot(dx, dy) || 1;
+        const ux = dx / L, uy = dy / L;
+
+        const tl = Math.min(L * k, U * 2.2);
+
+        // 1) 外扩的雾状尾迹（宽而淡，给「飞行物拖着一股能量」的感觉）
+        lightBeam(hx, hy, hx - ux * tl, hy - uy * tl,
+                  Math.max(3, U * 0.26), rgbA, 0.20 * fade);
+        // 2) 主体光束（窄而亮，实体感来自这一层）
+        lightBeam(hx, hy, hx - ux * tl, hy - uy * tl,
+                  Math.max(1.6, U * 0.09), rgbB, 0.72 * fade);
+        // 3) 一条更细的高光芯，把轴线「点亮」
+        g.strokeStyle = 'rgba(' + rgbB + ',' + (0.9 * fade) + ')';
+        g.lineWidth = Math.max(1, U * 0.028);
+        g.beginPath();
+        g.moveTo(hx, hy);
+        g.lineTo(hx - ux * tl, hy - uy * tl);
+        g.stroke();
+
+        // 弹头：核心光球 + 外晕
+        blob(hx, hy, U * 0.42, rgbB, 0.75 * fade);
+        blob(hx, hy, U * 0.16, rgbB, 0.95 * fade);
+
+        if (k >= 1) {
+          const kk = Math.min(1, (age - fly) / 0.26);
+          if (kk < 1) {
+            const aa = (1 - kk) * fade;
+            glowPath(() => {
+              g.beginPath();
+              g.arc(tp[0], tp[1], U * (0.25 + 0.75 * kk), 0, Math.PI * 2);
+            }, rgbB, Math.max(1.8, U * 0.06), aa);
+            blob(tp[0], tp[1], U * 0.62 * (0.4 + 0.6 * kk), rgbB, 0.5 * aa);
+            sparks(tp[0], tp[1], kk, U * 0.85, rgbB, aa, fx.t * 73.1);
+          }
+        }
+        break;
+      }
+
+      // ---- 圆形范围：持续型画成有生命力的场，瞬发画成扩张冲击波 ----
+      case 'aoe': {
+        // fx.r 是命中人数，不能据此推导半径。固定小尺寸虚线仅表示范围形态。
+        if (!tp) { unknownCast(cp, U, rgbB, fade); break; }
+        const R = Math.min(U * 1.35, cv.clientWidth * 0.13, 82);
+        const sustained = (fx.d || 0) >= 1.0;
+        const seed = fx.t * 3.1 + fx.c;
+
+        // 数据只有受击英雄位置，没有真实施法中心；在已记录目标处提示范围形态。
+        // 此处固定在事件时刻，不让持续场随受击英雄移动。
+        const ct = tp;
+
+        if (sustained) {
+          // 边界用不规则轮廓，不用正圆 —— 正圆一眼就像圆规画的。
+          // 三层：外圈淡、中圈主色、内部再一圈更细的脉动。
+          // 先铺一层**内部雾**：只有边界线的话，范围里是空的，像画了个圈占位；
+          // 有雾才像「这一片是它的领域」。
+          blob(ct[0], ct[1], R * 1.05, rgbA, 0.34 * e * fade);
+          blob(ct[0], ct[1], R * 0.75, rgbB, 0.20 * e * fade);
+          glowPath(() => wobblyRing(ct[0], ct[1], R, seed, age, 0.09),
+                   rgbB, Math.max(1.4, U * 0.028), 0.60 * e * fade);
+
+          // 内部再叠一圈稍小的轮廓，两层错开相位 → 有厚度、有层次
+          g.strokeStyle = 'rgba(' + rgbB + ',' + (0.28 * e * fade) + ')';
+          g.lineWidth = Math.max(1, U * 0.018);
+          wobblyRing(ct[0], ct[1], R * 0.72, seed + 1.7, age * 1.3, 0.13);
+          g.stroke();
+
+          // 从中心往外推的波纹
+          for (let n = 0; n < 3; n++) {
+            const ph = (age * 0.6 + n / 3) % 1;
+            g.strokeStyle = 'rgba(' + rgbB + ',' + (0.40 * (1 - ph) * e * fade) + ')';
+            g.lineWidth = Math.max(1, U * 0.020 * (1 - ph * 0.5));
+            wobblyRing(ct[0], ct[1], R * (0.22 + 0.78 * ph), seed + n, age, 0.10);
+            g.stroke();
+          }
+
+          // 内部漂浮光点：没有这些，持续技能就是一张静止的贴图
+          for (let n = 0; n < 10; n++) {
+            const a = rnd01(n * 7.7 + 1) * Math.PI * 2 + age * 0.45 * (n % 2 ? 1 : -1);
+            const rr = R * (0.15 + rnd01(n * 3.1 + 2) * 0.8);
+            const rise = ((age * 0.35 + rnd01(n * 5.3)) % 1) * U * 0.3;
+            blob(ct[0] + Math.cos(a) * rr, ct[1] + Math.sin(a) * rr - rise,
+                 U * 0.085, rgbB, 0.45 * e * fade);
+          }
+        } else {
+          // 瞬发：不规则冲击波，向外炸开的同时轮廓散掉
+          const k = Math.min(1, p * 1.15);
+          const kk = 1 - Math.pow(1 - k, 2.2);
+          const rr = R * (0.18 + 0.82 * kk);
+          const aa = (1 - k) * fade;
+          glowPath(() => wobblyRing(ct[0], ct[1], rr, seed, age, 0.14),
+                   rgbB, Math.max(1.6, U * 0.040), 0.70 * aa);
+          blob(ct[0], ct[1], rr * 0.8, rgbA, 0.22 * aa);
+          blob(ct[0], ct[1], U * 0.30, rgbB, 0.50 * aa);
+          sparks(ct[0], ct[1], k, R * 0.5, rgbB, aa * 0.8, fx.t * 41.3);
+        }
+        break;
+      }
+
+      // ---- 直线：沟壑 / 肉钩 / 强力击，甩出一条带白热芯的光柱 ----
+      case 'line': {
+        if (!tp) { unknownCast(cp, U, rgbB, fade); break; }
+        const dx = tp[0] - cp[0], dy = tp[1] - cp[1];
+        const L0 = Math.hypot(dx, dy) || 1;
+        const ux = dx / L0, uy = dy / L0;
+        // 只连接记录中的目标，不延长到目标之外，也不宣称真实射程。
+        const LEN = Math.min(L0, U * 6, cv.clientWidth * 0.6);
+        const pr = Math.min(1, age / 0.16);
+        const ex = cp[0] + ux * LEN * pr;
+        const ey = cp[1] + uy * LEN * pr;
+        const w = Math.max(3, U * 0.16) * (0.5 + 0.5 * e) * fade;
+
+        // 实体光柱：外雾 + 主体 + 高光芯。
+        // 关键：**沿轴向也要衰减**。原来整条一样亮，会变成一根穿过好几个人的硬光条，
+        // 看起来像「拿荧光笔画了一道」。真实能量束是近端浓、远端散。
+        const ax = g.createLinearGradient(cp[0], cp[1], ex, ey);
+        ax.addColorStop(0, 'rgba(' + rgbB + ',' + (0.95 * fade) + ')');
+        ax.addColorStop(0.55, 'rgba(' + rgbB + ',' + (0.55 * fade) + ')');
+        ax.addColorStop(1, 'rgba(' + rgbA + ',' + (0.15 * fade) + ')');
+
+        lightBeam(cp[0], cp[1], ex, ey, w * 2.2, rgbA, 0.20 * fade);
+        g.strokeStyle = ax;
+        g.lineWidth = w * 1.1;
+        g.lineCap = 'round';
+        g.beginPath(); g.moveTo(cp[0], cp[1]); g.lineTo(ex, ey); g.stroke();
+        g.lineCap = 'butt';
+
+        g.strokeStyle = 'rgba(' + rgbB + ',' + (0.45 * fade) + ')';
+        g.lineWidth = Math.max(1, w * 0.30);
+        g.beginPath(); g.moveTo(cp[0], cp[1]); g.lineTo(ex, ey); g.stroke();
+
+        // 发射端的光晕：让「从这里射出」这件事看得见
+        blob(cp[0], cp[1], w * 1.7, rgbB, 0.50 * fade);
+        // 前端（弹头 / 沟壑顶端）最亮
+        blob(ex, ey, w * 1.9, rgbB, 0.70 * fade);
+        break;
+      }
+
+      // ---- 扇形：龙息 / 声波，靠近施法者更亮的锥形光 ----
+      case 'cone': {
+        if (!tp) { unknownCast(cp, U, rgbB, fade); break; }
+        const a0 = Math.atan2(tp[1] - cp[1], tp[0] - cp[0]);
+        const R = Math.min(U * (1.1 + 0.5 * Math.min(1, p * 2)), cv.clientWidth * 0.18, 100);
+        const sp = Math.PI / 5;
+        const aa = e * fade;
+
+        // 实体锥形光：中心浓、边缘散
+        lightCone(cp[0], cp[1], a0, sp, R, rgbB, 0.50 * aa, 0);
+        // 再叠一层窄一点的，靠近轴线更亮 → 有「喷出来」的方向感
+        lightCone(cp[0], cp[1], a0, sp * 0.45, R * 0.95, rgbB, 0.42 * aa, 0);
+
+        // 边缘轮廓（弱化，只做收边，不抢主体）
+        g.strokeStyle = 'rgba(' + rgbB + ',' + (0.55 * aa) + ')';
+        g.lineWidth = Math.max(1, U * 0.032);
+        for (const sg of [-1, 1]) {
+          g.beginPath();
+          g.moveTo(cp[0], cp[1]);
+          g.lineTo(cp[0] + Math.cos(a0 + sg * sp) * R, cp[1] + Math.sin(a0 + sg * sp) * R);
+          g.stroke();
+        }
+        // 外弧收边
+        g.beginPath();
+        g.arc(cp[0], cp[1], R, a0 - sp, a0 + sp);
+        g.stroke();
+
+        // 爆发点
+        blob(cp[0], cp[1], U * 0.55, rgbB, 0.6 * aa);
+        break;
+      }
+
+      // ---- 光环：围着人转的不规则环 + 光点（暗影契约、各种持续 buff）----
+      case 'aura': {
+        const R = U * 1.05;
+        const aa = e * fade;
+        const seed = fx.t * 2.7 + fx.c;
+        blob(cp[0], cp[1], R * 1.15, rgbA, 0.26 * aa);
+        // 轮廓也走不规则，和 aoe 同一套语言，整体风格才统一
+        glowPath(() => wobblyRing(cp[0], cp[1], R, seed, age, 0.10),
+                 rgbB, Math.max(1.5, U * 0.038), 0.68 * aa);
+
+        // 内层虚线环反向旋转，一眼能看出「在转」
+        g.strokeStyle = 'rgba(' + rgbB + ',' + (0.30 * aa) + ')';
+        g.lineWidth = Math.max(1, U * 0.026);
+        g.setLineDash([U * 0.16, U * 0.14]);
+        g.beginPath();
+        g.arc(cp[0], cp[1], R * 0.72, -age * 1.1, -age * 1.1 + Math.PI * 2);
+        g.stroke();
+        g.setLineDash([]);
+
+        for (let n = 0; n < 8; n++) {
+          const a = age * 1.9 + n * Math.PI * 2 / 8;
+          const rr = R * (0.88 + 0.12 * Math.sin(age * 4 + n));
+          blob(cp[0] + Math.cos(a) * rr, cp[1] + Math.sin(a) * rr,
+               U * 0.11, rgbB, 0.75 * aa);
+        }
+        break;
+      }
+
+      // ---- 自身增益：从脚下升起的光柱 + 向上的箭头 ----
+      case 'selfbuf': {
+        const aa = fade;
+        const grd = g.createLinearGradient(cp[0], cp[1] + U * 0.5, cp[0], cp[1] - U * 1.1);
+        grd.addColorStop(0, 'rgba(' + rgbB + ',' + (0.55 * aa) + ')');
+        grd.addColorStop(1, 'rgba(' + rgbB + ',0)');
+        g.fillStyle = grd;
+        g.beginPath();
+        g.moveTo(cp[0] - U * 0.22, cp[1] + U * 0.35);
+        g.lineTo(cp[0] + U * 0.22, cp[1] + U * 0.35);
+        g.lineTo(cp[0] + U * 0.10, cp[1] - U * 1.1);
+        g.lineTo(cp[0] - U * 0.10, cp[1] - U * 1.1);
+        g.closePath(); g.fill();
+
+        for (let n = 0; n < 3; n++) {
+          const ph = (age * 0.9 + n / 3) % 1;
+          const yy = cp[1] + U * 0.45 - ph * U * 1.3;
+          const al = Math.sin(ph * Math.PI) * aa;
+          if (al <= 0) continue;
+          g.fillStyle = 'rgba(' + rgbB + ',' + (0.9 * al) + ')';
+          g.beginPath();
+          g.moveTo(cp[0], yy - U * 0.11);
+          g.lineTo(cp[0] - U * 0.13, yy + U * 0.07);
+          g.lineTo(cp[0] + U * 0.13, yy + U * 0.07);
+          g.closePath(); g.fill();
+        }
+        blob(cp[0], cp[1], U * 0.85, rgbA, 0.22 * aa);
+        break;
+      }
+
+      // ---- 落点：收缩的定位环 + 十字准星（雷霆之击这类）----
+      case 'point': {
+        if (!tp) { unknownCast(cp, U, rgbB, fade); break; }
+        const at = tp;
+        const k = Math.min(1, age / 0.30);
+        const aa = (1 - k) * fade;
+
+        glowPath(() => {
+          g.beginPath();
+          g.arc(at[0], at[1], U * (1.15 - 0.75 * k), 0, Math.PI * 2);
+        }, rgbB, Math.max(1.6, U * 0.05), 0.95 * aa);
+
+        g.strokeStyle = 'rgba(' + rgbB + ',' + (0.7 * aa) + ')';
+        g.lineWidth = Math.max(1, U * 0.035);
+        const s = U * 0.9;
+        g.beginPath();
+        g.moveTo(at[0] - s, at[1]); g.lineTo(at[0] - s * 0.35, at[1]);
+        g.moveTo(at[0] + s * 0.35, at[1]); g.lineTo(at[0] + s, at[1]);
+        g.moveTo(at[0], at[1] - s); g.lineTo(at[0], at[1] - s * 0.35);
+        g.moveTo(at[0], at[1] + s * 0.35); g.lineTo(at[0], at[1] + s);
+        g.stroke();
+
+        blob(at[0], at[1], U * 0.5 * (1 - k * 0.4), rgbB, 0.9 * aa);
+        blob(at[0], at[1], U * 0.22, rgbB, aa);
+        sparks(at[0], at[1], k, U * 0.7, rgbB, aa, fx.t * 57.9);
+        break;
+      }
+
+      // ---- 弹跳：锯齿状闪电（雷神之锤、连锁类）----
+      case 'chain': {
+        if (!tp) break;
+        const dx = tp[0] - cp[0], dy = tp[1] - cp[1];
+        const L = Math.hypot(dx, dy) || 1;
+        const nx = -dy / L, ny = dx / L;
+        const segs = 7;
+        const pr = Math.min(1, age / Math.max(0.14, Math.min(life, 0.45)));
+        const pts = [];
+        for (let n = 0; n <= segs; n++) {
+          const k = n / segs;
+          if (k > pr) break;
+          const bx = cp[0] + dx * k, by = cp[1] + dy * k;
+          // 两端不抖，中间抖得最厉害 —— 像一道贴上去的电弧
+          const jit = (n === 0 || n === segs) ? 0
+            : (rnd01(fx.t * 13 + n) - 0.5) * U * 0.35 * Math.sin(k * Math.PI);
+          pts.push([bx + nx * jit, by + ny * jit]);
+        }
+        if (pts.length < 2) break;
+
+        const aa = fade * (pr >= 1 ? Math.max(0, 1 - (age - 0.45) / 0.3) : 1);
+        if (aa <= 0) break;
+
+        const strokeChain = () => {
+          g.beginPath();
+          g.moveTo(pts[0][0], pts[0][1]);
+          for (let n = 1; n < pts.length; n++) g.lineTo(pts[n][0], pts[n][1]);
+        };
+        glowPath(strokeChain, rgbB, Math.max(1.8, U * 0.06), 0.95 * aa);
+
+        g.strokeStyle = 'rgba(' + rgbB + ',' + (0.95 * aa) + ')';
+        g.lineWidth = Math.max(1, U * 0.028);
+        strokeChain(); g.stroke();
+
+        blob(tp[0], tp[1], U * 0.4, rgbB, 0.9 * aa);
+        break;
+      }
+
+      // ---- 兜底：任何没归类的技能也得有个「炸」的反馈 ----
+      default: {
+        const k = Math.min(1, p * 1.2);
+        const aa = (1 - k) * fade;
+        const rr = U * (0.25 + 0.85 * (1 - Math.pow(1 - k, 2)));
+        glowPath(() => {
+          g.beginPath(); g.arc(cp[0], cp[1], rr, 0, Math.PI * 2);
+        }, rgbB, Math.max(1.8, U * 0.06), 0.95 * aa);
+        blob(cp[0], cp[1], rr * 1.1, rgbA, 0.35 * aa);
+        sparks(cp[0], cp[1], k, U * 0.8, rgbB, aa, fx.t * 29.7);
+      }
+    }
+  }
+
+  if (air) g.restore();     // 退出「挖洞」的 clip
+  g.restore();              // 退出 lighter 混合
+
+  // 伤害飘字单独一层：要压在所有特效之上，且必须用普通混合（白字才白），
+  // 也不能被头像挖洞 —— 数字被挖掉一截比不显示更糟。
+  if (air) drawDmgLayer(i);
+}
+
+/**
+ * 伤害飘字。
+ * 「打了多少」是 DOTA 观众最认的反馈 —— 只有血条在掉、没有数字，
+ * 就跟看无声录像一样。但 107 个特效每个都飘字会糊成一片。
+ *
+ * 三条约束，都是被实际画面逼出来的：
+ *  1) 阈值提到 90。60 会让普攻和一跳被动也飘字，密集处变成数字墙。
+ *  2) **同一目标同一时刻的数字要合并** —— 上一次实测出现过「6043」这种
+ *     两个数字叠成一个乱码，因为两条伤害同时命中同一个目标，都画在同一坐标。
+ *     现在按 (目标, 0.25 秒) 归并，相加后再画。
+ *  3) 同目标连续飘字要**错开高度**，否则连续掉血时就是一列数字挤在一起。
+ */
+const DMG_MS = 1.15;      // 伤害数字飘多久（秒）
+const MIN_V = 90;         // 低于这个值不飘字，否则密集处是数字墙
+
+function drawDmgLayer(i) {
+  const list = D.fx || [];
+
+  // ---- 归并：同目标 + 0.25 秒内的伤害加起来，只画一个数字 ----
+  const buckets = [];
+  for (const fx of list) {
+    const v = fx.v || 0;
+    if (v < MIN_V) continue;
+    const k = (cur - fx.t) / DMG_MS;
+    if (k < 0 || k >= 1) continue;
+    if (fx.g == null || fx.g < 0) continue;      // 没有明确目标的不飘（否则会飘在施法者身上）
+
+    const b = buckets.find(o => o.g === fx.g && Math.abs(o.t - fx.t) < 0.25);
+    if (b) { b.v += v; b.t = Math.min(b.t, fx.t); }
+    else buckets.push({ g: fx.g, t: fx.t, v: v, kind: fx.k });
+  }
+
+  g.save();
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+
+  // 每个目标维护一个正在飘的数字列表，用于竖直错开
+  const live = {};
+  buckets.sort((a, b) => a.t - b.t);
+
+  for (const b of buckets) {
+    const at = heroSX(SLUG_OF[b.g], i);
+    if (!at) continue;
+    const k = (cur - b.t) / DMG_MS;
+    if (k < 0 || k >= 1) continue;
+
+    const U = fxU();
+    const stack = live[b.g] || (live[b.g] = []);
+    // 同目标上还有几个数字在飘 → 往下错开一个行高，不叠在一起
+    stack.push(k);
+
+    const y = at[1] - U * 0.60 - k * U * 0.95 + (stack.length - 1) * U * 0.34;
+    const a = k < 0.12 ? k / 0.12 : (k > 0.7 ? 1 - (k - 0.7) / 0.3 : 1);
+    const size = Math.round(Math.max(11, U * 0.32));
+
+    g.font = '700 ' + size + 'px -apple-system,"PingFang SC",sans-serif';
+    g.lineWidth = Math.max(2.6, size * 0.30);
+    g.strokeStyle = 'rgba(6,8,12,' + (0.88 * a) + ')';
+    g.strokeText(String(Math.round(b.v)), at[0], y);
+    g.fillStyle = b.kind === 'aa'
+      ? 'rgba(255,240,205,' + a + ')'
+      : 'rgba(255,214,120,' + a + ')';
+    g.fillText(String(Math.round(b.v)), at[0], y);
+  }
+  g.restore();
+}
+
+/**
+ * 击杀特效：死亡位置炸开一团 + 顶部横幅。
+ *
+ * 团战 demo 最需要「高潮」。之前阵亡只在原地画个灰色小叉 ——
+ * 观众根本不知道有人死了，得看右上角的事件流才知道。
+ * 现在做两件事：
+ *  1) 死亡点爆发（持续 1.2 秒）：扩散冲击环 + 上升的灵魂光点；
+ *  2) 屏幕上方短暂弹出击杀横幅，写明谁杀了谁。这是 MOBA 的通用语言，
+ *     任何人一眼就懂，不需要额外解释。
+ */
+function drawKillFx(i, w, h) {
+  const KILL_SHOW = 2.6;      // 横幅显示多久
+  for (const k of (D.kills || [])) {
+    const age = cur - k.t;
+    if (age < 0 || age > KILL_SHOW) continue;
+
+    const victim = SLUG_OF[k.v];
+    const at = heroSX(victim, fi(Math.max(0, k.t)));
+    if (!at) continue;
+
+    // --- 死亡爆点（前 1.2 秒）---
+    if (age < 1.2) {
+      const kk = Math.min(1, age / 1.2);
+      const U = fxU();
+      g.save();
+      g.globalCompositeOperation = 'lighter';
+
+      const aa = 1 - kk;
+      // 冲击环
+      glowPath(() => wobblyRing(at[0], at[1], U * (0.3 + 1.7 * kk), k.t, age, 0.12),
+               '255,120,90', Math.max(1.6, U * 0.045), 0.75 * aa);
+      // 中心爆闪：只在前 0.35 秒给，而且不做成大白球 ——
+      // 之前一直铺到 1.2 秒、半径接近 1 个身位，把死者头像整个糊成一团白的，
+      // 观众反而看不清「死的是谁」。
+      if (age < 0.35) {
+        const bf = 1 - age / 0.35;
+        blob(at[0], at[1], U * 0.75 * (1 - age / 0.35 * 0.4), '255,150,110', 0.45 * bf);
+      }
+
+      // 上升的灵魂光点：比单纯爆炸更有「这人不在了」的意味
+      for (let n = 0; n < 9; n++) {
+        const ph = (kk + n / 9) % 1;
+        const bx = at[0] + (rnd01(n * 3.7 + k.t) - 0.5) * U * 1.1;
+        const by = at[1] - ph * U * 2.2;
+        blob(bx, by, U * 0.10 * (1 - ph * 0.6), '255,170,130', 0.7 * (1 - ph));
+      }
+      g.restore();
+    }
+
+    // --- 顶部横幅（最后 1.4 秒淡出）---
+    const fade = age > KILL_SHOW - 0.5 ? (KILL_SHOW - age) / 0.5 : 1;
+    const slide = Math.min(1, age / 0.22);           // 滑入
+    const y = 44 + (1 - slide) * -18;
+
+    const killer = k.by >= 0 ? H[k.by] : null;
+    const victimH = H[k.v];
+    const txt = killer
+      ? `${killer.n}  击杀  ${victimH.n}`
+      : `${victimH.n}  阵亡`;
+
+    g.save();
+    g.globalAlpha = fade;
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+
+    g.font = '700 17px -apple-system,"PingFang SC",sans-serif';
+    const tw = g.measureText(txt).width;
+    const bw = tw + 44, bh = 34;
+    const bx = w / 2 - bw / 2;
+
+    // 背板：半透明深色 + 描边，保证在任何地图上都读得清
+    g.fillStyle = 'rgba(10,12,18,.82)';
+    roundRect(bx, y - bh / 2, bw, bh, 6); g.fill();
+    g.strokeStyle = victimH.t === 0
+      ? 'rgba(217,83,79,.85)'      // 天辉的人死了 = 红框
+      : 'rgba(76,175,125,.85)';
+    g.lineWidth = 1.5;
+    roundRect(bx, y - bh / 2, bw, bh, 6); g.stroke();
+
+    // 文字：杀手名亮、被杀的暗
+    g.fillStyle = '#f0f4fa';
+    g.fillText(txt, w / 2, y + 1);
+
+    g.restore();
+  }
+}
+
+/** 圆角矩形路径（Canvas 原生没有） */
+function roundRect(x, y, w, h, r) {
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.lineTo(x + w - r, y);
+  g.quadraticCurveTo(x + w, y, x + w, y + r);
+  g.lineTo(x + w, y + h - r);
+  g.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  g.lineTo(x + r, y + h);
+  g.quadraticCurveTo(x, y + h, x, y + h - r);
+  g.lineTo(x, y + r);
+  g.quadraticCurveTo(x, y, x + r, y);
+  g.closePath();
+}
+
+/** #rrggbb -> "r,g,b"，供 rgba() 拼字符串 */
+function hex2rgb(h) {
+  const s = String(h).replace('#', '');
+  const n = parseInt(s.length === 3 ? s.split('').map(c => c + c).join('') : s, 16);
+  return `${(n >> 16) & 255},${(n >> 8) & 255},${n & 255}`;
+}
+
+function draw() {
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (follow) {
+    const box = liveBox(cur);
+    if (box) fitBox(box, false);
+  }
+  g.clearRect(0, 0, w, h);
+  drawMapLayer();
+
+  const i = fi(cur);
+  const AP = avatarPx();
+
+  // ---- 轨迹（最近 2.5 秒，渐隐）----
+  const TRAIL = 2.5, SEG = 14;
+  for (const h of Object.keys(F.x)) {
+    if (F.al[h][i] === 0) continue;
+    const col = H[IDX[h]].t === 0 ? '76,175,125' : '217,83,79';
+    for (let k = 0; k < SEG; k++) {
+      const t0 = cur - TRAIL * (1 - k / SEG);
+      const t1 = cur - TRAIL * (1 - (k + 1) / SEG);
+      if (t1 > cur || t0 < 0) continue;
+      const a = posAt(h, t0), b = posAt(h, t1);
+      if (a[0] == null || b[0] == null) continue;
+      const p = W2S(a[0], a[1]), q = W2S(b[0], b[1]);
+      g.strokeStyle = `rgba(${col},${0.05 + 0.30 * (k / SEG)})`;
+      g.lineWidth = 2.5;
+      g.beginPath(); g.moveTo(p[0], p[1]); g.lineTo(q[0], q[1]); g.stroke();
+    }
+  }
+
+  // ---- 地面特效（范围圈 / 光环 / 扇形 / 增益光柱）----
+  // 这一层留在头像下面是对的：这些东西真实存在于地面上，人站在里面就该被挡。
+  drawFxLayer(i, false);
+
+  // ---- 英雄 ----
+  // 关键原则：**头像圆心 = 真实坐标，一个像素都不许挪。**
+  //
+  // 之前踩过的两个坑，都出在「想让头像别重叠」上：
+  //   1) 当卡片矩形互相推开 → 最多推 1.5 个卡片高，位置和真实坐标彻底脱钩；
+  //   2) 每帧独立求解推开量 → 相邻两帧的推开方向会翻转，播放时头像来回抖，
+  //      看起来就是「一堆头像在乱晃」。这是「乱晃」的真正原因，不是位置错了。
+  // 现在按用户的要求处理：**允许堆叠，绝不漂移**。
+  // 重叠靠三件事区分，而不是靠挪位置：
+  //   a) 绘制顺序（后画的压在上面）—— 血少的画在后面，因为那是当前的焦点；
+  //   b) 每个头像都有明显的阵营描边，叠起来也能分出是几号人；
+  //   c) 名字不做黑底条（那是画面变糊的主因），改成描边字，只在没被压住时画。
+  const items = [], offscreen = [];
+  for (const h of Object.keys(F.x)) {
+    const x = F.x[h][i], y = F.y[h][i];
+    if (x == null || y == null) continue;
+    const [sx, sy] = W2S(x, y);
+    const alive = F.al[h][i] === 1;
+    if (sx < -AP || sy < -AP || sx > w + AP || sy > h + AP) {
+      if (alive) offscreen.push({ meta: H[IDX[h]], x: sx, y: sy });
+      continue;
+    }
+    const [hp, mx] = alive ? hpAt(h, cur) : [0, 1];
+    items.push({ h, meta: H[IDX[h]], x: sx, y: sy, alive, hp, mx });
+  }
+
+  // 绘制顺序：血少的在上层（团战里快死的人更需要被看见）；
+  // 死亡的最后画（不挡活人）。
+  items.sort((a, b) => {
+    if (a.alive !== b.alive) return a.alive ? -1 : 1;
+    const fa = a.mx ? a.hp / a.mx : 0, fb = b.mx ? b.hp / b.mx : 0;
+    return fb - fa;
+  });
+
+  // 被谁压住：用于决定「这一帧还要不要画名字」。
+  // 名字是画面糊掉的主因 —— 10 个黑底条叠在几百像素里，什么都看不清。
+  // 规则：如果我的头像圆心落在别人的头像圆内，说明我被压住了，就不画名字
+  // （被压住的人本来就看不全，硬画名字只会更乱）。
+  for (const it of items) {
+    it.covered = false;
+    if (!it.alive) continue;
+    for (const o of items) {
+      if (o === it || !o.alive) continue;
+      if (Math.hypot(o.x - it.x, o.y - it.y) < AP * 0.62) {
+        // 谁在更上层，谁就能盖住别人；上层被盖住 = 不画
+        const idxOf = items.indexOf(o), idxIt = items.indexOf(it);
+        if (idxOf > idxIt) { it.covered = true; break; }
+      }
+    }
+  }
+
+  for (const it of items) {
+    const { meta, alive, hp, mx } = it;
+    const sx = it.x, sy = it.y;
+    const r = AP / 2;
+
+    if (!alive) {
+      // 死亡：暗底 + 去饱和头像 + 叉。
+      // 关键是要有**暗底**：只把头像调灰、调透明，在明亮地形（白天野区）上
+      // 会淡成一片灰雾，认不出是谁死了。先铺一层深色圆底，颜色对比才立得住。
+      g.save();
+      g.beginPath(); g.arc(sx, sy, r, 0, Math.PI * 2); g.clip();
+      const im = AV[it.h];
+      g.globalAlpha = 0.55;
+      if (im && im.complete && im.naturalWidth) {
+        g.drawImage(im, sx - r, sy - r, r * 2, r * 2);
+      } else {
+        g.fillStyle = '#3a4150';
+        g.fillRect(sx - r, sy - r, r * 2, r * 2);
+      }
+      // 深色罩 + 去饱和，压到「明显是尸体」的程度
+      g.globalAlpha = 0.62;
+      g.fillStyle = '#0b0e14';
+      g.fillRect(sx - r, sy - r, r * 2, r * 2);
+      g.restore();
+
+      // 外圈：灰色细环，明确「这个位置有东西，但不是活人」
+      g.globalAlpha = 0.75;
+      g.strokeStyle = 'rgba(150,158,172,.9)';
+      g.lineWidth = 1.8;
+      g.beginPath(); g.arc(sx, sy, r, 0, Math.PI * 2); g.stroke();
+
+      // 叉
+      const d = r * 0.60;
+      g.strokeStyle = 'rgba(210,214,224,.92)';
+      g.lineWidth = 2.2;
+      g.beginPath();
+      g.moveTo(sx - d, sy - d); g.lineTo(sx + d, sy + d);
+      g.moveTo(sx + d, sy - d); g.lineTo(sx - d, sy + d);
+      g.stroke();
+
+      // 名字保留（暗灰），否则「这是谁」就没人知道了
+      g.globalAlpha = 0.6;
+      g.font = '600 10px -apple-system,"PingFang SC",sans-serif';
+      g.textAlign = 'center'; g.textBaseline = 'middle';
+      g.lineWidth = 3;
+      g.strokeStyle = 'rgba(4,7,11,.9)';
+      g.strokeText(meta.n, sx, sy - r - 8);
+      g.fillStyle = '#9aa2b0';
+      g.fillText(meta.n, sx, sy - r - 8);
+      g.globalAlpha = 1;
+      continue;
+    }
+
+    const frac = mx ? Math.max(0, Math.min(1, hp / mx)) : 0;
+
+    // 控制环（眩晕/沉默/减速）
+    let ring = null, controlText = '';
+    for (const c of D.ctrl) {
+      if (c.tg !== IDX[it.h]) continue;
+      const dur = c.d || 1.5;
+      if (cur >= c.t - 0.05 && cur <= c.t + dur) {
+        ring = c.k.includes('stun') ? '#f6b53a'
+             : c.k.includes('sil') ? '#a874f0' : '#3fb4dc';
+        controlText = c.k.includes('stun') ? '眩晕' : c.k.includes('sil') ? '沉默' : '减速';
+        break;
+      }
+    }
+    if (ring) {
+      // 控制环：加一圈外描边压住，避免亮环直接压在地图/头像上显脏
+      g.strokeStyle = 'rgba(6,8,12,.6)';
+      g.lineWidth = 5;
+      g.beginPath(); g.arc(sx, sy, r + 4.0, 0, Math.PI * 2); g.stroke();
+      g.strokeStyle = ring;
+      g.lineWidth = 2.2;
+      g.beginPath(); g.arc(sx, sy, r + 4.0, 0, Math.PI * 2); g.stroke();
+    }
+
+    // 阵营底环：先铺一个深色外沿，再铺阵营色。
+    // 只有阵营色时，深色地图上边界会糊；只有深色时，英雄就没了归属。
+    // 两层叠加 = 无论地图明暗，头像边界都清楚。
+    g.beginPath(); g.arc(sx, sy, r + 2.6, 0, Math.PI * 2);
+    g.fillStyle = 'rgba(6,8,12,.85)';
+    g.fill();
+    g.beginPath(); g.arc(sx, sy, r + 1.9, 0, Math.PI * 2);
+    g.fillStyle = meta.t === 0 ? '#46b47c' : '#d1463f';
+    g.fill();
+
+    g.save();
+    g.beginPath(); g.arc(sx, sy, r, 0, Math.PI * 2); g.clip();
+    const im = AV[it.h];
+    if (im && im.complete && im.naturalWidth) {
+      g.drawImage(im, sx - r, sy - r, r * 2, r * 2);
+    } else {
+      g.fillStyle = meta.t === 0 ? '#2c5e45' : '#6d2a28';
+      g.fillRect(sx - r, sy - r, r * 2, r * 2);
+      g.fillStyle = '#e6ebf2';
+      g.font = `600 ${Math.round(r * 0.95)}px sans-serif`;
+      g.textAlign = 'center'; g.textBaseline = 'middle';
+      g.fillText(meta.n.charAt(0), sx, sy);
+    }
+    g.restore();
+
+    // 血条：紧贴头像下缘，略窄于头像（避免相邻血条首尾相连成一条长线）
+    const BW = AP * 0.86, BH = 3.5;
+    const by = sy + r + 3;
+    g.fillStyle = 'rgba(4,7,11,.9)';
+    g.fillRect(sx - BW / 2, by, BW, BH);
+    g.fillStyle = frac > .5 ? '#5fd08a' : frac > .25 ? '#e0a030' : '#e05555';
+    g.fillRect(sx - BW / 2, by, BW * frac, BH);
+
+    // 状态名配合颜色环，移动端及色觉差异下也能直接读懂控制类型。
+    if (controlText && !it.covered) {
+      g.font = '700 10px sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
+      g.lineWidth = 3; g.strokeStyle = '#080d16';
+      g.strokeText(controlText, sx, sy + r + 15);
+      g.fillStyle = ring; g.fillText(controlText, sx, sy + r + 15);
+    }
+
+    // 名字：画在头像**上方**，血条在下方 —— 各自紧贴头像。
+    // 为什么不像之前那样名字放血条下面：被压住的英雄只画血条不画名字，
+    // 结果那一截孤立的血条横在别人名字下方，看着像「血条挂错了人」。
+    // 现在血条固定贴头像下缘、名字固定贴头像上缘，两者永不同框。
+    if (it.covered) continue;
+    g.font = '600 10px -apple-system,"PingFang SC",sans-serif';
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    const ty = sy - r - 8;
+    g.lineWidth = 3;
+    g.strokeStyle = 'rgba(4,7,11,.92)';
+    g.strokeText(meta.n, sx, ty);
+    g.fillStyle = meta.t === 0 ? '#b6f0cd' : '#ffc0bc';
+    g.fillText(meta.n, sx, ty);
+  }
+
+  // ---- 空中特效（弹道 / 射线 / 落点 / 爆点 / 伤害飘字）----
+  // 必须放在头像之后。上一版把这些全压在头像下面，团战时 10 个头像
+  // 正好盖住技能中心，所以「只能看到血条在掉」。
+  drawFxLayer(i, true);
+  drawSpellLabels(i);
+
+  // ---- 击杀：这是全场最重要的瞬间，必须给足反馈 ----
+  drawKillFx(i, w, h);
+
+  // ---- 画面外的人：边缘箭头 + 小头像，点一下镜头飞过去 ----
+  for (const o of offscreen) {
+    // 从画面中心指向该英雄，与画布边界求交
+    const cx = w / 2, cy = h / 2;
+    let dx = o.x - cx, dy = o.y - cy;
+    const len = Math.hypot(dx, dy) || 1;
+    dx /= len; dy /= len;
+    const m = 26;
+    const tx = dx > 1e-6 ? (w - m - cx) / dx : dx < -1e-6 ? (m - cx) / dx : 1e9;
+    const ty = dy > 1e-6 ? (h - m - cy) / dy : dy < -1e-6 ? (m - cy) / dy : 1e9;
+    const t = Math.min(tx, ty);
+    const ex = cx + dx * t, ey = cy + dy * t;
+
+    g.save();
+    g.translate(ex, ey);
+    // 箭头
+    g.rotate(Math.atan2(dy, dx));
+    g.fillStyle = o.meta.t === 0 ? 'rgba(76,175,125,.85)' : 'rgba(217,83,79,.85)';
+    g.beginPath();
+    g.moveTo(9, 0); g.lineTo(-4, -6); g.lineTo(-4, 6);
+    g.closePath(); g.fill();
+    g.restore();
+
+    // 小头像
+    const rr = 11;
+    g.save();
+    g.beginPath(); g.arc(ex, ey, rr, 0, Math.PI * 2); g.clip();
+    const im = AV[o.meta.slug];
+    if (im && im.complete && im.naturalWidth) {
+      g.drawImage(im, ex - rr, ey - rr, rr * 2, rr * 2);
+    }
+    g.restore();
+    g.strokeStyle = o.meta.t === 0 ? '#4caf7d' : '#d9534f';
+    g.lineWidth = 2;
+    g.beginPath(); g.arc(ex, ey, rr, 0, Math.PI * 2); g.stroke();
+  }
+
+  // 画面外人数提示
+  if (offscreen.length) {
+    g.font = '10px -apple-system,sans-serif';
+    g.textAlign = 'left'; g.fillStyle = 'rgba(190,200,215,.75)';
+    g.fillText(`${offscreen.length} 人在视野外`, 10, h - 10);
+  }
+
+  $('#clock').textContent = fmtClock(M.clock0 + cur);
+}
+
+function fmtClock(sec) {
+  sec = Math.max(0, sec);
+  const m = Math.floor(sec / 60);
+  const s = sec - m * 60;
+  return String(m).padStart(2, '0') + ':' + s.toFixed(1).padStart(4, '0');
+}
+
+// =====================================================================
+// 交互
+// =====================================================================
+let drag = null;
+cv.addEventListener('mousedown', e => {
+  drag = { x: e.clientX, y: e.clientY, cx: view.cx, cy: view.cy };
+  follow = false; syncFollow();
+  cv.classList.add('drag');
+});
+window.addEventListener('mouseup', () => { drag = null; cv.classList.remove('drag'); });
+window.addEventListener('mousemove', e => {
+  if (!drag) return;
+  view.cx = drag.cx - (e.clientX - drag.x) / view.scale;
+  view.cy = drag.cy + (e.clientY - drag.y) / view.scale;   // 翻转：鼠标下移 = 世界 y 减小
+  draw();
+});
+cv.addEventListener('wheel', e => {
+  e.preventDefault();
+  follow = false; syncFollow();
+  const r = cv.getBoundingClientRect();
+  const [wx, wy] = S2W(e.clientX - r.left, e.clientY - r.top);
+  const k = e.deltaY > 0 ? 0.86 : 1.16;
+  view.scale = Math.max(view.base * 0.25, Math.min(view.base * 20, view.scale * k));
+  const [nx, ny] = S2W(e.clientX - r.left, e.clientY - r.top);
+  view.cx += wx - nx;
+  view.cy += wy - ny;
+  draw();
+}, { passive: false });
+cv.addEventListener('dblclick', () => {
+  follow = true; syncFollow();
+  const box = liveBox(cur) || fitAll();
+  fitBox(box, true); draw();
+});
+
+// =====================================================================
+// 英雄面板
+// =====================================================================
+function renderHeroes() {
+  const i = fi(cur);
+  $('#heroes').innerHTML = H.map((m, hi) => {
+    const [hp, mx] = hpAt(m.slug, cur);
+    const alive = F.al[m.slug][i] === 1;
+    const frac = mx ? Math.max(0, Math.min(1, hp / mx)) : 0;
+    const bar = frac > .5 ? '#5fd08a' : frac > .25 ? '#e0a030' : '#e05555';
+    const av = D.avatars && D.avatars[m.slug]
+      ? `<img class="av" src="${D.avatars[m.slug]}">`
+      : `<span class="av fb"></span>`;
+    return `<div class="hero ${alive ? '' : 'dead'}" data-h="${m.slug}">
+      ${av}
+      <div style="min-width:0">
+        <div class="hname"><b class="r${m.t}">${m.n}</b>
+          <span class="muted">${m.lvl}</span></div>
+        <div class="hpbar"><i style="width:${frac * 100}%;background:${bar}"></i></div>
+      </div>
+      <span class="hpnum">${Math.round(hp)}/${mx}</span>
+    </div>`;
+  }).join('');
+}
+$('#heroes').addEventListener('click', e => {
+  const el = e.target.closest('.hero');
+  if (!el) return;
+  // 点击英雄 = 镜头对准他
+  const m = H[IDX[el.dataset.h]];
+  const p = posAt(m.slug, cur);
+  follow = false; syncFollow();
+  if (p[0] != null) {
+    view.cx = p[0]; view.cy = p[1];
+    view.scale = view.base * 3;
+    draw();
+  }
+});
+
+// =====================================================================
+// 事件流
+// =====================================================================
+// 控制类型缩写 -> 中文。数据里存的是 stun/sil/slow（紧凑、方便存），
+// 展示时必须转中文，否则事件流里会露出 'sil' 这种英文。
+const KINDS = ks => ks.map(k =>
+  ({ stun: '眩晕', sil: '沉默', slow: '减速' })[k] || k).join('/');
+
+// 控制事件的正文。
+// 技能名本身可能已经带了效果词（「双生龙息·减速」），再补一次「减速」就变成
+// 「双生龙息·减速 减速」。所以名字里已含该字面时就不再重复。
+function ctrlKind(c) {
+  const words = c.k.map(k => ({ stun: '眩晕', sil: '沉默', slow: '减速' })[k] || k);
+  const name = String(c.n || '');
+  const need = words.filter(w => !name.includes(w));
+  return need.length ? need.join('/') : '';
+}
+// 控制持续时长。⚠ 函数名不能叫 DUR —— 顶部 const DUR = M.dur 是团战总时长，
+// 重名会直接抛 Identifier already declared，整页白屏。
+function ctrlDur(c) {
+  return (c.d && c.d > 0) ? '（' + c.d.toFixed(2) + 's）' : '';
+}
+
+function evHTML(t, tag, cls, who, text) {
+  return `<div class="ev" data-t="${t}">
+    <span class="ts">${fmtClock(M.clock0 + t)}</span>
+    <span class="tx"><span class="tag ${cls}">${tag}</span>${text}</span>
+  </div>`;
+}
+const nm = i => i == null || i < 0 ? ''
+  : `<span class="who r${H[i].t}">${H[i].n}</span>`;
+
+function renderFeed() {
+  // 技能名可能自带英雄前缀（「主宰 · 剑刃风暴」），而事件流前面已经写了施法者，
+  // 直接拼会出现「主宰 主宰 · 剑刃风暴」。所以先把前缀剥掉再拼。
+  const bareName = (n, hi) => {
+    const hn = H[hi] ? H[hi].n : '';
+    let t = String(n || '');
+    if (hn && t.startsWith(hn)) {
+      t = t.slice(hn.length).replace(/^\s*·\s*/, '').trim();
+    }
+    return t || String(n || '');
+  };
+
+  const evs = [];
+  for (const s of D.spells)
+    evs.push({ t: s.t, h: evHTML(s.t, '技能', 't-spell', s.c,
+      nm(s.c) + ' ' + bareName(s.n, s.c) + (s.tg.length ? ' → ' + nm(s.tg[0]) : '')) });
+  for (const it of D.items)
+    evs.push({ t: it.t, h: evHTML(it.t, '物品', 't-item', it.c,
+      nm(it.c) + ' ' + bareName(it.n, it.c)) });
+  for (const k of D.kills)
+    evs.push({ t: k.t, h: evHTML(k.t, '阵亡', 't-kill', k.v,
+      nm(k.v) + (k.by >= 0 ? ' 被 ' + nm(k.by) + ' 击杀' : ' 阵亡')) });
+  for (const c of D.ctrl)
+    evs.push({ t: c.t, h: evHTML(c.t, '控制', 't-ctrl', -1,
+      nm(c.tg) + ' 被「' + c.n + '」' + ctrlKind(c) + ctrlDur(c)) });
+  evs.sort((a, b) => a.t - b.t);
+  $('#feed').innerHTML = evs.map(e => e.h).join('');
+  $('#feed').addEventListener('click', e => {
+    const el = e.target.closest('.ev');
+    if (!el) return;
+    cur = Math.max(0, Math.min(DUR, parseFloat(el.dataset.t)));
+    sync();
+  });
+}
+
+// =====================================================================
+// 随播解说：只使用相对秒，模型文字一律作为纯文本节点展示。
+// =====================================================================
+const commentary = D.commentary && typeof D.commentary === 'object' ? D.commentary : null;
+const commentText = value => typeof value === 'string' ? value.trim() : '';
+const cues = (commentary && Array.isArray(commentary.cues) ? commentary.cues : [])
+  .filter(c => c && typeof c.t === 'number' && Number.isFinite(c.t))
+  .map(c => ({ t: Math.max(0, Math.min(DUR, c.t)),
+    title: commentText(c.title), text: commentText(c.text) }))
+  .sort((a, b) => a.t - b.t);
+const cueButtons = [];
+let activeCue = -2, conclusionEnded = null;
+
+function initCommentary() {
+  $('#commentaryStatus').textContent = !commentary ? '无解说'
+    : commentary.status === 'ai' ? 'AI 解说'
+    : commentary.status === 'fallback' ? '基础解说' : '文字解说';
+  const title = commentText(commentary && commentary.title);
+  if (title) $('#commentaryListTitle').textContent = title + ' · 点击跳转';
+  const list = $('#commentaryList');
+  if (!cues.length) {
+    const empty = document.createElement('p');
+    empty.className = 'comment-text';
+    empty.textContent = '暂无分段解说。';
+    list.appendChild(empty);
+  }
+  cues.forEach((cue, index) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'cue';
+    const time = document.createElement('span');
+    time.className = 'comment-time';
+    time.textContent = '+' + fmtClock(cue.t);
+    const heading = document.createElement('strong');
+    heading.textContent = cue.title || '解说 ' + (index + 1);
+    const text = document.createElement('p');
+    text.textContent = cue.text;
+    button.append(time, heading, text);
+    button.addEventListener('click', () => { cur = cue.t; sync(); });
+    list.appendChild(button);
+    cueButtons.push(button);
+  });
+  const result = commentary && commentary.conclusion;
+  $('#conclusionVerdict').textContent = commentText(result && result.verdict) || '暂无结论';
+  for (const [key, label] of [['reason', '判断依据'], ['focus', '关键关注'], ['improvement', '改进建议']]) {
+    const field = document.createElement('div');
+    field.className = 'conclusion-field';
+    const term = document.createElement('dt');
+    term.textContent = label;
+    const detail = document.createElement('dd');
+    detail.textContent = commentText(result && result[key]) || '暂无内容';
+    field.append(term, detail);
+    $('#conclusionFields').appendChild(field);
+  }
+}
+
+function syncCommentary() {
+  // 找到最近一条已到达的解说；首次解说之前不提前展示未来内容。
+  let lo = 0, hi = cues.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (cues[mid].t <= cur) lo = mid + 1;
+    else hi = mid;
+  }
+  const index = lo - 1;
+  if (index !== activeCue) {
+    if (cueButtons[activeCue]) {
+      cueButtons[activeCue].classList.remove('now');
+      cueButtons[activeCue].removeAttribute('aria-current');
+    }
+    activeCue = index;
+    const cue = cues[index];
+    $('#commentaryTitle').textContent = cue ? cue.title || '当前解说'
+      : cues.length ? '等待解说开始' : '暂无解说';
+    $('#commentaryText').textContent = cue ? cue.text
+      : cues.length ? '播放到对应时间后显示解说，可点击列表跳转。' : '此回放未附带分段文字解说。';
+    $('#commentaryTime').textContent = cue ? '+' + fmtClock(cue.t) : '';
+    if (cueButtons[index]) {
+      cueButtons[index].classList.add('now');
+      cueButtons[index].setAttribute('aria-current', 'true');
+    }
+  }
+  const ended = cur >= DUR;
+  if (ended !== conclusionEnded) {
+    conclusionEnded = ended;
+    $('#conclusion').classList.toggle('ended', ended);
+    $('#conclusionHeading').textContent = ended ? '回放结束 · 最终结论' : '最终结论';
+  }
+}
+
+// =====================================================================
+// 播放
+// =====================================================================
+let last = 0;
+let holdTo = 0;          // 播完后停留的截止时刻（毫秒时间戳）
+
+function loop(ts) {
+  if (!playing) return;
+  if (last) {
+    const dt = (ts - last) / 1000;
+
+    // 播到尾：先停 1.6 秒让人看清最后一击，再从头循环。
+    // 直接跳回去会有「闪断」，观感很廉价。
+    if (cur >= DUR) {
+      if (!holdTo) holdTo = ts + 1600;
+      if (ts >= holdTo) {
+        holdTo = 0;
+        cur = 0;
+        const b = liveBox(0);
+        if (b) fitBox(b, true);      // 瞬间归位，避免回卷时镜头长距离滑行
+        sync();
+      }
+    } else {
+      cur += dt * speed;
+      if (cur > DUR) cur = DUR;
+      sync();
+    }
+  }
+  syncCommentary();
+  last = ts;
+  requestAnimationFrame(loop);
+}
+
+function sync() {
+  cur = Math.max(0, Math.min(DUR, Number.isFinite(cur) ? cur : 0));
+  if (cur < DUR) holdTo = 0;
+  syncCommentary();
+  $('#seek').value = DUR > 0 ? Math.round(cur / DUR * 1000) : 0;
+  draw();
+  renderHeroes();
+  const evs = $('#feed').children;
+  for (let k = 0; k < evs.length; k++) {
+    const t = parseFloat(evs[k].dataset.t);
+    evs[k].classList.toggle('now', Math.abs(t - cur) < 0.3);
+  }
+}
+
+$('#play').onclick = () => {
+  playing = !playing;
+  $('#play').textContent = playing ? '⏸ 暂停' : '▶ 播放';
+  if (playing) { last = 0; requestAnimationFrame(loop); }
+};
+$('#seek').oninput = e => { cur = e.target.value / 1000 * DUR; sync(); };
+$('#speed').onclick = e => {
+  speed = SPEEDS[(SPEEDS.indexOf(speed) + 1) % SPEEDS.length];
+  e.target.textContent = speed + 'x';
+};
+function syncFollow() {
+  const b = $('#follow');
+  b.textContent = follow ? '跟随镜头' : '自由视角';
+  b.style.color = follow ? '#7fd0ff' : 'var(--dim)';
+}
+$('#follow').onclick = () => {
+  follow = !follow;
+  if (follow) { const box = liveBox(cur) || fitAll(); fitBox(box, true); }
+  syncFollow(); draw();
+};
+
+window.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.closest('.cue')) return;
+  if (e.key === ' ') { e.preventDefault(); $('#play').click(); }
+  if (e.key === 'ArrowRight') { cur = Math.min(DUR, cur + 0.5); sync(); }
+  if (e.key === 'ArrowLeft') { cur = Math.max(0, cur - 0.5); sync(); }
+});
+
+// =====================================================================
+// 启动
+// =====================================================================
+const alive0 = H.length;
+$('#meta').textContent =
+  `比赛 ${M.match} · ${fmtClock(M.clock0)} – ${fmtClock(M.clock0 + DUR)} · `
+  + `${alive0} 英雄 · ${D.spells.length} 施法 · ${D.kills.length} 阵亡`;
+
+initCommentary();
+renderFeed();
+resize();
+renderHeroes();
+syncFollow();
+window.addEventListener('resize', resize);
+
+// ---- 打开即播，播完自动重来 ----
+// 这是个「团战 demo」，不是编辑器。打开页面还要人点一下播放，
+// 就丢掉了一半的观感 —— 尤其是拿给别人看的时候。
+// 循环播放的意义：35 秒太短，看完就黑屏等于把页面废了；
+// 循环也方便反复看某一段。
+function autoplay() {
+  cur = 0;
+  playing = true;
+  $('#play').textContent = '⏸ 暂停';
+  last = 0;
+  requestAnimationFrame(loop);
+}
+// 首帧先把镜头摆到位（否则从全图猛推过来，开头会晃）
+{ const b0 = liveBox(0); if (b0) fitBox(b0, true); sync(); }
+autoplay();
+</script>
+</body>
+</html>

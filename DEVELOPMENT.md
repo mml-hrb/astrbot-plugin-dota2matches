@@ -3999,6 +3999,16 @@ workflow 里已写成 `token: ${{ secrets.SYNC_TOKEN || github.token }}` —— 
 > 本仓库要的是完整镜像，所以选了 PAT 方案。
 
 
+## HTML 团战同步解说
+
+`dota_fight_html.build()` 生成回放与完整窗口的精简证据；`dota_fight_commentary` 汇总施法、控制、保护状态、阵亡及按英雄归属的召唤物伤害，不再以事件前 N 行截断。时间全部先转换为回放相对秒；比赛时钟由 `match_clock_offset` 单独换算。
+
+`main._render_fight_html()` 使用独立系统提示调用现有报告模型，传入焦点账号对应的中文英雄名，不套整场两步归因格式。模型返回分段 `cues` 和 `conclusion`，经结构与时间范围校验后写回 HTML。模型失败或结构异常时，回放照常交付，明确显示事实摘要而不是伪造 AI 点评。
+
+模板同步播放、跳转和循环进度，解说点击可定位，结论常驻显示。技能名和施法来源采用中文标签，目标不明时只画来源提示；图上范围属于示意而非精确命中判定。所有模型文本用 `textContent` 渲染，内嵌 JSON 转义脚本闭合字符。
+
+离线回归可执行 `python -m unittest test_fight_commentary -v`。实际模型仍可能误读动作意义，结构校验不代表内容经过人工审核；预览样例若经过人工修订，应单独标注，不能冒充全自动输出。
+
 ## 版本发布（打 tag 与推送）
 
 **约定：每次推送都带一个 tag，tag 名原样取 `metadata.yaml` 里 `version` 的值**

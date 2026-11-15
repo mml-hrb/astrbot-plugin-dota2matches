@@ -34,11 +34,21 @@ except Exception:  # noqa: BLE001
     except Exception:  # noqa: BLE001
         _QuotedReply = None  # type: ignore[assignment]
 
+try:  # 文件消息组件（团战回放 HTML 用）：同样随版本变路径，取不到就退回「不支持」
+    from astrbot.core.message.components import File as _FileComponent
+except Exception:  # noqa: BLE001
+    try:
+        from astrbot.api.message.components import File as _FileComponent  # type: ignore
+    except Exception:  # noqa: BLE001
+        _FileComponent = None  # type: ignore[assignment]
+
 try:  # 插件目录被作为包加载时的相对导入
     from . import (
         dota_chat,
         dota_cron,
         dota_esports,
+        dota_fight_commentary,
+        dota_fight_html,
         dota_hero_kb,
         dota_hero_kb_ingest,
         dota_history,
@@ -107,6 +117,8 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
     import dota_chat  # type: ignore[no-redef]
     import dota_cron  # type: ignore[no-redef]
     import dota_esports  # type: ignore[no-redef]
+    import dota_fight_commentary  # type: ignore[no-redef]
+    import dota_fight_html  # type: ignore[no-redef]
     import dota_hero_kb  # type: ignore[no-redef]
     import dota_hero_kb_ingest  # type: ignore[no-redef]
     import dota_history  # type: ignore[no-redef]
@@ -2709,6 +2721,45 @@ class Dota2Plugin(Star):
         if result is not True:
             logger.warning(
                 f"[dota2] 战报图片未确认送达（平台返回 {result!r}），改发文本"
+            )
+            return False
+        return True
+
+    async def _send_file(self, umo: str, path: str, display_name: str = "") -> bool:
+        """把本地文件作为「文件消息」发到会话（团战回放 HTML 用）。
+
+        与 :meth:`_send_image` 的区别与共性：
+
+        * **必须用 ``File`` 组件，不能 ``file_image``**。HTML 交给
+          ``file_image`` 会被 QQ 当成图片去解析，对方收到的是一张打不开的
+          破图 —— 而且不会报错。
+        * 路径要以 **``file://`` URI** 交给 ``File``。框架里
+          （``aiocqhttp_message_event._from_segment_to_dict``）看到绝对路径
+          也会转成 URI，但显式一点更稳。
+        * 返回值判据与 ``_send_image`` 一致：**只有 ``True`` 算送达**。
+          QQ 适配器在发文件失败时会「不抛异常、返回 None」，
+          把 None 当成功会让任务台账记「已发出」而用户什么都没收到。
+
+        Args:
+            display_name: 对方看到的文件名。**必须带扩展名**，否则接收端
+                不知道用什么打开（手机 QQ 会显示成「未知文件」）。
+        """
+        if not path or not os.path.isfile(path):
+            return False
+        if _FileComponent is None:
+            logger.warning("[dota2] 当前框架没有 File 组件，无法发送文件")
+            return False
+        name = display_name or os.path.basename(path)
+        uri = Path(path).resolve().as_uri()
+        try:
+            chain = MessageChain([_FileComponent(name=name, file=uri)])
+        except Exception as e:  # noqa: BLE001 - 老版本框架签名不同
+            logger.warning(f"[dota2] 组装文件消息失败：{e}")
+            return False
+        result = await self._send(umo, chain)
+        if result is not True:
+            logger.warning(
+                f"[dota2] 文件未确认送达（平台返回 {result!r}）：{name}"
             )
             return False
         return True
@@ -6912,7 +6963,13 @@ class Dota2Plugin(Star):
             # 主动来查往往就是「刚装完想确认一下」，所以顺手清掉缓存，
             # 让紧接着的那份战报立刻用上新环境，而不是先等一分钟。
             self._invalidate_runtime_cache()
-            yield event.plain_result(self._replay_runtime().describe())
+            runtime = self._replay_runtime()
+            # 环境说明 + Fine 状态一起给：团战复盘现在发的是 HTML 回放，
+            # 缺 Fine 时主环境明明是「就绪」，回放却出不来 —— 两段必须同时看到，
+            # 否则用户会以为「环境都好，为什么还失败」。
+            yield event.plain_result(
+                runtime.describe() + "\n\n" + runtime.describe_extra()
+            )
             return
 
         if not tokens or len(tokens) < 2 or not re.fullmatch(r"\d{6,20}", tokens[0]):
@@ -7078,13 +7135,22 @@ class Dota2Plugin(Star):
                 focus_raw, players_in_match, umo=umo, heroes=heroes
             )
             if failed and not focus_ids:
+                # ⚠️ **2026-11-13 起这里不再中止流程。**
+                #
+                # 回放（现在的产物）画的是全场十个人，不区分主视角 ——
+                # 「焦点玩家没解析出来」对它毫无影响。原来会 return，
+                # 是因为那时要给模型写「以某人的视角」的复盘正文。
+                # 现在为了一个字面参数把整份回放砍掉，属于迁怒。
+                #
+                # 保留提示（用户可能真的想聚焦，得知道自己写错了名字），
+                # 但继续往下走：能出的回放先给，别让他白等 15 秒解析。
+                logger.info(f"[dota2] 团战焦点没解析出来，继续出回放：{failed}")
                 await self._send_to_session(
                     umo,
-                    "❌ 焦点玩家没能解析出来：\n"
+                    "ℹ️ 焦点玩家没能解析出来（不影响回放，回放是全场视角）：\n"
                     + "\n".join(f"· {item}" for item in failed)
-                    + "\n可以直接用 32 位账号 ID 再试一次。",
+                    + "\n如果确实需要按人聚焦，可以换成 32 位账号 ID 再试。",
                 )
-                return False, "点名的焦点玩家没解析出来"
         # 没点名时的两级回落 —— 「以第一步战报里的焦点玩家为主视角」。
         #
         # 这里原本写的是「后台任务手里没有 event，刻意不做自动聚焦」，理由是
@@ -7120,36 +7186,254 @@ class Dota2Plugin(Star):
         label = f"比赛 {match_id} 第 {index} 波"
 
         # 真正的重活从这里开始，**必须**过队列：同一时刻只允许一个 JVM 在跑。
+        #
+        # 返回的 ``block`` 是给模型看的文本数据块。**现在不再用它**（复盘正文
+        # 已经改成发 HTML 回放），但这个调用**必须保留**：
+        # 它内部完成「下载 demo → 跑 Snap/Dump/Eco/Fine → 写缓存」的全过程，
+        # 回放渲染要读的 `fine.csv` / `combat.jsonl` 正是它产出的。
+        # 删掉它等于断掉回放的数据来源。
+        #
+        # TODO(2026-11-13): AI 复盘接进 HTML 后，这里的返回值才会重新被用上
+        # （那时是给 HTML 内嵌点评用的）。届时可以考虑把「解析」与「拼数据块」
+        # 拆成两个函数，现在拆没有收益。
         waiting = self.replay_queue.pending()
         self._jobs.stage(
             f"排队等录像解析（前面还有 {waiting} 个）"
             if waiting
             else "正在下载并解析录像（需要跑三次解析器）"
         )
-        block = await self.replay_queue.run(
+        _block = await self.replay_queue.run(
             label,
             lambda: self._build_replay_block(
                 match, fight, heroes, items_const, focus_ids
             ),
         )
 
-        await self._send_to_session(umo, f"🔍 {label} 录像解析完成，正在生成复盘…")
-        self._jobs.stage("录像解析完成，正在整理数据并写复盘")
-        prompt = self._fight_prompt(
-            match, fight, index, block, focus_ids, focus_names, heroes,
-            hero_block=self._hero_kb_block(match, heroes, focus_ids),
+        # ==================================================================
+        # 出口：发「可交互团战回放 HTML」
+        # ==================================================================
+        #
+        # 2026-11-13 起，团战复盘的产物从「模型写一段复盘正文 → 排版成图」
+        # 换成「渲染一份能播放的 HTML 回放」。原因很直接：文字复盘说不清
+        # 「谁在第几秒站在哪、技能怎么落」，而回放能。
+        #
+        # ⚠️ **下面那段 AI 复盘的代码整段被注释保留了**，一行没删：
+        # 后续要把 AI 复盘**接进 HTML 里**（在回放上做时间轴标注、逐波点评），
+        # 那是一次大改，不是把这段打开就能用的。现在留着当参考，
+        # **不要直接取消注释** —— 它依赖的 `_fight_prompt` / `_deliver_report`
+        # 与未来的 HTML 内嵌方案不是同一条路。
+        #
+        # TODO(2026-11-13): AI 复盘接入 HTML 时间轴后再重写这一段。
+        html_path, note = await self._render_fight_html(
+            umo, match, fight, index, label,
+            focus_ids=focus_ids, focus_names=focus_names, heroes=heroes,
         )
-        report = await self._generate_report_for_umo(umo, prompt)
-        if report:
-            # 团战复盘同样是「长报告」：走统一出口，先出图再发。
-            # headline 传空 —— 上面那句「正在生成复盘」已经交代过上下文了。
-            await self._deliver_report(umo, "", report, label="团战复盘")
-            return True, "团战复盘已发出"
+        if html_path:
+            return True, "团战回放已发出"
+        # 回放渲染不出来（引擎缺 Fine / 录像过期 / 数据不够）。
+        # 这里**不回退到 AI 复盘** —— 旧逻辑按要求暂时不触发。
+        # 只把原因如实告诉用户，并附上这一波的基础信息，免得一句「失败」什么都没给。
         await self._send_to_session(
             umo,
-            self._llm_failure_notice() + "\n\n以下是这一波的原始数据：\n\n" + block,
+            f"❌ {label} 的回放没能生成：{note}\n\n"
+            f"{self._fight_brief_text(match, fight, index)}",
         )
-        return False, "模型没出正文，已发这一波的原始数据"
+        return False, f"回放渲染失败：{note}"
+
+    # ------------------------------------------------------------------
+    # 以下为「AI 复盘正文」旧出口，2026-11-13 起**暂时停用**，保留作参考。
+    #
+    # 停用原因：团战复盘改为发 HTML 回放，AI 正文那条路要重新设计
+    # （计划是把点评挂到回放的时间轴上，而不是另发一段长文）。
+    # 恢复时请连 `_fight_prompt` / `_deliver_report` 一起看，
+    # 注意 `_deliver_report` 是全插件后台复盘出口的唯一收口，不能绕开它。
+    # ------------------------------------------------------------------
+    #
+    #     await self._send_to_session(umo, f"🔍 {label} 录像解析完成，正在生成复盘…")
+    #     self._jobs.stage("录像解析完成，正在整理数据并写复盘")
+    #     prompt = self._fight_prompt(
+    #         match, fight, index, block, focus_ids, focus_names, heroes,
+    #         hero_block=self._hero_kb_block(match, heroes, focus_ids),
+    #     )
+    #     report = await self._generate_report_for_umo(umo, prompt)
+    #     if report:
+    #         # 团战复盘同样是「长报告」：走统一出口，先出图再发。
+    #         # headline 传空 —— 上面那句「正在生成复盘」已经交代过上下文了。
+    #         await self._deliver_report(umo, "", report, label="团战复盘")
+    #         return True, "团战复盘已发出"
+    #     await self._send_to_session(
+    #         umo,
+    #         self._llm_failure_notice() + "\n\n以下是这一波的原始数据：\n\n" + block,
+    #     )
+    #     return False, "模型没出正文，已发这一波的原始数据"
+
+    def _fight_brief_text(self, match: dict, fight: dict, index: int) -> str:
+        """回放渲染失败时的兜底：这一波的基本事实（不给模型，直接给用户看）。
+
+        之所以还要给一段：失败时如果只回一句「生成失败」，用户既不知道
+        这波团到底打了什么，也无从判断要不要重试。这几行全部来自
+        OpenDota 的 ``teamfights``，零成本、不需要录像。
+        """
+        def _mmss(sec: Any) -> str:
+            try:
+                total = max(0, int(sec))
+            except (TypeError, ValueError):
+                return "-"
+            return "%02d:%02d" % (total // 60, total % 60)
+
+        # slot -> 玩家。**按 slot 对，不按下标**：缺人时下标会整体错位
+        # （同一个坑在 ``build_fight_block`` 里踩过，见那里的注释）。
+        by_slot = {
+            int(p.get("player_slot") or 0): p
+            for p in (match.get("players") or [])
+            if isinstance(p, dict)
+        }
+        lines = [
+            f"这波团：{_mmss(fight.get('start'))} – {_mmss(fight.get('end'))}，"
+            f"双方共阵亡 {int(fight.get('deaths') or 0)} 人。"
+        ]
+
+        # 逐波伤害在 teamfights[].players[].damage（服务端聚合好的），
+        # 比整场 hero_damage 更能说明「这一波谁在打」。
+        rows: list[tuple[int, str]] = []
+        for fp in (fight.get("players") or []):
+            if not isinstance(fp, dict):
+                continue
+            p = by_slot.get(int(fp.get("player_slot") or 0)) or {}
+            hero_id = int(p.get("hero_id") or 0)
+            name = str(p.get("hero_name") or "").strip() or f"英雄 #{hero_id}"
+            rows.append((int(fp.get("damage") or 0), name))
+        rows.sort(key=lambda r: -r[0])
+
+        top = [r for r in rows[:4] if r[0] > 0]
+        if top:
+            lines.append("")
+            lines.append("这波伤害前四：")
+            lines.extend(f"· {name}　{damage:,}" for damage, name in top)
+        return "\n".join(lines)
+
+    async def _render_fight_html(
+        self,
+        umo: str,
+        match: dict,
+        fight: dict,
+        index: int,
+        label: str,
+        *,
+        focus_ids: list[int] | None = None,
+        focus_names: dict | None = None,
+        heroes: dict | None = None,
+    ) -> tuple[str | None, str]:
+        """把一波团渲染成单文件 HTML 回放，发到会话。
+
+        Returns:
+            ``(文件路径, "")`` 成功；``(None, 原因)`` 失败。
+
+        ⚠️ **时间轴要换算**（这一步错了不报错，只是画错时间段）：
+        ``fight["start"] / ["end"]`` 是**比赛时间**，而渲染器要的是
+        **战斗日志时间**，两者差 ``offsets["combatlog_to_match"]``。
+        这个偏移由 :meth:`_build_replay_block` 里的 ``calibrate`` 算出，
+        这里重新算一次（它只读已缓存的文件，很便宜），不复用上一个函数的
+        返回值 —— 那个函数返回的是字符串，为了传一个 float 去改它的签名
+        不值得。
+        """
+        engine = self._replay_engine_dir()
+        if not dota_replay.has_fine_exporter(engine):
+            return None, dota_replay.FINE_SETUP_HINT
+
+        match_id = int(match.get("match_id") or 0)
+        workdir = os.path.join(engine, "replays", str(match_id))
+        fine_path = os.path.join(workdir, "fine.csv")
+        combat_path = os.path.join(workdir, "combat.jsonl")
+        if not (os.path.exists(fine_path) and os.path.exists(combat_path)):
+            return None, (
+                "录像解析产物不完整（缺 fine.csv 或 combat.jsonl）。"
+                "如果是升级前解析的旧缓存，重跑一次 `/d2 团战` 会自动重解析。"
+            )
+
+        # ---- 比赛时间 → 战斗日志时间 ----
+        try:
+            combat = dota_replay_parse._read_combat(combat_path)
+            hp_series = dota_replay_parse._read_hp(
+                os.path.join(workdir, "hp.csv")
+            )
+            offsets = dota_replay_parse.calibrate(combat, hp_series, match)
+            c2m = float(offsets.get("combatlog_to_match") or 0)
+        except Exception as e:  # noqa: BLE001 - 标定失败就按 0 试，不要直接放弃
+            logger.warning(f"[dota2] 团战回放时间标定失败，按 0 处理：{e}")
+            c2m = 0.0
+
+        t0 = float(fight.get("start") or 0) + c2m
+        t1 = float(fight.get("end") or 0) + c2m
+        # 前后各留 3 秒：团战「开打」与「真打起来」之间常有几秒的接近过程，
+        # 正好卡在开团第一帧会让人觉得「一打开就已经打完了」。
+        t0 -= 3.0
+        t1 += 3.0
+
+        out_path = os.path.join(workdir, f"fight_{index}.html")
+        self._jobs.stage("录像解析完成，正在渲染团战回放")
+        # 渲染一帧 350 帧的动画要读 17 MB 的 fine.csv、再拼 450 KB 的 HTML，
+        # 实测约 2.7 秒。这个时间用户完全能等，所以不另设进度提示，
+        # 只把「在渲染」写进台账 —— 上面那句「解析完成」已经交代过前后了。
+
+        evidence: dict = {}
+        try:
+            # 放线程里跑：它是同步阻塞的（读 17 MB 的 fine.csv + 拼 450 KB 的
+            # JSON），直接在事件循环里跑会把整台机器的心跳卡住 2~3 秒。
+            #
+            # ⚠️ `work_root` 要传 **`<引擎目录>/replays`**：
+            # `build()` 自己会拼 `<work_root>/<match>/`，而插件的产物落在
+            # `<引擎目录>/replays/<match>/`（见 `_build_replay_block` 开头的
+            # `workdir`）。传引擎目录会找成 `replays/123` 外面那层，
+            # 报「缺少解析产物：fine.csv」—— 文件明明在那儿。
+            info = await asyncio.to_thread(
+                dota_fight_html.build,
+                match_id,
+                t0,
+                t1,
+                os.path.join(engine, "replays"),
+                out_path,
+                evidence_out=evidence,
+                match_clock_offset=c2m,
+            )
+        except Exception as e:  # noqa: BLE001 - 渲染失败要能回话，不能抛给事件循环
+            logger.exception(f"[dota2] 团战回放渲染失败：{e}")
+            return None, str(e)
+
+        # 使用专门的结构化提示词；不要套整场两步归责和长文格式。
+        self._jobs.stage("回放已生成，正在编排同步解说与结论")
+        context = {
+            "match_id": match_id, "fight_index": index,
+            "match_start": fight.get("start"), "match_end": fight.get("end"),
+            "focus": [
+                {"name": str((focus_names or {}).get(i) or i),
+                 "hero": hname(heroes or {}, int(p.get("hero_id") or 0))}
+                for i in (focus_ids or [])
+                for p in (match.get("players") or []) if p.get("account_id") == i
+            ],
+        }
+        try:
+            raw = await self._call_report_llm(
+                dota_fight_commentary.prompt(evidence, context), umo=umo,
+                system_prompt="你是Dota2录像解说编辑。严格依照提供的录像证据输出指定JSON，不套整场战报格式。",
+            )
+            commentary = dota_fight_commentary.parse(raw, float(evidence["duration"]))
+            if commentary is not None:
+                await asyncio.to_thread(dota_fight_html.attach_commentary, out_path, commentary)
+            else:
+                logger.warning("[dota2] 团战解说未返回有效结构，保留录像事件摘要")
+        except Exception as e:  # noqa: BLE001 - 解说失败不能阻止回放交付
+            logger.warning(f"[dota2] 团战解说生成失败，保留事件摘要：{e}")
+
+        logger.info(
+            f"[dota2] 团战回放已生成：{out_path}（{info['size'] / 1024:.0f} KB，"
+            f"{info['fx']} 特效，头像 {info['avatar']}）"
+        )
+        if await self._send_file(umo, out_path, f"{label} 回放.html"):
+            return out_path, ""
+        # 文件发不出去（平台不支持 / 超限）时**不要把路径当成功返回**，
+        # 否则任务台账会记「已发出」，而用户什么都没收到。
+        return None, "回放文件没能发出去（平台可能不支持文件消息，或文件超限）"
 
     async def _build_replay_block(
         self,
@@ -7169,12 +7453,13 @@ class Dota2Plugin(Star):
         hp_path = os.path.join(workdir, "hp.csv")
         ward_path = os.path.join(workdir, "ward.csv")
         items_path = os.path.join(workdir, "items.csv")
+        fine_path = os.path.join(workdir, "fine.csv")
 
         # 产物格式会随版本变（例如 hp.csv 后来才加了「复活时刻」这一列）。
         # 不认版本号的话，旧缓存会被当成新数据用：复活倒计时永远算不出来，
         # 而且**不会报错**，只是数据静默变旧。
         marker = os.path.join(workdir, "cache_version")
-        want_version = "2"
+        want_version = "3"
         if os.path.exists(combat_path):
             try:
                 with open(marker, encoding="utf-8") as fh:
@@ -7182,12 +7467,38 @@ class Dota2Plugin(Star):
             except OSError:
                 cached_version = ""
             if cached_version != want_version:
-                for name in ("combat.jsonl", "hp.csv", "ward.csv", "items.csv"):
+                for name in ("combat.jsonl", "hp.csv", "ward.csv", "items.csv",
+                             "fine.csv"):
                     try:
                         os.remove(os.path.join(workdir, name))
                     except OSError:
                         pass
                 logger.info(f"[dota2] 比赛 {match_id} 的录像缓存版本过旧，已清理待重解析")
+            elif (
+                os.path.exists(combat_path)
+                and dota_replay.has_fine_exporter(engine)
+                and not os.path.exists(fine_path)
+            ):
+                # ---- 装了 Fine 之前解析过的老缓存 ----
+                #
+                # 这类缓存的 version 已经是新号（解析时引擎里还没有 Fine，
+                # 但版本号照样写进去了），于是「版本对得上 → 不重解析」，
+                # 而 `fine.csv` 永远补不上 —— 再点多少次 `/d2 团战` 都是
+                # 「产物不完整」，自己不会好。
+                #
+                # 判据只看「引擎有 Fine 但这份缓存没有 fine.csv」，所以
+                # 重解析一次之后就再也不成立，不会反复删。
+                #
+                # 代价是要重下 37 MB 的 demo（解析完就删了）。可接受：
+                # 老缓存只会在第一次访问时补一次，之后长期命中。
+                for name in ("combat.jsonl", "hp.csv", "ward.csv", "items.csv"):
+                    try:
+                        os.remove(os.path.join(workdir, name))
+                    except OSError:
+                        pass
+                logger.info(
+                    f"[dota2] 比赛 {match_id} 的缓存缺 fine.csv 且引擎已装 Fine，重新解析"
+                )
 
         if not os.path.exists(combat_path):
             url = await self._match_replay_url(match, match_id)
@@ -7208,6 +7519,28 @@ class Dota2Plugin(Star):
             await dota_replay_parse.run_java(java, engine, "Snap", [demo, hp_path, ward_path])
             await dota_replay_parse.run_java(java, engine, "Dump", [demo, combat_path])
             await dota_replay_parse.run_java(java, engine, "Eco", [demo, items_path])
+            # ---- Fine：0.1 秒逐帧状态，只给「团战回放 HTML」用 ----
+            #
+            # Snap 的 hp.csv 是 2.1 秒一采，拿它渲染回放会一顿一顿；Fine 给
+            # 0.1 秒，位置才连续。代价是**多跑一次 JVM、多占 17 MB**。
+            #
+            # ⚠️ 三个必须守住的点：
+            # 1. **只在引擎里有 Fine.class 时才跑**。插件市场装来的老部署可能
+            #    没更新引擎，此时不该让整条解析链失败 —— 数据块与战报不需要它。
+            # 2. **失败不能连累主链**。它是可选的，出任何错都只记日志，
+            #    让 combat/hp 照常产出（否则「团战看不了」会升级成「复盘也没了」）。
+            # 3. **必须在删 demo 之前跑**。demo 用完就删，之后再想补就要重下 37 MB。
+            if dota_replay.has_fine_exporter(engine):
+                try:
+                    await dota_replay_parse.run_java(
+                        java, engine, "Fine", [demo, fine_path]
+                    )
+                except Exception as e:  # noqa: BLE001 - 可选步骤，不能拖垮主链
+                    logger.warning(f"[dota2] Fine 逐帧导出失败（回放会退回无动画）：{e}")
+            else:
+                logger.info(
+                    "[dota2] 引擎没有 Fine.class，跳过逐帧导出（团战回放不可用）"
+                )
             # demo 有 37 MB，产物只有 7 MB 左右。产物留着（同一场再分析不同波次
             # 不用重解析），demo 必须删 —— 否则每场都攒 37 MB，云端磁盘会满。
             try:
@@ -7222,7 +7555,26 @@ class Dota2Plugin(Star):
         hp_series = dota_replay_parse._read_hp(hp_path)
         offsets = dota_replay_parse.calibrate(combat, hp_series, match)
         items = dota_replay_parse.read_items(items_path)
-        wards = dota_replay_parse.read_wards(ward_path, 0.0)
+        # A 杖祝福与幻象：两者都**不在装备栏、也不在血量表**里，
+        # 只能从战斗日志还原（2026-11-13 用户指出「不是买活，是 a 杖效果」）。
+        #
+        # · `read_aghs`：熔铸赠送的 A 杖不占装备格，受赠者身上连 modifier
+        #   都没有，全录像只留一条 ITEM 事件；自己吃祝福的则有
+        #   `modifier_item_ultimate_scepter` 且 atk==tgt。两条来源都要扫。
+        # · `read_illusions`：A 杖幻象是另一个实体，血量表只追本体，
+        #   于是「本体死了还在输出」会被模型解释成买活。
+        aghs = dota_replay_parse.read_aghs(combat)
+        illusions = dota_replay_parse.read_illusions(combat)
+        # 眼位时间在 ward.csv 里是 **demo 时间**，必须一并换算成比赛时间。
+        #
+        # ⚠️ 这里原本传的是 `0.0`（2026-11-13 发现）：于是数据块里写「14:05
+        # 夜魇放下真眼」，实际是 11:30 插的，整整偏了 155 秒。距离算的是对的
+        # （坐标没换算），所以「距团战中心 2796 码」是对的，只有时间错了 ——
+        # 模型看到「团战前一分钟刚插的眼」，会凭空多出一条「视野准备」的分析。
+        wards = dota_replay_parse.read_wards(
+            ward_path, float(offsets.get("demo_to_combatlog") or 0)
+            - float(offsets.get("combatlog_to_match") or 0)
+        )
 
         npc_label: dict[str, str] = {}
         npc_by_hero: dict[int, str] = {}
@@ -7231,12 +7583,64 @@ class Dota2Plugin(Star):
                 continue
             npc = str(info.get("name") or "")
             if npc:
-                npc_label[npc] = hname(heroes, hero_id)
-                npc_by_hero[int(hero_id)] = npc
+                # 键必须先归一化：血量/装备表里的键是 canon_npc 的产物，
+                # 直接把英雄表的原始名放进去，遇到 Ogre_Magi 这类带下划线的
+                # 就会差一个下划线，于是「查不到这个英雄」。
+                key = dota_replay_parse.canon_npc(npc)
+                npc_label[key] = hname(heroes, hero_id)
+                npc_by_hero[int(hero_id)] = key
+
+        # 装备名：录像里用的是**旧版内部键**（`blinkdagger`、`bootsofspeed`、
+        # `ultimatescepter`），而常量表的键是现行写法（`blink`、`boots`、
+        # `ultimate_scepter`）；即便键对上了，中文词表也按现行键编。
+        #
+        # 所以这里先建一张「抹掉下划线与大小写」的索引，键和 dname 都进索引，
+        # 录像里的旧键就能反查到现行键，再拿现行键去取中文名。
+        # 实测本局 87 种装备：直接命中 43 种，加这层归一化救回 34 种，
+        # 剩 10 种是 Valve 改过名的（craniumbasher / eaglehorn / emptybottle
+        # 之类），由 `dota_replay_parse._LEGACY_ITEM_KEYS` 显式补别名 ——
+        # **不做模糊匹配**，因为装备名互相太像，认错了不会有任何提示。
+        item_alias: dict[str, str] = {}
+        for key, info in (items_const or {}).items():
+            if not isinstance(info, dict):
+                continue
+            for probe in (key, str(info.get("dname") or "")):
+                norm = "".join(ch for ch in probe.lower() if ch.isalnum())
+                if norm:
+                    item_alias.setdefault(norm, key)
+
+        def _item_resolve(key: str) -> str | None:
+            """键 → 中文显示名；查不到返回 None（交给上层兜底）。"""
+            real = item_alias.get(key) or key
+            info = items_const.get(real) or {}
+            label = str(info.get("dname") or "")
+            return label or None
 
         def _item_label(key: str) -> str:
-            info = items_const.get(key) or {}
-            return str(info.get("dname") or info.get("name") or key)
+            # 归一化走 dota_replay_parse 里那份（含旧名别名表），
+            # 保证数据块与这里用的是同一套口径。
+            norm = dota_replay_parse._normalize_item_key(key)
+            got = _item_resolve(norm)
+            if got:
+                return got
+            return str(key).replace("_", " ")
+
+        # 技能名：走本地中文词表（`_zh`），**不联网**。
+        # 老版本的数据块里全是 `silencer_global_silence`、`largo_frogstomp`
+        # 这种内部键，模型得自己猜是什么技能 —— 猜错就会写出
+        # 「他用了一个不知名的技能」这类空话。词表命中率实测 960 条里绝大多数
+        # 常用技能都有，未命中的（新英雄）退回「下划线换空格」，仍然可读。
+        zh = self._zh
+
+        def _ability_label(name: str) -> str:
+            key = str(name or "")
+            if key.startswith("item_"):
+                return _item_label(key[len("item_"):])
+            if zh is not None:
+                got = zh.ability(key)
+                if got:
+                    return got
+            return key.replace("_", " ")
 
         return dota_replay_parse.build_fight_block(
             match,
@@ -7250,6 +7654,10 @@ class Dota2Plugin(Star):
             hero_of=lambda hero_id: hname(heroes, hero_id),
             npc_by_hero=npc_by_hero,
             item_label=_item_label,
+            ability_label=_ability_label,
+            item_resolve=_item_resolve,
+            aghs=aghs,
+            illusions=illusions,
             focus_account_ids=focus_ids,
         )
 

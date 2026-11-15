@@ -76,6 +76,19 @@ class RuntimeStatus:
         lines.append(f"装好后可用 `{self.keyword} 复盘 环境` 复查。")
         return "\n".join(lines)
 
+    def describe_extra(self) -> str:
+        """可选组件（``Fine`` 逐帧导出器）的状态。
+
+        单独一段而不是塞进 ``problems``：缺它只影响团战发 HTML 回放，
+        报告与数据块照常 —— 混进「缺环境」会让人以为整个解析都跑不了。
+        """
+        return (
+            "✅ 团战回放导出器（Fine）已就位。"
+            if has_fine_exporter(self.engine)
+            else "ℹ️ 团战回放导出器（Fine）未安装 —— 团战复盘会退回文本报告。\n"
+                 + FINE_SETUP_HINT
+        )
+
 
 def _resolve_java(engine_dir: str, java_path: str = "") -> str:
     """按「显式配置 → 引擎自带 → PATH」三级找 java。"""
@@ -111,6 +124,13 @@ def check_runtime(engine_dir: str = "", java_path: str = "", keyword: str = "/d2
 
     只做**便宜**的检查（文件存在 + ``java -version`` + import zstandard），
     不真的解析一场录像 —— 那个要 20 多秒，不该藏在「预检」里。
+
+    ⚠️ ``classes/Fine.class``（0.1 秒逐帧状态导出器）**不在必需项里**。
+    它是「团战复盘发 HTML 回放」专用的，缺了不影响单场复盘、战报、
+    数据块 —— 那些只走 Snap / Dump / Eco。把它列进 ``need`` 会让
+    已经能正常出报告的老用户忽然被判定成「环境不完整」，
+    从而连数据块都拿不到。需要它的调用方自己用
+    :func:`has_fine_exporter` 单独确认，见 ``dota_fight_html`` 那条链。
     """
     engine = (engine_dir or DEFAULT_ENGINE_DIR).strip()
     status = RuntimeStatus(engine=engine, keyword=keyword)
@@ -149,6 +169,27 @@ def check_runtime(engine_dir: str = "", java_path: str = "", keyword: str = "/d2
 
     status.ok = not status.problems
     return status
+
+
+def has_fine_exporter(engine_dir: str = "") -> bool:
+    """引擎里有没有 ``Fine``（0.1 秒逐帧状态导出器）。
+
+    单独一个函数而不是塞进 :func:`check_runtime` 的必需项，见那里的注释：
+    它只影响「团战发 HTML 回放」，不影响数据块与战报。
+    「有一份报告总比什么都没有好」——缺它时团战复盘要回退，不能连复盘都不给。
+    """
+    engine = (engine_dir or DEFAULT_ENGINE_DIR).strip()
+    return os.path.isfile(os.path.join(engine, "classes", "Fine.class"))
+
+
+#: ``Fine`` 缺失时给用户看的安装说明。**与 :meth:`RuntimeStatus.describe` 同一口径**：
+#: 都是「把 class 放进引擎的 classes/」，不引入第二个环境概念。
+FINE_SETUP_HINT = (
+    "团战回放需要引擎里多一个 `classes/Fine.class`（0.1 秒逐帧状态导出器）。\n"
+    "请在录像引擎中安装与当前 Clarity 版本兼容的 Fine 导出器，放到引擎的 `classes/` 下。\n"
+    "当前插件仓库不包含 Fine.class；已有部署可沿用引擎中的导出器。\n"
+    "装好后用 `/d2 团战 环境` 复查。"
+)
 
 
 # ======================================================================
@@ -1119,7 +1160,9 @@ def key_deaths(
     npc_text: Callable[[str], str] | None = None,
     top_n: int = 4,
 ) -> list[dict]:
-    """团战之外、把胜率明显打下去的那几次阵亡（单抓 / 被抓 / 独自送掉）。
+    """已识别团战窗外、随后伴随明显胜率下降的阵亡候选。
+
+    仅按时间窗筛选，未检查队友位置或同期交战，不能据此判定单抓、独自行动或个人责任。
 
     Args:
         curve: 已对齐的胜率曲线。
@@ -1204,10 +1247,9 @@ def render_responsibility_block(
     lines.append(
         "权重口径：|胜率变化| × 距 50% 的接近程度。同样十几个点，"
         "在五五开附近是翻盘，在九成以上只是垃圾时间 —— "
-        "**判「最差」有两条通路**：① 有至少一个【决定性】窗口作证；"
-        "② 判出「贯穿型失职」（一个位置从头到尾没干过自己岗位该干的事，"
-        "比如一号位整局没有输出端、辅助整局没有视野）—— 这类失败**本来就不会**"
-        "落在任何单一窗口上，所以「找不到那个决定性窗口」**不等于**他没责任。"
+        "严重个人输局责任须有【决定性】窗口的具体失误，或有条件却在多个阶段反复未兑现的贯穿型失职。"
+        "最佳/最差仍按同队相对发挥各选一人；相对最差不等于单人导致败局。"
+        "曲线标记用于衡量局势变化，不直接证明变化由哪位玩家造成。"
         "只有【影响有限】的窗口"
         "最多算过程瑕疵；【基本无关】的窗口一个字都不许用来说谁打得差。"
     )
@@ -1236,7 +1278,7 @@ def render_responsibility_block(
     singles = key_deaths(curve, match, npc_text=convert)
     if singles:
         lines.append("")
-        lines.append("团战之外把胜率打下去的阵亡（单抓 / 被抓 / 独自送掉）：")
+        lines.append("已识别团战窗外、随后伴随胜率下降的阵亡候选：")
         for death in singles:
             lines.append(
                 "- 【%s】%s %s 被 %s 击杀 · %s胜率 %d%% → %d%%（%+d）" % (
@@ -1247,8 +1289,8 @@ def render_responsibility_block(
                 )
             )
         lines.append(
-            "  （这类死亡责任最清楚：没有团战、没有队友，就是他一个人被抓住。"
-            "但**责任清楚不等于影响大** —— 权重档位同样要看它发生在什么局势下。）"
+            "  （这里只排除了数据源已识别的团战时间窗，未检查队友位置，不能据此认定独自被抓或送命。"
+            "胜率窗口可能同时包含未识别交战、建筑与肉山变化；结合具体动作判断责任，档位只衡量局势变化。）"
         )
 
     return "\n".join(lines)
