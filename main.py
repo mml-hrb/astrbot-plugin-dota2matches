@@ -1852,7 +1852,7 @@ class Dota2Plugin(Star):
             )
             # 标题不再单独先发：先发就等于告诉用户「好了」，然后要对着
             # 5~7 分钟的出图干等（2026-11-05 用户原话）。
-            await self._deliver_report(umo, headline, report, label="复盘")
+            await self._deliver_report(umo, headline, report, label="复盘", single_match=True)
             return True, "复盘已发出"
 
         # 兜底路径自己要拿渲染常量（原先靠上游算好的局部变量，
@@ -2843,6 +2843,7 @@ class Dota2Plugin(Star):
         report: str,
         *,
         label: str = "复盘",
+        single_match: bool = False,
         progress: str = "🖼 正在把战报排版成图片（可能要几分钟），好了直接发出来…",
     ) -> bool:
         """后台任务出口：**先生图，图好了再连标题一起发**。
@@ -2897,13 +2898,29 @@ class Dota2Plugin(Star):
         if image_path:
             try:
                 if await self._send_image(umo, image_path):
+                    if single_match:
+                        await self._send_match_meme(umo)
                     return True
             except Exception as e:  # noqa: BLE001 - 图发不出去不能连累正文
                 logger.warning(f"[dota2] 推送{label}图片失败，回退为文本：{e}")
 
         # 没图 / 图没确认送达：正文必须补发。宁可重复一条，不能让它消失。
         await self._send_chunked(umo, report, label=label)
+        if single_match:
+            await self._send_match_meme(umo)
         return False
+
+    @staticmethod
+    def _match_meme_path() -> str:
+        return str(Path(__file__).resolve().parent / "assets" / "single-match-meme.png")
+
+    async def _send_match_meme(self, umo: str) -> None:
+        """单局报告后附送表情包；附图失败不影响已完成的复盘。"""
+        try:
+            if not await self._send_image(umo, self._match_meme_path()):
+                logger.warning("[dota2] 单局复盘表情包未确认送达")
+        except Exception as e:  # noqa: BLE001 - 装饰图片失败不应重发报告
+            logger.warning(f"[dota2] 单局复盘表情包发送失败：{e}")
 
     async def _deliver_now(self, event: AstrMessageEvent, result) -> bool:
         """尽量把一条结果直接投递出去，成功返回 True。
@@ -2972,7 +2989,7 @@ class Dota2Plugin(Star):
             yield result
 
     async def _emit_report(
-        self, event: AstrMessageEvent, header: str, report: str
+        self, event: AstrMessageEvent, header: str, report: str, *, single_match: bool = False
     ):
         """指令路径：**先生图，图好了再一起发**（header + 图片）。
 
@@ -3005,9 +3022,11 @@ class Dota2Plugin(Star):
             yield event.plain_result(header)
         if image_path:
             yield event.image_result(image_path)
-            return
-        for result in self._text_results(event, report):
-            yield result
+        else:
+            for result in self._text_results(event, report):
+                yield result
+        if single_match:
+            yield event.image_result(self._match_meme_path())
 
     # ==================================================================
     # 目标解析
@@ -4841,7 +4860,7 @@ class Dota2Plugin(Star):
                 report = await self._append_fight_candidates(
                     report, match, focus_ids, focus_names, heroes
                 )
-                await self._deliver_report(umo, headline, report, label="复盘")
+                await self._deliver_report(umo, headline, report, label="复盘", single_match=True)
                 logger.info(f"[dota2] 工具复盘已推送: 比赛 {match_id} → {umo}")
                 job_ok, job_note = True, "复盘已发出"
                 return
@@ -6914,7 +6933,7 @@ class Dota2Plugin(Star):
                 report = await self._append_fight_candidates(
                     report, match, focus_ids, focus_names, heroes
                 )
-                async for item in self._emit_report(event, headline, report):
+                async for item in self._emit_report(event, headline, report, single_match=True):
                     yield item
                 job_ok, job_note = True, "复盘已发出"
             else:
@@ -9163,7 +9182,7 @@ class Dota2Plugin(Star):
         # 定时复查也是「复盘」，跟其它出口同一套发送规则（先出图、再连标题发）。
         # headline 上面已经发过了（它同时兼作「已经开始出分析」的提示），
         # 这里传空，避免同一句话出现两次。
-        await self._deliver_report(umo, "", report, label="复盘")
+        await self._deliver_report(umo, "", report, label="复盘", single_match=True)
 
     def _recheck_focus(self, umo: str, match: dict) -> tuple[list[int], dict[int, str]]:
         """复查单场时的焦点玩家：本会话**唯一**绑定的那位，且得在这局里。
