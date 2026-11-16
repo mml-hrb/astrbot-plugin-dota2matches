@@ -2212,9 +2212,8 @@ class OpenAICompatibleClient:
         delta = first.get("delta")
         if not isinstance(delta, dict):
             # 少数实现的「流式」其实是每块塞一个完整 message
-            delta = (
-                first.get("message") if isinstance(first.get("message"), dict) else {}
-            )
+            msg = first.get("message")
+            delta = msg if isinstance(msg, dict) else {}
         text = delta.get("content")
         if isinstance(text, list):
             text = "".join(

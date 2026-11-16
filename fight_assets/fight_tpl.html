@@ -256,6 +256,15 @@ function S2W(sx, sy) {
 // 刚从泉水走过来，10 人包围盒能横跨半张图 —— 全框进来，团战区就被缩成一团看不清。
 // 反过来「只框主簇、把远处的剪掉」也不行，人会凭空消失。
 // 所以取折中：框住「最近的大多数」，超出的在画面边缘画箭头指方向。
+// 取景时「离主簇太远、不参与定框」的距离阈值（世界单位）。
+// 一场团战的正常队形很少超过 3000；超过 4000 基本就是刚回城/刚复活的人。
+const CAM_OUTLIER = 4000;
+
+function medOf(arr, k) {
+  const a = arr.map(p => p[k]).sort((u, v) => u - v);
+  return a[Math.floor(a.length / 2)];
+}
+
 function liveBox(t) {
   const i = fi(t), pts = [];
   for (const h of Object.keys(F.x)) {
@@ -266,30 +275,25 @@ function liveBox(t) {
   }
   if (pts.length < 2) return null;
 
-  const med = k => {
-    const a = pts.map(p => p[k]).sort((u, v) => u - v);
-    return a[Math.floor(a.length / 2)];
-  };
-  const mx = med('x'), my = med('y');
+  const mx = medOf(pts, 'x'), my = medOf(pts, 'y');
 
   // ---- 先剔除「脱节者」，再定框 ----
   // 这是画面糊成一片的真正原因：团战 10 个人里总有 1~2 个在远处（狙击手站高地、
-  // 有人刚复活从泉水赶来），10 人包围盒能横跨半张地图。旧算法用 MAX_SPAN=13000
-  // 兜底，结果 t=8 时把人框在 11500 单位的窗口里 —— 头像只有 25px，
-  // 72px 的原图缩到这个尺寸，全糊成色块，谁也认不出谁。
+  // 有人刚复活从泉水赶来、有人刚回城/过双生之门）。10 人包围盒能横跨半张地图。
   //
-  // 现在按「到中位点的距离」取 80 分位，明显超出的先不算进框。
-  // 他们不会消失 —— 仍然会在画面边缘画箭头 + 小头像指过去。
-  const dists = pts.map(p => ({ p, d: Math.hypot(p.x - mx, p.y - my) }))
-    .sort((a, b) => a.d - b.d);
-  const q80 = dists[Math.floor((dists.length - 1) * 0.8)].d;
-  const OUTLIER = Math.max(1500, q80 * 1.35);     // 下限 1500：打得再散也不至于只框两人
-
-  let core = dists.filter(o => o.d <= OUTLIER).map(o => o.p);
-  // 主簇至少留 6 人：开局大家还在各条路上走时，别把框收得太窄
-  if (core.length < Math.min(6, pts.length)) {
-    core = dists.slice(0, Math.min(6, pts.length)).map(o => o.p);
+  // 曾经用「到中位点的 80 分位 × 1.35、下限 1500」自适应剔除 —— 人一少就失效：
+  // 场上只剩 5 个人时，80 分位本身就很大，阈值跟着水涨船高，等于没剔。
+  // 实测本场帧 260：镜头被一个刚从泉水赶来的尸王拽到 (13730,19474)，
+  // 而 5 个活人挤在 (9685,17237)，画面正中变成空无一人的肉山坑。
+  //
+  // 现在改成**固定距离**：离主簇中位点超过 CAM_OUTLIER 的人不参与取景，
+  // 但仍然画在画面边缘 + 箭头指过去（不会消失）。
+  let core = pts;
+  if (pts.length > 3) {
+    const inl = pts.filter(p => Math.hypot(p.x - mx, p.y - my) <= CAM_OUTLIER);
+    if (inl.length >= 3) core = inl;
   }
+  const cmx = medOf(core, 'x'), cmy = medOf(core, 'y');
 
   let box = null;
   for (const p of core) {
@@ -303,7 +307,9 @@ function liveBox(t) {
   // 留白：够放头像半径 + 技能特效半径即可。之前 12% / 420 偏松，
   // 因为框本身就大，再留白等于又缩了一圈。
   const pad = Math.max(380, Math.max(box.x1 - box.x0, box.y1 - box.y0) * 0.10);
-  return { x0: box.x0 - pad, y0: box.y0 - pad, x1: box.x1 + pad, y1: box.y1 + pad };
+  // cx/cy = 主簇中位点，交给 fitBox 收缩时居中用 —— 不能用「含离群点的原框中心」。
+  return { x0: box.x0 - pad, y0: box.y0 - pad, x1: box.x1 + pad, y1: box.y1 + pad,
+           cx: cmx, cy: cmy };
 }
 
 /** 把视野框夹进地图实心区域内。
@@ -326,7 +332,10 @@ function clampToMap(box) {
   else cx = Math.min(WORLD_HI - bw / 2, Math.max(WORLD_LO + bw / 2, cx));
   if (bh >= span) cy = (WORLD_LO + WORLD_HI) / 2;
   else cy = Math.min(WORLD_HI - bh / 2, Math.max(WORLD_LO + bh / 2, cy));
-  return { x0: cx - bw / 2, y0: cy - bh / 2, x1: cx + bw / 2, y1: cy + bh / 2 };
+  // cx/cy 要一路带到 fitBox：收缩视野时必须围绕**主簇中位点**，而不是
+  // 「含离群点的原框中心」—— 后者正是镜头对错地方的根源。
+  return { x0: cx - bw / 2, y0: cy - bh / 2, x1: cx + bw / 2, y1: cy + bh / 2,
+           cx: box.cx, cy: box.cy };
 }
 
 function fitBox(box, instant) {
@@ -339,15 +348,35 @@ function fitBox(box, instant) {
   // 画面中间只剩 2 个人，比之前更糟。
   // 现在的规则：上限取「最大簇的 1.8 倍跨度」，且不低于 6000 —— 只削掉极端值，不动正常队形。
   const wpx = cv.clientWidth;
-  const spanNow = Math.max(box.x1 - box.x0, box.y1 - box.y0);
+  const cx0 = (box.cx != null) ? box.cx : (box.x0 + box.x1) / 2;
+  const cy0 = (box.cy != null) ? box.cy : (box.y0 + box.y1) / 2;
+
+  // ---- 视野跨度下限 ----
+  // 剔掉离群者后，主簇往往只有 800~1500 单位宽 —— 全按包围盒走会贴脸贴到
+  // 1px=2 世界单位：底图原图只有 1024px（16 单位/像素），放大 8 倍糊成一团，
+  // 头像顶到 64px 上限、比整条河道还宽。所以留一个下限，把镜头按住。
+  const MIN_SPAN = 5600;
+  let spanNow = Math.max(box.x1 - box.x0, box.y1 - box.y0);
+  if (spanNow < MIN_SPAN) {
+    const k = MIN_SPAN / spanNow;
+    box = clampToMap({
+      x0: cx0 - (box.x1 - box.x0) * k / 2, y0: cy0 - (box.y1 - box.y0) * k / 2,
+      x1: cx0 + (box.x1 - box.x0) * k / 2, y1: cy0 + (box.y1 - box.y0) * k / 2,
+      cx: cx0, cy: cy0,
+    });
+    spanNow = Math.max(box.x1 - box.x0, box.y1 - box.y0);
+  }
+
   const MAX_SPAN = Math.max(6000, Math.min(9000, (wpx * HERO_WORLD) / 32));
   if (spanNow > MAX_SPAN) {
     const k = MAX_SPAN / spanNow;
-    const cx0 = (box.x0 + box.x1) / 2, cy0 = (box.y0 + box.y1) / 2;
+    // 以**主簇中位点**为中心收缩。用原框中心的话，一个离群者就能把整个视野
+    // 拽到空地上（本场帧 260 镜头偏离主簇 4044 单位就是这么来的）。
     const bw2 = (box.x1 - box.x0) * k, bh2 = (box.y1 - box.y0) * k;
     box = clampToMap({
       x0: cx0 - bw2 / 2, y0: cy0 - bh2 / 2,
       x1: cx0 + bw2 / 2, y1: cy0 + bh2 / 2,
+      cx: cx0, cy: cy0,
     });
   }
 
@@ -398,7 +427,21 @@ function posAt(h, t) {
   const ax = F.x[h][i], ay = F.y[h][i], bx = F.x[h][i + 1], by = F.y[h][i + 1];
   if (ax == null || ay == null) return [bx, by];
   if (bx == null || by == null) return [ax, ay];
+  // 瞬移帧不插值：否则头像会在两个落点之间「飞」过去，0.1 秒闪一下全图。
+  // 传送就该是硬切 —— 前一瞬在原地，下一瞬已经落地。
+  const tp = F.tp && F.tp[h];
+  if (tp && tp[i + 1]) return p < 0.5 ? [ax, ay] : [bx, by];
   return [ax + (bx - ax) * p, ay + (by - ay) * p];
+}
+
+/** 这段时间里有没有「瞬移帧」。有就说明位置是跳过去的，插值连线必须断开。 */
+function tpSpan(h, t0, t1) {
+  const tp = F.tp && F.tp[h];
+  if (!tp) return false;
+  const a = Math.max(0, Math.floor(t0 / F.dt));
+  const b = Math.min(NF - 1, Math.ceil(t1 / F.dt));
+  for (let i = a; i <= b; i++) if (tp[i]) return true;
+  return false;
 }
 
 /** 血量不插值 —— 掉血是阶跃的，插值会变成「慢慢流」且死亡时刻提前。*/
@@ -1422,6 +1465,9 @@ function draw() {
   const AP = avatarPx();
 
   // ---- 轨迹（最近 2.5 秒，渐隐）----
+  // 瞬移（回城 / 双生之门 / 复活回泉）那一段不能连起来 —— 否则会画出一条
+  // 横穿整张地图、穿墙穿树的直线，看起来像「人卡在了不该在的位置」。
+  // 瞬移本身是真实机制，页面只负责承认它：这一帧断开，落点另画涟漪。
   const TRAIL = 2.5, SEG = 14;
   for (const h of Object.keys(F.x)) {
     if (F.al[h][i] === 0) continue;
@@ -1430,12 +1476,32 @@ function draw() {
       const t0 = cur - TRAIL * (1 - k / SEG);
       const t1 = cur - TRAIL * (1 - (k + 1) / SEG);
       if (t1 > cur || t0 < 0) continue;
+      if (tpSpan(h, t0, t1)) continue;
       const a = posAt(h, t0), b = posAt(h, t1);
       if (a[0] == null || b[0] == null) continue;
       const p = W2S(a[0], a[1]), q = W2S(b[0], b[1]);
       g.strokeStyle = `rgba(${col},${0.05 + 0.30 * (k / SEG)})`;
       g.lineWidth = 2.5;
       g.beginPath(); g.moveTo(p[0], p[1]); g.lineTo(q[0], q[1]); g.stroke();
+    }
+  }
+
+  // ---- 瞬移落点涟漪（最近 0.5 秒）----
+  // 不解释就只是一个闪现。画一圈扩散的青色环，观众看得出「这是传送，不是穿模」。
+  if (F.tp) {
+    for (const h of Object.keys(F.tp)) {
+      for (let j = Math.max(0, i - 5); j <= i; j++) {
+        if (!F.tp[h][j] || F.al[h][j] !== 1) continue;
+        const age = (i - j) * F.dt;
+        if (age > 0.5) continue;
+        const x = F.x[h][j], y = F.y[h][j];
+        if (x == null || y == null) continue;
+        const [sx, sy] = W2S(x, y);
+        const rr = AP * (0.45 + 1.1 * (age / 0.5));
+        g.strokeStyle = `rgba(150,220,255,${0.6 * (1 - age / 0.5)})`;
+        g.lineWidth = 2;
+        g.beginPath(); g.arc(sx, sy, rr, 0, Math.PI * 2); g.stroke();
+      }
     }
   }
 

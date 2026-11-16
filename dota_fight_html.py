@@ -65,23 +65,39 @@ def read_fine(path):
     series {slug: {t: (hp, maxhp, mp, x, y)}}，只含「本体活着」的行。
     lvl_of {slug: 等级}
 
-    ⚠ 三个坑，都是实测踩出来的：
+    ⚠ 四个坑，都是实测踩出来的：
 
     1. 同一 playerID 会同时存在 本体 + 幻象 + 分身 + 尸体残留。
-       幻象/分身 hp=0 或 alive=0，必须滤掉，否则血量会串。
-       （本场 Bane 有 13088 条本体行、21157 条 hp=0/alive=0 行。）
+       **幻象/分身并不总是 hp=0 或 alive=0** —— 幽鬼开鬼影重重时，同一 tick
+       最多有 8 个 body，全部 alive=1、maxHp 都是 3522（满血幻象），
+       位置最远散布 23,277 单位。所以「按 hp/alive 过滤」只能挡掉一部分，
+       挡不住满血幻象。
 
-    2. **等级不能取「最后一行」**。齐天大圣「七十二变」的分身与本体共用同一个
+    2. **同一时刻的多条记录不能「后写覆盖先写」**。原来 `series[slug][t] = ...`
+       直接以时间为键，同 tick 里最后写入的那条胜出；而最后写入的往往是最新
+       生成的幻象（实体句柄更大），于是英雄坐标在几个 body 之间来回跳，
+       单帧位移 4000–9700 单位。**现在改为：同一 tick 若有多条候选，
+       取「与上一帧已接受位置最近」的那条**（配血量连续性做同分裁决）。
+       幻象与本体的距离通常差一个数量级，这个判据足够稳。
+
+    3. **等级不能取「最后一行」**。齐天大圣「七十二变」的分身与本体共用同一个
        playerID，分身固定 1 级 538 血，在 csv 里与本体逐帧交错写入。
        取最后一行会得到 1 级。正确做法：取「maxHp 最大的那条」——
        分身血量上限远低于本体，这个判据与英雄名无关，对任何分身/幻象都成立。
+       （注意：这条**只用于取等级**，不能拿来判位置 —— 满血幻象的 maxHp
+       与本体相同，见坑 1。）
 
-    3. 键必须转成 slug 并在此统一。旧代码在别处用 npc 原名查，导致等级全 1。
+    4. 键必须转成 slug 并在此统一。旧代码在别处用 npc 原名查，导致等级全 1。
     """
-    series = defaultdict(dict)
+    #: 正常移动速度上限（单位/秒）。超过它就不是「走」过去的，只能是传送/跳刀。
+    MOVE_MAX = 700.0
+    #: 完全说不通的速度。有「说得过去」的候选时优先选它，一条都没有才承认瞬移。
+    MOVE_HARD = 1500.0
+
+    cand = defaultdict(lambda: defaultdict(list))  # slug -> t -> [(hp,maxhp,mp,x,y)]
     lvl_of = {}
-    best_hp = {}  # slug -> 该英雄见过的最大 maxHp，用于识别本体
-    lvl_raw = {}  # slug -> (maxHp, lvl) 取 maxHp 最大者的等级
+    best_hp = {}   # slug -> 该英雄见过的最大 maxHp，用于识别本体（取等级用）
+    lvl_raw = {}   # slug -> (maxHp, lvl) 取 maxHp 最大者的等级
     for line in open(path, encoding="utf-8"):
         p = line.rstrip("\n").split(",")
         if len(p) < 12:
@@ -100,12 +116,43 @@ def read_fine(path):
             continue
         slug = hero_slug(name)
         if alive != 1 or hp <= 0:
-            continue  # 幻象 / 分身 / 尸体残留
-        series[slug][round(t, 2)] = (hp, maxhp, mp, x, y)
+            continue  # 幻象 / 分身 / 尸体残留（只能挡掉这一部分，见 docstring 坑 1）
+        cand[slug][round(t, 2)].append((hp, maxhp, mp, x, y))
         # 本体判据：maxHp 最大。分身/幻象的 maxHp 明显更小，不会被选中。
         if maxhp >= best_hp.get(slug, -1):
             best_hp[slug] = maxhp
             lvl_raw[slug] = lvl
+
+    series = {}
+    for slug, ticks in cand.items():
+        ts = sorted(ticks)
+        seq = {}
+        last = None      # (x, y, hp) 上一帧已接受的本体状态
+        last_t = None
+        for t in ts:
+            rows = ticks[t]
+            if len(rows) == 1:
+                pick = rows[0]
+            elif last is None:
+                pick = max(rows, key=lambda r: r[0])   # 首帧：血最多的那条
+            else:
+                dt = max(t - last_t, 0.1)
+
+                def key(r):
+                    d = ((r[3] - last[0]) ** 2 + (r[4] - last[1]) ** 2) ** 0.5
+                    # 速度归一化：1.0 = 刚好在正常移动速度上限；再叠一层血量连续性
+                    dh = abs(r[0] - last[2]) / max(1.0, 0.15 * r[1])
+                    return d / (dt * MOVE_MAX) + 0.8 * dh
+
+                reachable = [
+                    r for r in rows
+                    if ((r[3] - last[0]) ** 2 + (r[4] - last[1]) ** 2) ** 0.5 / dt <= MOVE_HARD
+                ]
+                pick = min(reachable or rows, key=key)
+            seq[t] = (pick[0], pick[1], pick[2], pick[3], pick[4])
+            last = (pick[3], pick[4], pick[0])
+            last_t = t
+        series[slug] = seq
     for slug, lv in lvl_raw.items():
         lvl_of[slug] = lv
     return series, lvl_of
@@ -1422,13 +1469,58 @@ def form_of(inf):
 def infer_team(series, combat, idx):
     """返回 {slug: 0(天辉)/1(夜魇)}。
 
-    优先用 combat 里的 team 字段（Dump 会带 player_slot 的话）—— 实测没有。
-    退而用「互相伤害」的二分：队友之间不会互相造成伤害，所以敌人图是两个团（极少数误伤除外）。
-    再用出生点定谁是天辉：天辉泉水在 (≈9600,≈9600)，夜魇在 (≈23300,≈22800)，
-    比较 x+y 即可，这个判据不受地图朝向影响。
+    **主判据：combat 事件自带的 at / tt 字段。**
+    它们就是 Dota 的 DOTA_TEAM_GOODGUYS(2) / DOTA_TEAM_BADGUYS(3)：
+    攻击方队伍号 / 承受方队伍号。英雄只要产生过一次伤害、增益、施法，
+    阵营就被钉死了 —— 本场 10 个英雄各拿到 2000~10000 票，逐票 100% 一致，
+    与 OpenDota 的 isRadiant 逐人核对 10/10 吻合。
+
+    旧版为什么 9/10 错：它没用这两个字段（注释写着「实测没有 player_slot」，
+    把紧挨着的 at/tt 漏了），退而用「队友之间不互相伤害」做二分图着色。
+    这个假设在真实录像里不成立 —— 净化、光环、范围伤害都会落在队友身上，
+    一旦出现一条同队边，二分就不再自洽；BFS 是「先到先得」，
+    错色会顺着边传播，最后整场翻车。出生点校验只能整组取反，
+    救不了「组内一半人反了」的情况。
+
+    所以现在的顺序是：
+      1) at/tt 投票（票多者胜）；
+      2) 没票的英雄，用伤害图着色补，但颜色**约束**到已判定的英雄上；
+      3) 整个连通块都没票，才退回出生点（x+y 与地图中心比）。
     """
+    votes = defaultdict(lambda: {2: 0, 3: 0})
+    for _t, e in combat:
+        at = e.get("at")
+        tt = e.get("tt")
+        if at in (2, 3):
+            a = norm_npc(e.get("atk"))
+            if a in idx:
+                votes[a][at] += 1
+        if tt in (2, 3):
+            b = norm_npc(e.get("tgt"))
+            if b in idx:
+                votes[b][tt] += 1
+
+    color, undecided = {}, []
+    for h in idx:
+        v = votes.get(h)
+        if not v or v[2] == v[3]:
+            undecided.append(h)
+            continue
+        color[h] = 0 if v[2] > v[3] else 1
+
+    def birth(h):
+        seq = series.get(h) or {}
+        if not seq:
+            return 0
+        t = min(seq)
+        return 0 if (seq[t][3] + seq[t][4]) < 2 * 16384 else 1
+
+    if not undecided:
+        return color
+
+    # ---- 没票的人：用伤害关系补色 ----
     enemy = defaultdict(set)
-    for t, e in combat:
+    for _t, e in combat:
         if e.get("type") != "DOTA_COMBATLOG_DAMAGE":
             continue
         a = norm_npc(e.get("atk"))
@@ -1437,51 +1529,48 @@ def infer_team(series, combat, idx):
             enemy[a].add(b)
             enemy[b].add(a)
 
-    allh = set(idx)
-    if not enemy:
-        # 完全没有战斗日志：按出生点硬分（左下一半 / 右上一半）
-        out = {}
-        for h in allh:
-            seq = series[h]
-            if not seq:
-                out[h] = 0
+    for h in undecided:
+        if h in color:
+            continue
+        # 从 h 出发，先找这个连通块里已知颜色的锚点
+        comp, stack, seen = [], [h], {h}
+        while stack:
+            cur = stack.pop()
+            comp.append(cur)
+            for nb in enemy.get(cur, ()):
+                if nb not in seen:
+                    seen.add(nb)
+                    stack.append(nb)
+        anchor = next((c for c in comp if c in color), None)
+        if anchor is None:
+            # 整块都没票：这一块按出生点定（同块内仍然按互相敌对二分）
+            base = birth(h)
+            color[h] = base
+            stack = [h]
+            while stack:
+                cur = stack.pop()
+                for nb in enemy.get(cur, ()):
+                    if nb not in color:
+                        color[nb] = 1 - color[cur]
+                        stack.append(nb)
+            continue
+        # 有锚点：按「与锚点的跳数奇偶」上色
+        dist = {anchor: 0}
+        stack = [anchor]
+        while stack:
+            cur = stack.pop()
+            for nb in enemy.get(cur, ()):
+                if nb not in dist:
+                    dist[nb] = dist[cur] + 1
+                    stack.append(nb)
+        for c in comp:
+            if c in color:
                 continue
-            x, y = seq[min(seq)][3], seq[min(seq)][4]
-            out[h] = 0 if (x + y) < 2 * 16384 else 1
-        return out
+            d = dist.get(c)
+            color[c] = birth(c) if d is None else (color[anchor] ^ (d & 1))
 
-    # 以「敌人最多」的人为种子做二分图着色
-    seed = max(allh, key=lambda s: len(enemy.get(s, ())))
-    color = {seed: 0}
-    stack = [seed]
-    while stack:
-        cur = stack.pop()
-        for nb in enemy.get(cur, ()):
-            if nb not in color:
-                color[nb] = 1 - color[cur]
-                stack.append(nb)
-    for h in allh:  # 孤立点（整场没打过人）走出生点判据
-        if h not in color:
-            seq = series[h]
-            x, y = (seq[min(seq)][3], seq[min(seq)][4]) if seq else (0, 0)
-            color[h] = 0 if (x + y) < 2 * 16384 else 1
-
-    # 出生点校验：天辉一组的总 x+y 应该更小；不是就整组取反
-    def birth_sum(g):
-        tot, n = 0.0, 0
-        for h in allh:
-            if color[h] != g:
-                continue
-            seq = series[h]
-            if not seq:
-                continue
-            t = min(seq)
-            tot += seq[t][3] + seq[t][4]
-            n += 1
-        return tot / max(1, n)
-
-    if birth_sum(0) > birth_sum(1):
-        color = {h: 1 - c for h, c in color.items()}
+    for h in idx:     # 兜底：兜到「跟谁都没关系」的人
+        color.setdefault(h, birth(h))
     return color
 
 
@@ -1620,7 +1709,11 @@ def build(
     #       只靠「记录太旧」会把站着不动的人（采样去重，间隔可到 10 秒）误判成尸体。
     DT = 0.1
     nf = int(round((t1 - t0) / DT)) + 1
-    frames = {"dt": DT, "t0": t0, "x": {}, "y": {}, "hp": {}, "mp": {}, "al": {}, "mx": {}}
+    frames = {"dt": DT, "t0": t0, "x": {}, "y": {}, "hp": {}, "mp": {}, "al": {}, "mx": {},
+              "tp": {}}
+    #: 一帧（0.1 秒）内位移超过这个数，就不可能是「走」过去的 —— 只能是
+    #: 回城 / 双生之门 / 复活点传送。跳刀只有 1200 单位（一帧 120），不会被误标。
+    TP_STEP = 300
     spawn = {}
     death_log = {}
     for h in heroes:
@@ -1696,6 +1789,26 @@ def build(
         frames["mp"][h] = mps
         frames["al"][h] = als
         frames["mx"][h] = mxs
+
+        # ---------------- 瞬移标记 ----------------
+        # 为什么要标：回城卷轴 / 双生之门 / 复活回泉都是「瞬间换地方」的真实机制
+        # （本场 >4000 单位的瞬移：回城 106 次、双生之门 51 次、复活 61 次）。
+        # 页面把 0.1 秒一帧连起来看，会以为人是「走」过去的 —— 于是轨迹尾迹
+        # 在瞬移后拖出一条横穿整张地图的直线（穿墙、穿树），镜头也被两个端点
+        # 拽着横移。标出来之后：尾迹在这一帧断开、镜头不再为刚落地的瞬移买单。
+        tp = [0] * nf
+        for i in range(1, nf):
+            if als[i] != 1:
+                continue
+            if als[i - 1] != 1:
+                tp[i] = 1                      # 刚从死亡状态复活（尸体 → 泉水）
+                continue
+            px, py = xs[i - 1], ys[i - 1]
+            if px is None or xs[i] is None:
+                continue
+            if abs(xs[i] - px) + abs(ys[i] - py) > TP_STEP:
+                tp[i] = 1
+        frames["tp"][h] = tp
         if ts:
             first = seq[ts[0]]
             spawn[h] = [round(first[3]), round(first[4])]

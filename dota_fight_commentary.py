@@ -59,10 +59,12 @@ def evidence(data: dict, combat: list, t0: float, t1: float, norm, label) -> dic
         row = [rel, kind, names.get(atk, str(e.get('atk') or '环境')), names.get(tgt, ''), label(inf)]
         if kind == '控制生效':
             row.append({k: e[k] for k in ('stun', 'sil', 'root', 'hex', 'disarm', 'taunt', 'mdur') if e.get(k)})
-        key = json.dumps(row, ensure_ascii=False, sort_keys=True)
-        if key not in seen:
+        # 变量名不叫 key：上面 damage 那段已经用 key 做过解包，mypy 会认为
+        # 同一个局部名先绑过 tuple 又绑 str，类型冲突（闸门会红）。
+        sig = json.dumps(row, ensure_ascii=False, sort_keys=True)
+        if sig not in seen:
             events.append(row)
-            seen.add(key)
+            seen.add(sig)
     # 按整个窗口的时间桶汇总伤害，不以首 N 行截断后半场。
     hits = [[t, a, b, round(v)] for (t, a, b), v in sorted(damage.items()) if v >= 100]
     death_rows = [{'t': e[0], 'killer': e[2], 'victim': e[3]} for e in events if e[1] == '死亡']
