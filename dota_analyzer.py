@@ -10,9 +10,11 @@
 from __future__ import annotations
 
 import asyncio
+import http.client
 import json
 import re
 import socket
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -1948,8 +1950,10 @@ class LLMRequestError(RuntimeError):
 
     ``kind`` 说明**是哪一类**失败，调用方据此决定要不要换通道重试：
 
-    * ``timeout`` —— 等到超时都没返回。换通道意味着**再等一整轮**，
-      用户看到的就是「十分钟过去了什么都没发生」，所以默认不回退；
+    * ``timeout`` —— **连续一段时间没有收到任何新数据**（流式下不再有
+      「总时长」这回事，见 :meth:`OpenAICompatibleClient._stream_sync`）。
+      这说明模型卡住了，换通道意味着**再等一整轮**，用户看到的就是
+      「十分钟过去了什么都没发生」，所以默认不回退；
     * ``auth`` / ``config`` —— Key 或模型名不对，换通道确实有救；
     * ``rate_limit`` / ``server`` / ``network`` —— 换通道可能绕开；
     * ``protocol`` / ``http`` / ``other`` —— 兜底，按原策略处理。
@@ -1982,8 +1986,9 @@ class LLMRequestError(RuntimeError):
     def retryable_elsewhere(self) -> bool:
         """换一条通道重试是否有意义。
 
-        超时不算：模型慢不慢和走哪条 Key 没有必然关系，而重试的代价是
-        用户**再等一整轮超时**。配置类错误也不算「换通道」——没配 Key 时
+        超时不算：流式下「超时」的含义是**连接已经不再吐字**，说明这条
+        通道此刻就是卡住了，换一条同样要重新等；而重试的代价是
+        用户**再等一轮**。配置类错误也不算「换通道」——没配 Key 时
         本来就该回落，这条由调用方按 ``auth``/``config`` 处理。
         """
         return self.kind not in {"timeout"}
@@ -1999,13 +2004,17 @@ def http_error_kind(code: int) -> str:
       有自己的模型名），所以归 ``config`` 而不是「参数错误」；
     * 408/504 —— 网关等上游等到超时。和本进程的 socket 超时同类，
       再等一轮没有意义；
+    * 524 —— Cloudflare 专属的「源站 120 秒没吐完整响应」。语义和 504
+      完全一样，**必须归 timeout**：原来漏在 5xx 里被判成 ``server``，
+      于是每撞一次都触发「回退到 AstrBot 再跑一遍」，而回退通道同样要
+      从头等（2026-11-15 夜里就是这么白等了两轮的）；
     * 429 —— 限流，换通道有救；5xx —— 服务端抖动，换通道也可能有救。
     """
     if code in (401, 403, 407):
         return "auth"
     if code in (400, 404, 422):
         return "config"
-    if code in (408, 504):
+    if code in (408, 504, 524):
         return "timeout"
     if code == 429:
         return "rate_limit"
@@ -2080,15 +2089,20 @@ class OpenAICompatibleClient:
         *,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        stream: bool = False,
     ) -> dict:
-        """组装请求体。"""
+        """组装请求体。
+
+        ``stream`` 只由 :meth:`chat` 决定（它固定开）——
+        :meth:`chat_with_tools` 走自己的 ``build_tool_payload``，理由见那里的注释。
+        """
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system_prompt or ""},
                 {"role": "user", "content": user_prompt or ""},
             ],
-            "stream": False,
+            "stream": bool(stream),
         }
         if temperature is not None:
             payload["temperature"] = float(temperature)
@@ -2096,34 +2110,46 @@ class OpenAICompatibleClient:
             payload["max_tokens"] = int(max_tokens)
         return payload
 
-    def _post_sync(self, payload: dict) -> dict:
-        """同步发一次请求并返回解析好的 JSON 对象。
-
-        由 :meth:`chat` / :meth:`chat_with_tools` 放进线程池执行。
-        拆出这一层是因为**工具的返回体不能只取正文**：``tool_calls``
-        与 ``finish_reason`` 都要读出来做下一步决策。
-        """
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    def _headers(self, accept: str) -> dict[str, str]:
+        """组装请求头。``accept`` 区分普通 JSON 与 SSE 两种读法。"""
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
-            "Accept": "application/json",
+            "Accept": accept,
             # 部分中转站会校验 UA，这里给一个常规值
             "User-Agent": "astrbot-plugin-dota2/1.4",
         }
         headers.update(self.extra_headers)
+        return headers
+
+    def _opener(self):
+        """按需返回挂了代理的 opener；未配代理时返回 None（用全局 urlopen）。
+
+        走自己的 handler 而不是全局 ``urlopen`` 配置，避免影响其他插件的请求。
+        """
+        if not self.proxy:
+            return None
+        return urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": self.proxy, "https": self.proxy})
+        )
+
+    def _post_sync(self, payload: dict) -> dict:
+        """同步发一次请求并返回解析好的 JSON 对象。
+
+        由 :meth:`chat_with_tools` 放进线程池执行。
+        拆出这一层是因为**工具的返回体不能只取正文**：``tool_calls``
+        与 ``finish_reason`` 都要读出来做下一步决策。
+
+        正文请求（:meth:`chat`）不走这里，走 :meth:`_stream_sync` —— 那边
+        的 ``timeout`` 含义不一样，不能共用。
+        """
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers = self._headers("application/json")
 
         request = urllib.request.Request(
             self.endpoint, data=body, headers=headers, method="POST"
         )
-        # 按需挂代理：走 handler 而不是全局 ``urlopen``，避免影响其他插件的请求
-        opener = None
-        if self.proxy:
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler(
-                    {"http": self.proxy, "https": self.proxy}
-                )
-            )
+        opener = self._opener()
         send = opener.open if opener is not None else urllib.request.urlopen
         try:
             with send(request, timeout=self.timeout) as resp:
@@ -2164,9 +2190,182 @@ class OpenAICompatibleClient:
 
         return data
 
-    def _request_sync(self, payload: dict) -> str:
-        """同步发一次请求并取出正文（由 :meth:`chat` 放进线程池执行）。"""
-        return self.parse_response(self._post_sync(payload))
+    @staticmethod
+    def _delta_text(item: dict) -> tuple[str, str]:
+        """从一条流式 chunk 里取出 ``(正文增量, finish_reason)``。
+
+        只认 ``delta.content``，**故意不碰 ``reasoning_content``** ——
+        那是思考过程（DeepSeek 系模型会单独给一段），拼进正文会让报告里多出
+        一大段自我推演。非流式路径的 :meth:`parse_response` 同样只取 content，
+        两边口径必须一致，否则同一份提示词换个通道就出两种结果。
+        """
+        if isinstance(item, dict) and item.get("error"):
+            err = item["error"]
+            msg = err.get("message") if isinstance(err, dict) else str(err)
+            raise LLMRequestError(f"接口返回错误：{msg}", kind="protocol")
+
+        choices = item.get("choices") if isinstance(item, dict) else None
+        if not choices:
+            return "", ""
+        first = choices[0] or {}
+        finish = str(first.get("finish_reason") or "")
+        delta = first.get("delta")
+        if not isinstance(delta, dict):
+            # 少数实现的「流式」其实是每块塞一个完整 message
+            delta = (
+                first.get("message") if isinstance(first.get("message"), dict) else {}
+            )
+        text = delta.get("content")
+        if isinstance(text, list):
+            text = "".join(
+                part.get("text", "") for part in text if isinstance(part, dict)
+            )
+        return (text or ""), finish
+
+    def _stream_sync(self, payload: dict) -> str:
+        """流式发一次请求，边收边拼，返回**完整**正文。
+
+        由 :meth:`chat` 放进线程池执行。
+
+        **为什么必须流式。** 非流式的判活依据是「从发出请求到收完整 body
+        最多 ``timeout`` 秒」；但长报告真正的死因不在我们这一侧 —— 中转站
+        前面挂着 Cloudflare，它有 **120 秒 Proxy Read Timeout**：源站 120 秒
+        内没吐出完整响应，CF 直接扔 524。2026-11-15 夜里连着三次失败都是它：
+
+            HTTP 524 The origin web server did not return a complete response
+            within the 120-second Proxy Read Timeout window.
+
+        ⚠️ 这条**跟我们配的 300 秒无关** —— 120 秒先被掐掉，压根等不到 300。
+        流式把这道门槛绕开了：源站一开口就被转发，连接立刻算「活着」，
+        之后只要还在吐字就一路通行。
+
+        **``timeout`` 的语义因此变了**：从「总时长上限」变成「**连续多久没有
+        收到任何新字节**」。报告写 5 分钟、10 分钟都照等，总时长**不设上限**；
+        只有真卡死（模型挂起、连接半开、中途断流）超过这个时间才判死。
+
+        **断流必须报错，不能返回半篇。** 流式最危险的一种失败是连接被中途
+        掐断 —— 此时 ``for line in resp`` 只会安静地 EOF，拼出来的是一份写了
+        一半的报告。所以这里要求流**正常收尾**（见过 ``[DONE]`` 或非空
+        ``finish_reason``），否则宁可报错重来，也不把半成品交给用户。
+
+        Returns:
+            完整正文（已 strip）。
+
+        Raises:
+            LLMRequestError: 网络、鉴权、限流、断流、空内容等。
+        """
+        payload = dict(payload)
+        payload["stream"] = True
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers = self._headers("text/event-stream")
+
+        request = urllib.request.Request(
+            self.endpoint, data=body, headers=headers, method="POST"
+        )
+        opener = self._opener()
+        send = opener.open if opener is not None else urllib.request.urlopen
+
+        chunks: list[str] = []
+        #: 收到的原始行。两个用处：兜住「服务不支持流式、直接回整包 JSON」的
+        #: 情况；出空内容时把原文写进报错，省得事后瞎猜。
+        raw_lines: list[str] = []
+        saw_sse = False
+        finished = False
+        started = time.monotonic()
+        #: 第一个字到达的时刻（相对请求发出）。它会进日志 —— 首包超过 60 秒
+        #: 就意味着离 Cloudflare 那道 120 秒的门槛不远了，值得预警。
+        first_at: float | None = None
+
+        try:
+            with send(request, timeout=self.timeout) as resp:
+                for line_bytes in resp:
+                    line = line_bytes.decode("utf-8", "replace").strip()
+                    raw_lines.append(line)
+                    if not line or line.startswith(":"):
+                        # 空行是事件分隔符；":" 开头是注释/心跳（部分服务每 15 秒发一条）
+                        continue
+                    if not line.startswith("data:"):
+                        # 没带 data: 前缀的，只可能是整包 JSON 按行输出，留着兜底
+                        continue
+                    saw_sse = True
+                    chunk = line[5:].strip()
+                    if chunk == "[DONE]":
+                        finished = True
+                        break
+                    if not chunk:
+                        continue
+                    try:
+                        item = json.loads(chunk)
+                    except json.JSONDecodeError:
+                        # 单个事件坏了不该拖垮整篇，跳过继续读
+                        continue
+                    text, finish = self._delta_text(item)
+                    if text:
+                        if first_at is None:
+                            first_at = time.monotonic() - started
+                        chunks.append(text)
+                    if finish:
+                        finished = True
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", "replace")[:400]
+            except Exception:  # noqa: BLE001
+                detail = ""
+            raise LLMRequestError(
+                f"HTTP {e.code} {e.reason}" + (f"：{detail}" if detail else ""),
+                kind=http_error_kind(e.code),
+            ) from e
+        except urllib.error.URLError as e:
+            reason = getattr(e, "reason", "")
+            timed_out = isinstance(reason, (TimeoutError, socket.timeout))
+            raise LLMRequestError(
+                f"无法连接 {self.endpoint}：{reason}",
+                kind="timeout" if timed_out else "network",
+            ) from e
+        except (TimeoutError, socket.timeout) as e:
+            # 流式中途超过 timeout 没有新字节 —— 这才是「真卡死」，
+            # 与「写得慢」要分清楚：写得慢不会断流，卡住才会。
+            got = sum(len(c) for c in chunks)
+            raise LLMRequestError(
+                f"流式输出中断：连续 {self.timeout:g} 秒没有收到新数据"
+                f"（已收 {got} 字）",
+                kind="timeout",
+            ) from e
+        except http.client.IncompleteRead as e:
+            got = sum(len(c) for c in chunks)
+            raise LLMRequestError(
+                f"流式响应被截断（已收 {got} 字，连接提前关闭）", kind="network"
+            ) from e
+
+        if not saw_sse:
+            # 服务端不支持流式，把整包 JSON 当普通响应解析
+            raw = "\n".join(raw_lines)
+            try:
+                return self.parse_response(json.loads(raw))
+            except json.JSONDecodeError as e:
+                raise LLMRequestError(
+                    f"返回体既不是 SSE 也不是合法 JSON：{raw[:200]}", kind="protocol"
+                ) from e
+
+        text = "".join(chunks).strip()
+        if not text:
+            raise LLMRequestError("模型流式返回了空内容", kind="protocol")
+        if not finished:
+            # 关键防线：没见到收尾标记就说明流被掐断了，正文可能只有一半。
+            # 交给上层按失败处理，绝不当成完整报告发出去。
+            raise LLMRequestError(
+                f"流式响应未正常结束（已收 {len(text)} 字，"
+                f"没收到结束标记）—— 疑似中转站中途断流",
+                kind="network",
+            )
+        if first_at is not None and first_at > 60:
+            logger.warning(
+                f"[dota2] 流式首包晚了 {first_at:.0f}s"
+                f"（总 {time.monotonic() - started:.0f}s · {len(text)} 字）—— "
+                f"中转站前面的 Cloudflare 门槛是 120s，再慢就容易被掐成 524"
+            )
+        return text
 
     @staticmethod
     def parse_message(data: dict) -> dict:
@@ -2224,10 +2423,17 @@ class OpenAICompatibleClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> str:
-        """调用模型并返回正文。
+        """调用模型并返回正文（**流式**收发，完整拼好再返回）。
+
+        2026-11-16 起固定走流式，原因见 :meth:`_stream_sync`：非流式下长报告
+        会被中转站前面的 Cloudflare 120 秒 Proxy Read Timeout 掐成 524，
+        跟我们自己配的超时无关。
+
+        注意「流式」只发生在**我们和服务之间**：这里仍然等正文全部收完才
+        ``return``，调用方拿到的是一整篇完整报告，发送时机没有任何变化。
 
         Raises:
-            LLMRequestError: 缺少 key/model、网络异常或返回体不可解析。
+            LLMRequestError: 缺少 key/model、网络异常、断流或返回体不可解析。
         """
         if not self.api_key:
             raise LLMRequestError("未配置 API Key", kind="config")
@@ -2239,8 +2445,9 @@ class OpenAICompatibleClient:
             user_prompt,
             temperature=temperature,
             max_tokens=max_tokens,
+            stream=True,
         )
-        return await asyncio.to_thread(self._request_sync, payload)
+        return await asyncio.to_thread(self._stream_sync, payload)
 
     # ------------------------------------------------------------------
     # 工具调用（Function Calling）通道
@@ -2259,6 +2466,12 @@ class OpenAICompatibleClient:
         ``messages`` 是**完整的对话历史**（system / user / assistant /
         tool 四种角色），不由本方法拼装 —— 多轮工具调用的上下文必须原样
         带着走，少一条消息模型就会重复调工具或答非所问。
+
+        **这条通道刻意保持非流式**（``stream: False``）。两个理由：
+        工具调用是短请求（线上实测最慢一次 12.3 秒，离超时很远），不存在
+        被 CF 120 秒掐断的问题；而流式下 ``tool_calls`` 会被拆成按字段
+        分片的名字/参数增量，拼装一错就是「参数残缺的函数调用」，
+        比慢一点危险得多。正文请求走 :meth:`_stream_sync`，两边分开。
         """
         payload: dict[str, Any] = {
             "model": self.model,
