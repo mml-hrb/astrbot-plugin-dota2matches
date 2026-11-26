@@ -53,6 +53,7 @@ try:  # 插件目录被作为包加载时的相对导入
         dota_hero_kb_ingest,
         dota_history,
         dota_jobs,
+        dota_keyfights,
         dota_nlu,
         dota_parse,
         dota_pool,
@@ -123,6 +124,7 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
     import dota_hero_kb_ingest  # type: ignore[no-redef]
     import dota_history  # type: ignore[no-redef]
     import dota_jobs  # type: ignore[no-redef]
+    import dota_keyfights  # type: ignore[no-redef]
     import dota_nlu  # type: ignore[no-redef]
     import dota_parse  # type: ignore[no-redef]
     import dota_pool  # type: ignore[no-redef]
@@ -2192,7 +2194,44 @@ class Dota2Plugin(Star):
             win_curve=win_block,
             hero_block=self._hero_kb_block(match, heroes, focus_ids),
         )
+        if self.cfg("two_step_report", True):
+            evidence = await self._match_keyfight_evidence(match, heroes, items, focus_ids)
+            common, spec = split_report_prompt(prompt)
+            if spec:
+                prompt = common + "\n\n" + evidence + "\n\n" + spec
         return headline, prompt
+
+    async def _match_keyfight_evidence(
+        self, match: dict, heroes: dict, items: dict, focus_ids: list[int]
+    ) -> str:
+        """一次排队完成关键团取证；失败明确降级，不阻断基础报告。"""
+        if not match.get("teamfights"):
+            return dota_keyfights.HEADER + "\n录像证据不可用：没有已解析团战窗口。"
+        try:
+            curve = await self._aligned_curve(match, int(match.get("match_id") or 0))
+            candidates = dota_replay.score_fights(match, focus_ids=focus_ids, curve=curve)
+            selected = dota_replay.pick_candidates(candidates, top_n=3)
+            if not selected:
+                return dota_keyfights.HEADER + "\n没有可定位的关键团窗口。"
+            self._jobs.stage("归因前取证：排队读取关键团完整录像窗口")
+
+            async def collect() -> str:
+                async def build(candidate: dict) -> str:
+                    self._jobs.stage(f"归因前取证：读取第 {candidate['index']} 波完整过程")
+                    fight = match["teamfights"][candidate["index"] - 1]
+                    return await self._build_replay_block(
+                        match, fight, heroes, items, focus_ids, for_report=True
+                    )
+                return await dota_keyfights.collect(selected, build)
+
+            return await self.replay_queue.run(
+                f"比赛 {match.get('match_id')} 归因前关键团取证", collect
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 增强证据不可拖垮整场复盘
+            logger.warning(f"[dota2] 归因前关键团取证失败：{exc}")
+            return dota_keyfights.HEADER + "\n录像证据不可用：引擎、队列或录像暂不可用；按基础数据归因，不作录像级断言。"
 
     def _hero_kb_block(
         self,
@@ -7461,8 +7500,13 @@ class Dota2Plugin(Star):
         heroes: dict[int, dict],
         items_const: dict[str, dict],
         focus_ids: Sequence[int] | None = None,
+        *,
+        for_report: bool = False,
     ) -> str:
-        """下载 → 解压 → 解析 → 组装数据块。整个函数在队列里串行执行。"""
+        """下载 → 解压 → 解析 → 组装数据块。整个函数在队列里串行执行。
+
+        整场归因不需要动画 Fine，避免为它额外重下录像。
+        """
         match_id = int(match.get("match_id") or 0)
         engine = self._replay_engine_dir()
         workdir = os.path.join(engine, "replays", str(match_id))
@@ -7495,6 +7539,7 @@ class Dota2Plugin(Star):
                 logger.info(f"[dota2] 比赛 {match_id} 的录像缓存版本过旧，已清理待重解析")
             elif (
                 os.path.exists(combat_path)
+                and not for_report
                 and dota_replay.has_fine_exporter(engine)
                 and not os.path.exists(fine_path)
             ):
@@ -7518,6 +7563,14 @@ class Dota2Plugin(Star):
                 logger.info(
                     f"[dota2] 比赛 {match_id} 的缓存缺 fine.csv 且引擎已装 Fine，重新解析"
                 )
+
+        if for_report and not all(
+            os.path.isfile(path) and os.path.getsize(path) > 0
+            for path in (combat_path, hp_path, items_path)
+        ):
+            # 不信任上次中断留下的 combat 半成品。
+            if os.path.exists(combat_path):
+                os.remove(combat_path)
 
         if not os.path.exists(combat_path):
             url = await self._match_replay_url(match, match_id)
@@ -7549,7 +7602,7 @@ class Dota2Plugin(Star):
             # 2. **失败不能连累主链**。它是可选的，出任何错都只记日志，
             #    让 combat/hp 照常产出（否则「团战看不了」会升级成「复盘也没了」）。
             # 3. **必须在删 demo 之前跑**。demo 用完就删，之后再想补就要重下 37 MB。
-            if dota_replay.has_fine_exporter(engine):
+            if not for_report and dota_replay.has_fine_exporter(engine):
                 try:
                     await dota_replay_parse.run_java(
                         java, engine, "Fine", [demo, fine_path]

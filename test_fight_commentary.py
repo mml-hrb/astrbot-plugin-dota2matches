@@ -47,6 +47,14 @@ class CommentaryTests(unittest.TestCase):
             data, _ = json.JSONDecoder().raw_decode(html.split('const DATA = ', 1)[1])
             self.assertEqual(data['commentary']['title'], '</script><script>alert(1)</script>')
 
+    def test_recent_item_names_are_localized_in_html(self):
+        from dota_fight_html import spell_cn
+
+        self.assertEqual(spell_cn("item_bloodslinger"), "血腥投带")
+        self.assertEqual(spell_cn("item_royale_with_cheese"), "奶酪块")
+        self.assertEqual(spell_cn("item_angels_demise"), "绝刃")
+        self.assertEqual(spell_cn("item_devastator"), "圣斧")
+
     def test_fine_entities_match_combat_names(self):
         self.assertEqual(renderer.hero_slug('CDOTA_Unit_Hero_Void_Spirit'), renderer.norm_npc('npc_dota_hero_void_spirit'))
         self.assertEqual(renderer.hero_slug('CDOTA_Unit_Hero_QueenOfPain'), renderer.norm_npc('npc_dota_hero_queenofpain'))
