@@ -90,7 +90,6 @@ try:  # 插件目录被作为包加载时的相对导入
     )
     from .dota_format import (
         BENCHMARK_ENABLED,
-        build_match_data_text,
         fmt_ago,
         fmt_duration,
         format_hero_meta_board,
@@ -160,7 +159,6 @@ except ImportError:  # 兜底：以普通模块方式加载时（把插件目录
     )
     from dota_format import (  # type: ignore[no-redef]
         BENCHMARK_ENABLED,
-        build_match_data_text,
         fmt_ago,
         fmt_duration,
         format_hero_meta_board,
@@ -1857,32 +1855,22 @@ class Dota2Plugin(Star):
             await self._deliver_report(umo, headline, report, label="复盘", single_match=True)
             return True, "复盘已发出"
 
-        # 兜底路径自己要拿渲染常量（原先靠上游算好的局部变量，
-        # 而那两个变量在收进 _build_match_prompt 时被一起搬走了 —— 见
-        # _match_render_constants 的说明）。
-        self._jobs.stage("模型没出正文，正在发原始数据（含团战清单）")
+        # 模型不可用：只如实说明 + 附团战清单。
+        #
+        # 2026-11-27 起**不再倒原始数据**。``build_match_data_text`` 拼的是
+        # 喂给模型的结构化字段（分路、逐分钟经济、逐件出装、伤害构成），
+        # 人读它既得不出结论，又会在 QQ 里刷几十屏 —— 失败就说清楚失败，
+        # 不拿机器格式充内容。用户原话：「那东西不是给人看的」。
+        self._jobs.stage("模型没出正文，正在整理可看的内容")
         await self._parse_notify(umo, headline)
-        abilities, curve_ids = await self._match_render_constants(match, focus_ids)
-        raw = (
-            self._llm_failure_notice()
-            + "\n以下为从数据源获取的完整原始数据：\n\n"
-            + build_match_data_text(
-                match,
-                heroes,
-                items,
-                focus_account_ids=focus_ids or None,
-                abilities=abilities,
-                curve_ids=curve_ids,
-            )
-        )
-        # 模型不可用时也照样给清单：它不依赖模型，而且「等这么久却连哪波
-        # 都点不了」比一份简略的原文更让人难受。
-        raw = await self._append_fight_candidates(
-            raw, match, focus_ids, focus_names, heroes
+        note = self._llm_failure_notice()
+        # 团战清单不依赖模型，仍然给：至少能点开看是哪几波打了。
+        note = await self._append_fight_candidates(
+            note, match, focus_ids, focus_names, heroes
         )
         # 同上：裸循环换成统一分块出口（逐块隔离 + 带块号的日志）。
-        await self._send_chunked(umo, raw, label="原文")
-        return False, "模型没出正文，已发原始数据"
+        await self._send_chunked(umo, note, label="说明")
+        return False, "模型没出正文，已发失败说明"
 
     async def _generate_report_for_umo(self, umo: str, prompt: str) -> str | None:
         """在指定会话下调用大模型生成报告（供后台任务使用）。"""
@@ -1898,9 +1886,9 @@ class Dota2Plugin(Star):
         降级原则：**任何一步拿不到东西都退回单步**。多一步是为了更准，
         不是为了多一次失败机会 —— 用户等的是战报，不是流程完整性。
 
-        ⚠️ 唯一的例外是**超时**：归因步连续一段时间没有任何输出，说明这条
-        通道此刻就是卡住了，退回单步等于把同一轮等待再走一遍（而用户已经
-        等了一整轮）。这种情况直接认输，交给「原始数据」兜底。
+        ⚠️ 唯一的例外是**超时**：归因步已经走完「同通道重试 → 回退默认模型」
+        这一整套，仍然拿不到东西；此时退回单步，等于把同样的一整套再跑一遍
+        （而用户已经等过一轮）。所以直接认输，走「模型不可用」的兜底说明。
 
         Args:
             prompt: :func:`build_single_match_analysis_prompt` 的完整输出。
@@ -1921,7 +1909,8 @@ class Dota2Plugin(Star):
         if not table or len(table.strip()) < 40:
             if self._is_timeout_error():
                 logger.warning(
-                    "[dota2] 归因步超时，不再退回单步（重跑一次还是等一整轮）"
+                    "[dota2] 归因步超时，不再退回单步"
+                    "（专用通道已重试并回退过，重跑一轮只会再花同样的时间）"
                 )
                 return None
             logger.warning("[dota2] 归因步没有拿到有效结果，退回单步生成")
@@ -2267,15 +2256,14 @@ class Dota2Plugin(Star):
 
         上一批把单场复盘的提示词组装收进 :meth:`_build_match_prompt` 时，
         顺带吃掉了调用点上 ``abilities = …`` / ``curve_ids = …`` 两条赋值 ——
-        而那三条「模型不可用 → 退回原始数据」的**冷路径**里，
+        而当时那三条「模型不可用 → 退回原始数据」的**冷路径**里，
         ``build_match_data_text(..., abilities=abilities, curve_ids=curve_ids)``
         还在引用它们。那条路只在 LLM 挂掉时才会走，所以 41 个离线脚本全绿、
         真机也没撞上：典型的「只在最需要它的时候才炸」。
 
-        没有把这两个值加进 :meth:`_build_match_prompt` 的返回值，是因为
-        「提示词」和「渲染常量」是两件事 —— 后者还要供
-        :func:`build_match_data_text` 拼**原始数据兜底**用。分开之后，
-        冷路径能自己去拿，不必依赖「上游有没有替我算过」。
+        2026-11-27 起那三条冷路径不再倒原始数据（用户原话「那东西不是给人看的」），
+        但这两个值**仍是提示词组装的必需项** —— 技能名表与曲线玩家都要进 prompt，
+        所以这个抽取继续保留，只是不再服务兜底路径。
         """
         abilities = await self._ability_constants()
         curve_ids = self._curve_targets(match, focus_ids)
@@ -4903,28 +4891,15 @@ class Dota2Plugin(Star):
                 logger.info(f"[dota2] 工具复盘已推送: 比赛 {match_id} → {umo}")
                 job_ok, job_note = True, "复盘已发出"
                 return
-            # 模型不可用：退化成原始数据，至少让用户拿到东西
-            abilities, curve_ids = await self._match_render_constants(
-                match, focus_ids
+            # 模型不可用：只如实说明 + 附团战清单（2026-11-27 起不再倒原始数据，
+            # 那份结构化字段是喂模型的，人看不懂，还会在 QQ 里刷几十屏 ——
+            # 用户原话「那东西不是给人看的」）。
+            note = f"{headline}\n\n" + self._llm_failure_notice()
+            note = await self._append_fight_candidates(
+                note, match, focus_ids, focus_names, heroes
             )
-            raw = (
-                f"{headline}\n\n"
-                + self._llm_failure_notice()
-                + "\n以下为从数据源获取的完整原始数据：\n\n"
-                + build_match_data_text(
-                    match,
-                    heroes,
-                    items,
-                    focus_account_ids=focus_ids or None,
-                    abilities=abilities,
-                    curve_ids=curve_ids,
-                )
-            )
-            raw = await self._append_fight_candidates(
-                raw, match, focus_ids, focus_names, heroes
-            )
-            await self._send_to_session(umo, raw)
-            job_note = "模型没出正文，已发原始数据"
+            await self._send_to_session(umo, note)
+            job_note = "模型没出正文，已发失败说明"
         finally:
             self._jobs.finish(
                 ok=job_ok,
@@ -6976,28 +6951,15 @@ class Dota2Plugin(Star):
                     yield item
                 job_ok, job_note = True, "复盘已发出"
             else:
-                abilities, curve_ids = await self._match_render_constants(
-                    match, focus_ids
+                # 模型不可用：只如实说明 + 附团战清单。不再倒原始数据 ——
+                # 那份结构化字段是喂模型的，人读不出结论，还会刷几十屏。
+                note = f"{headline}\n\n" + self._llm_failure_notice()
+                note = await self._append_fight_candidates(
+                    note, match, focus_ids, focus_names, heroes
                 )
-                raw = (
-                    f"{headline}\n\n"
-                    + self._llm_failure_notice()
-                    + "\n以下为从数据源获取的完整原始数据：\n\n"
-                    + build_match_data_text(
-                        match,
-                        heroes,
-                        items,
-                        focus_account_ids=focus_ids or None,
-                        abilities=abilities,
-                        curve_ids=curve_ids,
-                    )
-                )
-                raw = await self._append_fight_candidates(
-                    raw, match, focus_ids, focus_names, heroes
-                )
-                for result in self._text_results(event, raw):
+                for result in self._text_results(event, note):
                     yield result
-                job_note = "模型没出正文，已发原始数据"
+                job_note = "模型没出正文，已发失败说明"
         finally:
             self._jobs.finish(
                 ok=job_ok, note=job_note if job_ok else "", error="" if job_ok else job_note
@@ -9482,6 +9444,7 @@ class Dota2Plugin(Star):
             base_url=str(self.cfg("llm_base_url", "") or ""),
             model=str(self.cfg("llm_model", "") or ""),
             timeout=float(self.cfg("llm_timeout", 300) or 300),
+            first_token_timeout=float(self.cfg("llm_first_token_timeout", 60) or 60),
             proxy=str(self.cfg("llm_proxy", "") or ""),
         )
 
@@ -9567,12 +9530,15 @@ class Dota2Plugin(Star):
             return "⚠️ 未启用大模型分析（或本次没有可用的模型通道）"
         kind, message = info
         timeout = float(self.cfg("llm_timeout", 300) or 300)
+        first_timeout = float(self.cfg("llm_first_token_timeout", 60) or 60)
         if kind == "timeout":
             return (
-                f"⏱ 模型连续 {timeout:.0f} 秒没有输出任何内容，这次放弃了。\n"
+                f"⏱ 模型这次没能在 {first_timeout:.0f} 秒内开口"
+                f"（或中途连续 {timeout:.0f} 秒不出字），"
+                "重试和备用通道都没救回来，这次放弃了。\n"
                 "现在是流式接收 —— 只要它还在出字就会一直等（不设总时长上限），"
-                "所以这不是「写得太慢」，而是「卡住了」或「连接被掐断了」。\n"
-                "没有自动换通道重试：重试只会让你再等一轮。可以过几分钟再发一次。"
+                "所以这不是「写得太慢」，而是「卡住了」或「连接被掐断了」。"
+                "可以过几分钟再发一次。"
             )
         if kind == "auth":
             return "🔑 模型鉴权失败（Key 无效或没权限）。可以用 `/d2 模型测试` 自检。"
@@ -9589,16 +9555,19 @@ class Dota2Plugin(Star):
     ) -> str | None:
         """生成**报告 / 分析**用的大模型调用：专用 Key 优先，失败回退 AstrBot。
 
-        **超时不回退**（2026-11-10 起，2026-11-16 语义更新）：换一条通道意味着
-        从头再等一整轮，用户看到的就是「十分钟什么都没发生，最后说模型不可用」。
+        2026-11-27 起顺序改成「**同通道快速重试 → 用尽才换通道**」：
 
-        2026-11-16 起「超时」不再是「等到总时长用尽」—— 正文请求改走**流式**，
-        只要模型还在吐字就一直等，不设总时长上限（旧做法被中转站前面的
-        Cloudflare 120 秒 Proxy Read Timeout 掐成 524，跟我们配的时长无关）。
-        现在的「超时」专指**连续 ``llm_timeout`` 秒没有收到任何新字节**，
-        也就是真卡住 / 断流。那种情况重试同样要重新等，而且可能再卡一次，
-        所以照样不回退。鉴权 / 限流 / 连不上 / 服务端 5xx 仍然回退，
-        因为那几类换通道**确实**有救。
+        1. 专用通道流式调用，**60 秒没等到第一个 token 就判这次失败**
+           （``llm_first_token_timeout``）。中转站的上游是间歇性故障，
+           等满 ``llm_timeout`` 才判死，等于把用户的时间耗在一条死角里；
+        2. 失败后在**同一条通道**上立即重发，最多 ``llm_stream_retries``
+           次（默认 3）。首包超时、中途断流、5xx、限流都算「这次不行」；
+           鉴权 / 配置错误不重试（重发一百次也一样）；
+        3. 重试用尽仍失败，才回退到 AstrBot 的默认模型。
+
+        历史：2026-11-10 定的是「超时立刻认输、不回退」，理由是换通道要
+        从头再等一整轮。2026-11-27 的日志证明这个结论只对了一半 ——
+        上游抽风时换通道是对的，错的是「一次失败就换、换过去还死等」。
 
         Args:
             prompt: 用户提示词。
@@ -9619,57 +9588,80 @@ class Dota2Plugin(Star):
             system_prompt = DEFAULT_SYSTEM_PROMPT
 
         client = self._dedicated_client()
+        #: 专用通道最后留下的错误。回退段要靠它决定「报错该归咎于谁」——
+        #: 专用通道已经失败过，就别让回退的异常把首因顶掉（2026-11-26 的
+        #: 教训：用户看到的永远是「回退通道 Request timed out」，真正的
+        #: 「上游断流」在文案里彻底消失，于是每次都像「又超时了」）。
+        last_error: LLMRequestError | None = None
         if client is not None:
-            started = time.time()
-            last_error: LLMRequestError | None = None
-            try:
-                max_tokens = int(self.cfg("llm_max_tokens", 0) or 0)
-                text = await client.chat(
-                    system_prompt,
-                    prompt,
-                    temperature=float(self.cfg("llm_temperature", 0.7) or 0),
-                    max_tokens=max_tokens or None,
-                )
-            except LLMRequestError as e:
-                last_error = e
-                logger.error(
-                    f"[dota2] 专用模型调用失败（{client.endpoint}，"
-                    f"类别 {e.kind}）：{e}"
-                )
-                self._note_report_error(e)
-            except Exception as e:  # noqa: BLE001
-                last_error = LLMRequestError(
-                    f"专用模型调用出现异常：{e}", kind="other"
-                )
-                logger.error(f"[dota2] 专用模型调用出现异常：{e}", exc_info=True)
-                self._note_report_error(last_error)
-            else:
-                # **成功也要留痕**。这里原来只 return，一声不响 —— 事后查
-                # 「这份战报到底走了哪条 key」时，日志里只有入口那轮的默认模型，
-                # 看起来像全程都在用默认 key（2026-10-24 排查就卡在这）。
-                logger.info(
-                    f"[dota2] 分析正文已生成（通道=专用模型 "
-                    f"{getattr(client, 'model', '') or '未命名'} · "
-                    f"{len(text or '')} 字 · {time.time() - started:.1f}s）"
-                )
-                return text
+            max_tokens = int(self.cfg("llm_max_tokens", 0) or 0)
+            temperature = float(self.cfg("llm_temperature", 0.7) or 0)
+            retries = max(0, int(self.cfg("llm_stream_retries", 3) or 0))
 
-            # ---- 超时：立刻认输，不回退 ----
-            #
-            # 这一步是 2026-11-10 线上事故的直接修复：写作步 120 秒超时后
-            # 原代码回退到 AstrBot 提供商，回退通道又超时、又重试 5 次，
-            # 用户从 16:54 等到 17:06 只拿到「模型不可用」。
-            # 默认行为定为「不回退」，但仍留一个开关，方便用户在网络抖动
-            # 频繁、宁可多等也要出报告时改回去。
-            if (
-                last_error is not None
-                and last_error.kind == "timeout"
-                and not self.cfg("llm_fallback_on_timeout", False)
-            ):
-                logger.warning(
-                    "[dota2] 专用模型超时，不回退重试（再等一轮只会让用户多等一倍）"
-                )
-                return None
+            # 同一通道最多试 ``retries + 1`` 次（首次 + 重试）。重试放在
+            # 这里而不是 ``_stream_sync`` 里面，是因为「该不该重试」取决于
+            # 失败类别，而类别在异常对象上 —— 让客户端只负责一次调用的
+            # 成败，策略留在业务层。
+            for attempt in range(retries + 1):
+                started = time.time()
+                if attempt:
+                    logger.warning(
+                        f"[dota2] 专用模型重试 {attempt}/{retries}"
+                        f"（上次失败：{last_error.kind if last_error else '?'}）"
+                    )
+                try:
+                    text = await client.chat(
+                        system_prompt,
+                        prompt,
+                        temperature=temperature,
+                        max_tokens=max_tokens or None,
+                    )
+                except LLMRequestError as e:
+                    last_error = e
+                    logger.error(
+                        f"[dota2] 专用模型调用失败（{client.endpoint}，"
+                        f"类别 {e.kind}）：{e}"
+                    )
+                    # 首包超时 / 断流 / 5xx / 限流都是「这次上游不行」，
+                    # 立刻重发换条路由；鉴权 / 配置错误重发没用。
+                    if e.retryable_same_channel and attempt < retries:
+                        continue
+                    self._note_report_error(e)
+                except Exception as e:  # noqa: BLE001
+                    last_error = LLMRequestError(
+                        f"专用模型调用出现异常：{e}", kind="other"
+                    )
+                    logger.error(
+                        f"[dota2] 专用模型调用出现异常：{e}", exc_info=True
+                    )
+                    self._note_report_error(last_error)
+                else:
+                    # **成功也要留痕**。这里原来只 return，一声不响 —— 事后查
+                    # 「这份战报到底走了哪条 key」时，日志里只有入口那轮的默认
+                    # 模型，看起来像全程都在用默认 key（2026-10-24 排查卡在这）。
+                    if attempt:
+                        logger.info(
+                            f"[dota2] 专用模型第 {attempt} 次重试成功"
+                        )
+                    logger.info(
+                        f"[dota2] 分析正文已生成（通道=专用模型 "
+                        f"{getattr(client, 'model', '') or '未命名'} · "
+                        f"{len(text or '')} 字 · {time.time() - started:.1f}s）"
+                    )
+                    return text
+                break
+
+            if last_error is not None:
+                if last_error.retryable_same_channel:
+                    logger.warning(
+                        f"[dota2] 专用模型重试用尽（共 {retries + 1} 次尝试，"
+                        f"最后失败：{last_error.kind}），改用默认模型"
+                    )
+                else:
+                    logger.warning(
+                        f"[dota2] 专用模型失败（{last_error.kind}，这一类不重试），"
+                        f"改用默认模型"
+                    )
 
             if not self.cfg("llm_fallback_on_error", True):
                 logger.warning("[dota2] 已关闭回退，本次不做 AI 分析")
@@ -9686,16 +9678,27 @@ class Dota2Plugin(Star):
             return None
         started = time.time()
         try:
-            text = await call_llm(provider, system_prompt, prompt)
+            # prefer_stream=True 是 2026-11-27 的修复：回退通道的 provider
+            # timeout（线上 120s）在非流式下是**总时长**，而一篇长战报实测
+            # 要 284 秒，于是 5 次重试必然全败（用户白等 10 分钟）。走流式后
+            # 超时变成「两次数据之间的间隔」，模型还在吐字就能跑完。
+            text = await call_llm(provider, system_prompt, prompt, prefer_stream=True)
         except Exception as e:  # noqa: BLE001
             logger.error(f"[dota2] 调用大模型失败: {e}", exc_info=True)
-            self._note_report_error(
-                LLMRequestError(f"回退通道调用失败：{e}", kind="other")
-            )
+            if last_error is None:
+                # 专用通道根本没跑（没配 Key / 没启用），回退的失败就是首因
+                self._note_report_error(
+                    LLMRequestError(f"回退通道调用失败：{e}", kind="other")
+                )
+            else:
+                # 专用通道已经失败过 —— 那才是首因，不能覆盖
+                logger.warning(
+                    f"[dota2] 回退通道也失败（保留首因 {last_error.kind}）：{e}"
+                )
             return None
         # 回退成功同样要留痕 —— 只有这样「专用通道没走成」才在日志里可见。
         logger.info(
-            f"[dota2] 分析正文已生成（通道=回退 AstrBot 默认模型 · "
+            f"[dota2] 分析正文已生成（通道=回退 AstrBot 默认模型（流式） · "
             f"{len(text or '')} 字 · {time.time() - started:.1f}s）"
         )
         return text

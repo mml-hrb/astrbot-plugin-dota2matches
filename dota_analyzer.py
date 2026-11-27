@@ -1694,14 +1694,66 @@ async def resolve_provider(context: Any, umo: str, provider_id: str = "") -> Any
         return None
 
 
-async def call_llm(provider: Any, system_prompt: str, user_prompt: str) -> str:
+async def _call_llm_stream(
+    provider: Any, system_prompt: str, user_prompt: str
+) -> str:
+    """用 provider 的流式接口收完整正文；拿不到就返回空串，交给非流式兜底。
+
+    ⚠️ AstrBot 的 ``text_chat_stream`` 在**每个 chunk 都 yield 同一个**
+    ``LLMResponse`` 对象，但中间 chunk 的 ``completion_text`` 是**空串**
+    （增量放在 ``result_chain`` 里），只有收尾那次 yield 才是完整全文。
+    所以这里只在「非空且更长」时覆盖 —— 逐个拼 ``result_chain`` 会与最终
+    全文重复计算，拼出两遍报告。
+    """
+    stream_fn = getattr(provider, "text_chat_stream", None)
+    if stream_fn is None:  # 老版本 AstrBot 没有这个接口
+        return ""
+
+    final = ""
+    try:
+        async for resp in stream_fn(
+            prompt=user_prompt, system_prompt=system_prompt
+        ):
+            text = getattr(resp, "completion_text", "") or ""
+            if len(text) > len(final):
+                final = text
+    except TypeError:
+        # 连 system_prompt 都不认的版本，直接放弃流式
+        return ""
+    except Exception as e:  # noqa: BLE001 - 流式失败要能退回非流式
+        logger.warning(f"[dota2] 回退通道流式调用失败，改用非流式：{e}")
+        return ""
+    return final.strip()
+
+
+async def call_llm(
+    provider: Any,
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    prefer_stream: bool = False,
+) -> str:
     """调用大模型并返回纯文本结果。
+
+    Args:
+        prefer_stream: **报告类长请求传 True**。AstrBot 的 provider 把
+            ``timeout``（线上 120 秒）当**总时长**用，非流式下长报告必然超时：
+            2026-11-27 实测同一端点写一篇 5000 字战报要 **284 秒**，120 秒
+            根本等不到，重试几次也是必然全败。改走 ``text_chat_stream`` 后，
+            这个 120 秒变成「两次数据之间的间隔」—— 只要模型还在吐字就能
+            一路跑完（实测首包 130 秒、总 285 秒仍完整收完）。
+        system_prompt / user_prompt: 提示词。
 
     Raises:
         RuntimeError: 提供商为空或调用失败。
     """
     if provider is None:
         raise RuntimeError("没有可用的模型提供商")
+
+    if prefer_stream:
+        streamed = await _call_llm_stream(provider, system_prompt, user_prompt)
+        if streamed:
+            return streamed
 
     # 不同 AstrBot 版本 text_chat 的参数略有差异，这里做兼容降级
     try:
@@ -1948,19 +2000,22 @@ PRESET_ALIASES: dict[str, str] = {
 class LLMRequestError(RuntimeError):
     """自建通道调用失败（网络、鉴权、限流、返回体异常等）。
 
-    ``kind`` 说明**是哪一类**失败，调用方据此决定要不要换通道重试：
+    ``kind`` 说明**是哪一类**失败，调用方据此决定要不要重试：
 
-    * ``timeout`` —— **连续一段时间没有收到任何新数据**（流式下不再有
-      「总时长」这回事，见 :meth:`OpenAICompatibleClient._stream_sync`）。
-      这说明模型卡住了，换通道意味着**再等一整轮**，用户看到的就是
-      「十分钟过去了什么都没发生」，所以默认不回退；
+    * ``timeout`` —— **首包超过 ``first_token_timeout`` 没到**，或流式输出
+      连续 ``llm_timeout`` 秒没有新数据（见
+      :meth:`OpenAICompatibleClient._stream_sync`）。2026-11-27 起这一类
+      **不再一次就放弃**：先在同一条通道上重发（中转站是间歇性故障，换条
+      上游路由往往立刻就好），重试用尽才回退默认模型；
     * ``auth`` / ``config`` —— Key 或模型名不对，换通道确实有救；
     * ``rate_limit`` / ``server`` / ``network`` —— 换通道可能绕开；
     * ``protocol`` / ``http`` / ``other`` —— 兜底，按原策略处理。
 
     2026-11-10 线上事故：写作步 120 秒超时，代码不分青红皂白回退，
     又在回退通道上重试了 5 次，用户等了十分钟只拿到「模型不可用」。
-    分类就是为了让「超时」这一类单独走「立刻认输」的路。
+    当时把它归成「超时就不该换通道」，但 2026-11-27 的日志说明这个结论
+    只对了一半：上游抽风时**换通道是对的**，错的是「一次失败就换、换过去
+    还死等」。现在的顺序是「同通道快速重试 → 用尽才换通道」。
     """
 
     #: 已知类别。没归类的异常一律 ``other``。
@@ -1983,15 +2038,27 @@ class LLMRequestError(RuntimeError):
         self.kind = kind if kind in self.KINDS else "other"
 
     @property
-    def retryable_elsewhere(self) -> bool:
-        """换一条通道重试是否有意义。
+    def retryable_same_channel(self) -> bool:
+        """在同一条通道上重发一次是否有意义。
 
-        超时不算：流式下「超时」的含义是**连接已经不再吐字**，说明这条
-        通道此刻就是卡住了，换一条同样要重新等；而重试的代价是
-        用户**再等一轮**。配置类错误也不算「换通道」——没配 Key 时
-        本来就该回落，这条由调用方按 ``auth``/``config`` 处理。
+        鉴权 / 配置错误重发一百次结果都一样；其余类别（首包超时、中途断流、
+        5xx、限流、网络抖动）都是「这次上游不行」，重发换条路由可能立刻就好。
+
+        2026-11-27 实测依据：同一个中转站，11-26 20:28 断流（324 秒）、
+        11-27 08:37 返回 502、09:15 同样的请求 115 秒正常收完 —— 典型的
+        间歇性故障，不试第二次等于白扔一次机会。
         """
-        return self.kind not in {"timeout"}
+        return self.kind not in {"auth", "config"}
+
+    @property
+    def retryable_elsewhere(self) -> bool:
+        """换**另一条通道**是否有意义（与同通道重试是两件事）。
+
+        2026-11-27 起超时也算「值得换」：重试耗尽后仍失败，说明这条通道
+        这一阵子都不行，退到默认模型比直接交白卷强。鉴权 / 配置类错误
+        由调用方单独处理（没配 Key 时本来就该回落）。
+        """
+        return self.kind not in {"auth", "config"}
 
 
 def http_error_kind(code: int) -> str:
@@ -2067,6 +2134,7 @@ class OpenAICompatibleClient:
         model: str = "",
         *,
         timeout: float = 120.0,
+        first_token_timeout: float = 60.0,
         provider_hint: str = "",
         proxy: str = "",
         extra_headers: dict[str, str] | None = None,
@@ -2075,6 +2143,9 @@ class OpenAICompatibleClient:
         self.base_url = normalize_base_url(base_url, provider_hint)
         self.model = (model or "").strip()
         self.timeout = max(5.0, float(timeout))
+        #: 多久没等到**第一个字**就判这次失败。这是「上游这次不行」的快速
+        #: 判定，由调用方决定要不要换条路由重发（见 ``retryable_same_channel``）。
+        self.first_token_timeout = max(1.0, float(first_token_timeout))
         self.proxy = (proxy or "").strip()
         self.extra_headers = dict(extra_headers or {})
 
@@ -2242,6 +2313,14 @@ class OpenAICompatibleClient:
         收到任何新字节**」。报告写 5 分钟、10 分钟都照等，总时长**不设上限**；
         只有真卡死（模型挂起、连接半开、中途断流）超过这个时间才判死。
 
+        **但首包另有一个更短的硬门槛**（``first_token_timeout``，默认 60 秒）。
+        中转站的上游是间歇性故障 —— 2026-11-27 实测同一份代码、同样规模的
+        请求：某一晚 324 秒断流、次日 HTTP 502，几小时后又 115 秒正常收完。
+        对这种情况等满 ``timeout`` 再判死没有意义：60 秒还没吐第一个字，
+        这次基本就是废的，早点判死交给调用方换条路由重发，比让用户干等强。
+        收到第一个字之后，读超时自动放宽回 ``timeout``（见
+        :meth:`_relax_read_timeout`）。
+
         **断流必须报错，不能返回半篇。** 流式最危险的一种失败是连接被中途
         掐断 —— 此时 ``for line in resp`` 只会安静地 EOF，拼出来的是一份写了
         一半的报告。所以这里要求流**正常收尾**（见过 ``[DONE]`` 或非空
@@ -2274,9 +2353,11 @@ class OpenAICompatibleClient:
         #: 第一个字到达的时刻（相对请求发出）。它会进日志 —— 首包超过 60 秒
         #: 就意味着离 Cloudflare 那道 120 秒的门槛不远了，值得预警。
         first_at: float | None = None
+        #: 打开连接与等首包用较短阈值；收到第一个字后再放宽成空闲阈值。
+        open_timeout = min(self.timeout, self.first_token_timeout)
 
         try:
-            with send(request, timeout=self.timeout) as resp:
+            with send(request, timeout=open_timeout) as resp:
                 for line_bytes in resp:
                     line = line_bytes.decode("utf-8", "replace").strip()
                     raw_lines.append(line)
@@ -2302,6 +2383,7 @@ class OpenAICompatibleClient:
                     if text:
                         if first_at is None:
                             first_at = time.monotonic() - started
+                            self._relax_read_timeout(resp)
                         chunks.append(text)
                     if finish:
                         finished = True
@@ -2318,14 +2400,26 @@ class OpenAICompatibleClient:
         except urllib.error.URLError as e:
             reason = getattr(e, "reason", "")
             timed_out = isinstance(reason, (TimeoutError, socket.timeout))
+            if timed_out and first_at is None:
+                # 连响应头都没拿到 —— 上游此刻不可用，重发换条路由比继续等强
+                raise LLMRequestError(
+                    f"首包超时：{open_timeout:g} 秒内没有拿到响应（连响应头都没回）",
+                    kind="timeout",
+                ) from e
             raise LLMRequestError(
                 f"无法连接 {self.endpoint}：{reason}",
                 kind="timeout" if timed_out else "network",
             ) from e
         except (TimeoutError, socket.timeout) as e:
+            got = sum(len(c) for c in chunks)
+            if first_at is None:
+                # 通道活着但一个字都没吐出来 —— 同样按「首包失败」处理
+                raise LLMRequestError(
+                    f"首包超时：{open_timeout:g} 秒没有收到第一个 token",
+                    kind="timeout",
+                ) from e
             # 流式中途超过 timeout 没有新字节 —— 这才是「真卡死」，
             # 与「写得慢」要分清楚：写得慢不会断流，卡住才会。
-            got = sum(len(c) for c in chunks)
             raise LLMRequestError(
                 f"流式输出中断：连续 {self.timeout:g} 秒没有收到新数据"
                 f"（已收 {got} 字）",
@@ -2358,13 +2452,35 @@ class OpenAICompatibleClient:
                 f"没收到结束标记）—— 疑似中转站中途断流",
                 kind="network",
             )
-        if first_at is not None and first_at > 60:
+        if first_at is not None and first_at > self.first_token_timeout * 0.75:
             logger.warning(
-                f"[dota2] 流式首包晚了 {first_at:.0f}s"
-                f"（总 {time.monotonic() - started:.0f}s · {len(text)} 字）—— "
-                f"中转站前面的 Cloudflare 门槛是 120s，再慢就容易被掐成 524"
+                f"[dota2] 流式首包偏慢 {first_at:.0f}s"
+                f"（阈值 {self.first_token_timeout:g}s · "
+                f"总 {time.monotonic() - started:.0f}s · {len(text)} 字）"
+                f"—— 再慢就会被判首包超时并重试"
             )
         return text
+
+    def _relax_read_timeout(self, resp: Any) -> None:
+        """首包到达后，把连接的读超时放宽回「空闲阈值」。
+
+        ``urlopen(timeout=...)`` 设的是 socket 级超时，对**每一次** ``recv``
+        生效：打开连接时为了快速判死首包用的是 ``first_token_timeout``，
+        但读到第一个字之后，整篇报告还按 60 秒卡着就不对了 —— 模型中途
+        思考几十秒是常态。
+
+        取不到底层 socket 时安静跳过：退化成「整篇都按首包阈值算」，
+        比为了改超时把一次正常的请求弄挂要好。
+        """
+        sock = getattr(
+            getattr(getattr(resp, "fp", None), "raw", None), "_sock", None
+        )
+        if sock is None:
+            return
+        try:
+            sock.settimeout(self.timeout)
+        except OSError:  # pragma: no cover - 平台差异，改了也没法验证
+            pass
 
     @staticmethod
     def parse_message(data: dict) -> dict:
