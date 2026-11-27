@@ -674,6 +674,18 @@ def read_illusions(combat: list[dict]) -> dict[str, list[tuple[float, float | No
 #: 那条路径，而它贵在**模型为了补猜而多写的废话**，不比多给数据便宜。
 EVENT_LIMIT = 1500
 
+#: 聚合段里「不进汇总、按原样单条列出」的阈值（伤害/治疗量）。
+#:
+#: 一次 400 的伤害是关键打击，一次 400 的治疗是救人，都不是噪音 ——
+#: 它们出现在聚合行里会被「累计 N」抹平，看不出那一击/那一奶有多重。
+_AGG_KEEP_SINGLE = 300
+
+#: 治疗**他人**时「不进聚合、单条列出」的阈值。
+#:
+#: 比伤害阈值低一半：治疗自己是续航（可以并进聚合），治疗别人是救人 ——
+#: 一次 180 的奶救不救得活人，往往比一次 300 的伤害更能决定这波团的结论。
+_AGG_KEEP_HEAL_OTHER = 150
+
 #: 保留优先级（数字越小越必留）。
 #:
 #: 判据是「这条信息能不能改变对一个决策的评价」。
@@ -1115,6 +1127,145 @@ def _render_modifier_remove(
     return "%s %s 身上的 %s 结束（实际%.1fs）" % (tm, g, label, mel)
 
 
+def _event_source_label(
+    e: dict,
+    item_label: Callable[[str], str] | None,
+    ability_label: Callable[[str], str] | None,
+    item_resolve: Callable[[str], str | None] | None,
+) -> str:
+    """一条伤害/治疗事件的来源名（技能或道具），取不到返回空串。"""
+    info_raw = str(e.get("inf") or "")
+    info = _strip_prefix(info_raw, "modifier_", "ability_")
+    if info_raw.startswith("item_"):
+        fn = item_label or (lambda x: str(x).replace("_", " "))
+        return _resolve_item_label(info_raw, fn, item_resolve) or ""
+    if info_raw and not info_raw.startswith("modifier_"):
+        fn = ability_label or (lambda x: str(x).replace("_", " "))
+        return fn(info) or ""
+    return ""
+
+
+def _aggregate_noise_events(
+    combat: list[dict],
+    cl0: float,
+    cl1: float,
+    c2m: float,
+    *,
+    name_of: Callable[[Any], str],
+    item_label: Callable[[str], str] | None = None,
+    ability_label: Callable[[str], str] | None = None,
+    item_resolve: Callable[[str], str | None] | None = None,
+    gap: float = 8.0,
+    keep_single: int = 300,
+) -> list[str]:
+    """把「小额高频」的伤害与治疗压成按时间段的汇总行。
+
+    为什么不直接丢：一段「08:31–08:39 莱恩 → 主宰 24 次、累计 380 伤害」
+    本身就是画面的一部分 —— 它说明这几秒谁在持续挨打、谁在持续输出。
+    一律删掉，模型看到的就是「这 8 秒什么都没发生」，反而更容易编。
+
+    切段口径：同一对「攻击者 → 目标」的同类事件按时间排序，相邻两条间隔
+    超过 ``gap`` 秒就断开成新的一段。按固定时间桶切会把一次连续交火切成
+    两半，而按间隔切出来的每一段正好是一次「持续输出窗口」。
+
+    ``keep_single`` 以上的单次伤害/治疗不进聚合，按原样单条给 —— 一次 400
+    的伤害是「关键打击」，不是噪音。治疗同理：大额救治必须逐条可见。
+
+    控制、沉默、位移、减速、救人道具（清莲宝珠/梅肯/卫士胫甲）都不在这里，
+    它们在 ``_event_priority`` 里已经是必留档，由 ``_triage_events`` 原样输出。
+    """
+    pairs: dict[tuple[str, str, str], list[dict]] = {}
+    for e in combat:
+        t = float(e.get("t") or 0)
+        if not (cl0 - EVENT_PAD <= t <= cl1 + EVENT_PAD):
+            continue
+        typ = _strip_prefix(e.get("type"), "DOTA_COMBATLOG_")
+        if typ not in ("DAMAGE", "HEAL"):
+            continue
+        atk, tgt = str(e.get("atk") or ""), str(e.get("tgt") or "")
+        atk_hero = atk.startswith("npc_dota_hero_")
+        tgt_hero = tgt.startswith("npc_dota_hero_")
+        val = int(e.get("val") or 0)
+        # 与 _render_event 保持同一套出局条件：否则会把它本来不写的行聚合出来，
+        # 「安静的一段时间」凭空多出一段打架记录。
+        if typ == "DAMAGE":
+            if val <= 0:
+                continue
+            if not (atk_hero and tgt_hero):
+                # 打野、清兵的伤害不进聚合段。它们不是团战画面的一部分，
+                # 而「这个人这波在刷钱没来」由位置段和「未参战」说明给出，
+                # 不需要靠一堆 `→ 野怪` 行去暗示。
+                continue
+        else:
+            if val < 5:
+                continue
+            if not (atk_hero or tgt_hero):
+                continue
+        pairs.setdefault((atk, tgt, typ), []).append(e)
+
+    rows: list[tuple[float, str]] = []
+    for (atk, tgt, typ), events in pairs.items():
+        events.sort(key=lambda x: float(x.get("t") or 0))
+        cur: dict | None = None
+
+        def flush() -> None:
+            if not cur:
+                return
+            if cur["n"] < 2 and cur["total"] < 100:
+                # 零星一两下、总量也可忽略：写出来比不写更吵。
+                return
+            if cur["n"] < 2:
+                # 只有一条的不算「高频」，按单条原样给，省得模型看到
+                # 「1 次，累计 42」这种比原文还啰嗦的汇总。
+                rows.append((cur["t0"], cur["single"]))
+                return
+            span = "%s–%s" % (_clock(cur["t0"]), _clock(cur["t1"]))
+            src_note = ""
+            if cur["srcs"]:
+                top = sorted(cur["srcs"].items(), key=lambda kv: -kv[1])[:3]
+                src_note = "（%s）" % "、".join("%s %d" % (k, v) for k, v in top)
+            if typ == "HEAL":
+                text = "%s %s 治疗 %s：%d 次，累计 %d%s" % (
+                    span, cur["a"], cur["g"], cur["n"], cur["total"], src_note)
+            else:
+                text = "%s %s → %s：%d 次，累计 %d 伤害%s" % (
+                    span, cur["a"], cur["g"], cur["n"], cur["total"], src_note)
+            rows.append((cur["t0"], text))
+
+        for e in events:
+            tm = float(e.get("t") or 0) - c2m
+            val = int(e.get("val") or 0)
+            single = _render_event(
+                e, c2m, name_of, item_label=item_label,
+                ability_label=ability_label, item_resolve=item_resolve,
+            )
+            if val >= (_AGG_KEEP_HEAL_OTHER if typ == "HEAL" and atk != tgt else keep_single):
+                # 关键打击 / 救人：单独一条，不进聚合，也不打乱当前段。
+                # 治疗他人的阈值比伤害低得多 —— 一次 180 的奶救不救得活人，
+                # 比一次 300 的伤害更能决定这波团的结论，不能混进「累计 N」里。
+                flush()
+                cur = None
+                if single:
+                    rows.append((tm, single))
+                continue
+            if cur is None or tm - cur["t1"] > gap:
+                flush()
+                cur = {
+                    "a": name_of(atk), "g": name_of(tgt), "n": 0, "total": 0,
+                    "t0": tm, "t1": tm, "srcs": {}, "single": single or "",
+                }
+            cur["n"] += 1
+            cur["total"] += val
+            cur["t1"] = tm
+            src = _event_source_label(e, item_label, ability_label, item_resolve)
+            if src:
+                cur["srcs"][src] = cur["srcs"].get(src, 0) + 1
+        flush()
+
+    rows.sort(key=lambda r: r[0])
+    return [text for _, text in rows]
+
+
 def _triage_events(
     combat: list[dict],
     cl0: float,
@@ -1122,6 +1273,8 @@ def _triage_events(
     c2m: float,
     *,
     render: Callable[[dict], str | None],
+    floor: int = _EV_NOISE,
+    limit: int = EVENT_LIMIT,
 ) -> tuple[list[str], int, int]:
     """先渲染、再分层保留，保证**时间上均匀覆盖整波团**。
 
@@ -1136,6 +1289,13 @@ def _triage_events(
     2. 优先级 0–2 的全留（阵亡/控制/技能/道具/暴击）；
     3. 剩余的按 4 秒分桶，每桶按优先级取，配额 = 剩余名额 / 桶数；
     4. 必留项自己就超限时（极端情况），把必留项也按桶抽稀，绝不整段丢掉尾部。
+
+    Args:
+        floor: 只留优先级 **不超过** 它的条目。默认 ``_EV_NOISE``（全收）；
+            逐波核验传 ``_EV_HIGH``，直接丢掉「大额伤害」与「小额伤害、
+            治疗、普通 buff 到期」——2026-11-27 实测，单波 960 行里
+            有 646 行属于这一类，占了整块的 80% 体积。
+        limit: 行数上限，默认 :data:`EVENT_LIMIT`。
     """
     cands: list[tuple[float, int, str]] = []
     for e in combat:
@@ -1148,17 +1308,20 @@ def _triage_events(
         line = render(e)
         if line is None:
             continue
-        cands.append((t, _event_priority(e, atk, tgt), line))
+        prio = _event_priority(e, atk, tgt)
+        if prio > floor:
+            continue
+        cands.append((t, prio, line))
 
     if not cands:
         return [], 0, 0
     total = len(cands)
-    if total <= EVENT_LIMIT:
+    if total <= limit:
         return [c[2] for c in cands], 0, total
 
     must = [c for c in cands if c[1] <= _EV_HIGH]
     rest = [c for c in cands if c[1] > _EV_HIGH]
-    room = EVENT_LIMIT - len(must)
+    room = limit - len(must)
 
     def bucket_pick(items: list[tuple[float, int, str]], quota: int) -> list[tuple[float, int, str]]:
         """按 4 秒分桶，每桶优先取高优先级的，桶内保持时间顺序。"""
@@ -1176,7 +1339,7 @@ def _triage_events(
 
     if room <= 0:
         # 必留项自己就超了：按桶抽稀，但**保留时间覆盖**，不砍尾巴
-        kept = bucket_pick(must, EVENT_LIMIT)
+        kept = bucket_pick(must, limit)
     else:
         kept = must + bucket_pick(rest, room)
     kept.sort(key=lambda x: x[0])
@@ -1268,10 +1431,19 @@ def build_fight_block(
     aghs: dict[str, list[tuple[float, str, str]]] | None = None,
     illusions: dict[str, list[tuple[float, float | None]]] | None = None,
     focus_account_ids: Iterable[Any] | None = None,
+    density: str = "full",
 ) -> str:
     """把一波团整理成给模型看的文本块。
 
     时间一律用**比赛时间**；内部按 ``combatlog_to_match`` 换算回战斗日志时间。
+
+    ``density`` 有两种：
+
+    · ``"full"``（默认）—— 给人看完整过程、也用于旧的整体注入路径；
+    · ``"brief"`` —— 给**逐波核验**用：事件只留阵亡/控制/技能/道具
+      （丢掉大额伤害、小额伤害、治疗、普通 buff 到期），血量与位置按
+      每两个采样点取一（约 4 秒一行）。实测同一波从 6.0 万字符降到
+      2.2 万左右，而「谁先手、控了谁、谁先倒」这些画面要素一条没少。
 
     ``npc_label`` 是 ``npc_dota_hero_xxx → 显示名`` 的映射，由调用方用英雄表
     建好传进来：录像里的实体名是英文 npc 名，而插件显示的是中文名，
@@ -1295,6 +1467,7 @@ def build_fight_block(
     """
     aghs = aghs or {}
     illusions = illusions or {}
+    brief = str(density or "full").lower() == "brief"
     c2m = float(offsets.get("combatlog_to_match") or 0)
     d2c = float(offsets.get("demo_to_combatlog") or 0)
     demo_to_match = d2c - c2m
@@ -1706,10 +1879,38 @@ def build_fight_block(
         combat, cl0, cl1, c2m, render=lambda e: _render_event(
             e, c2m, name_of, item_label=label, ability_label=ability,
             item_resolve=item_resolve,
-        )
+        ),
+        floor=_EV_HIGH if brief else _EV_NOISE,
+        # 两种模式共用同一个行数上限：核验模式已经把噪音挡在 floor 之外，
+        # 留下来的全是阵亡/控制/技能/道具 —— 再对它们抽稀就等于随机丢控制，
+        # 而「控了几秒、谁被控」正是这层唯一不可替代的证据。
+        limit=EVENT_LIMIT,
     )
     lines.extend(picked)
-    if dropped:
+    if brief:
+        note = (
+            "（核验模式：阵亡、控制、技能、道具逐条保留，共 %d 条；"
+            "小额伤害与持续治疗见下方聚合段" % len(picked)
+        )
+        if dropped:
+            note += "；超出上限再按时间均匀抽稀 %d 条" % dropped
+        lines.append(note + "）")
+        aggregated = _aggregate_noise_events(
+            combat, cl0, cl1, c2m,
+            name_of=name_of,
+            item_label=label,
+            ability_label=ability,
+            item_resolve=item_resolve,
+            keep_single=_AGG_KEEP_SINGLE,
+        )
+        if aggregated:
+            lines.append("")
+            lines.append(
+                "=== 小额高频记录（按时段聚合；单次 ≥%d 的伤害、≥%d 的救人治疗仍逐条列出）==="
+                % (_AGG_KEEP_SINGLE, _AGG_KEEP_HEAL_OTHER)
+            )
+            lines.extend(aggregated)
+    elif dropped:
         lines.append(
             "（共 %d 条候选，保留 %d 条；按时间分桶抽稀，已略去 %d 条 "
             "重复的小额伤害/短增益，阵亡·控制·技能·道具·大额伤害全部保留）"
@@ -1726,6 +1927,11 @@ def build_fight_block(
             if t0 <= mt <= t1 + 3:
                 snap_times.add(round(mt, 1))
     ordered = sorted(snap_times)
+    if brief:
+        # 每两个采样点取一（约 4.2 秒一行）。血量/位置段原本各占 4 千字符，
+        # 而画面还原看的是「谁什么时候掉到危险线」，不是 2.1 秒一格的全量轨迹。
+        # 阵亡与复活另有一段独立输出（见上），不会因为这里抽稀而消失。
+        ordered = ordered[::2]
     for mt in ordered:
         parts = []
         for npc, rows in hp_series.items():

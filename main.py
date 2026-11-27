@@ -2183,44 +2183,160 @@ class Dota2Plugin(Star):
             win_curve=win_block,
             hero_block=self._hero_kb_block(match, heroes, focus_ids),
         )
-        if self.cfg("two_step_report", True):
-            evidence = await self._match_keyfight_evidence(match, heroes, items, focus_ids)
+        if self.cfg("two_step_report", True) and self.cfg(
+            "keyfight_brief_enabled", True
+        ):
+            # 2026-11-27：从「三波证据拼在一起注入」改成「逐波独立核验」。
+            # 拼在一起的版本受注入预算限制，实测三波全部被判定「未注入」，
+            # 模型一个字都没看到。逐波版每波单开一次调用，产出结论而非原始日志。
+            evidence = await self._match_keyfight_briefs(
+                match, heroes, items, focus_ids, focus_names, umo=umo
+            )
             common, spec = split_report_prompt(prompt)
             if spec:
                 prompt = common + "\n\n" + evidence + "\n\n" + spec
         return headline, prompt
 
-    async def _match_keyfight_evidence(
-        self, match: dict, heroes: dict, items: dict, focus_ids: list[int]
+    async def _match_keyfight_briefs(
+        self,
+        match: dict,
+        heroes: dict,
+        items: dict,
+        focus_ids: list[int],
+        focus_names: dict[int, str],
+        *,
+        umo: str = "",
     ) -> str:
-        """一次排队完成关键团取证；失败明确降级，不阻断基础报告。"""
+        """逐波独立核验关键团，返回可直接引用的「画面还原 + 评测」汇总。
+
+        2026-11-27 改：原来是把三波的证据块拼成一份文本塞进主提示词。实测
+        单波完整窗口就有 6 万字符、三波接近 20 万，而注入预算只有 3 万 ——
+        09:40 那场三波**全部**被判「超出剩余输入预算」，模型一个字都没看到，
+        报告里通篇「记录不足 / 无法判断」。用户的原话：
+        「应该在第一步归因分析的时候，用 llm 把团战数据转化为实际的团战画面和评测」。
+
+        现在每波单独一次模型调用：
+        · 每波都有完整上下文，不会被别的波挤掉；
+        · 模型只面对一波，注意力不会被另外两波稀释；
+        · 每波产出 400–700 字，三份加起来几千字，主提示词装得下。
+
+        数据块用 ``density="brief"``：只留阵亡/控制/技能/道具，血量与位置
+        降采样。单波从 6.0 万字符降到 2 万出头，画面要素一条没少。
+
+        代价是三次额外调用。所以这里的失败一律降级为「本波核验未完成」，
+        绝不阻断主报告 —— 用户等的是战报，不是流程完整性。
+        """
         if not match.get("teamfights"):
-            return dota_keyfights.HEADER + "\n录像证据不可用：没有已解析团战窗口。"
+            return dota_keyfights.BRIEF_HEADER + "\n录像证据不可用：没有已解析团战窗口。"
+        match_id = int(match.get("match_id") or 0)
         try:
-            curve = await self._aligned_curve(match, int(match.get("match_id") or 0))
-            candidates = dota_replay.score_fights(match, focus_ids=focus_ids, curve=curve)
-            selected = dota_replay.pick_candidates(candidates, top_n=3)
-            if not selected:
-                return dota_keyfights.HEADER + "\n没有可定位的关键团窗口。"
-            self._jobs.stage("归因前取证：排队读取关键团完整录像窗口")
-
-            async def collect() -> str:
-                async def build(candidate: dict) -> str:
-                    self._jobs.stage(f"归因前取证：读取第 {candidate['index']} 波完整过程")
-                    fight = match["teamfights"][candidate["index"] - 1]
-                    return await self._build_replay_block(
-                        match, fight, heroes, items, focus_ids, for_report=True
-                    )
-                return await dota_keyfights.collect(selected, build)
-
-            return await self.replay_queue.run(
-                f"比赛 {match.get('match_id')} 归因前关键团取证", collect
+            curve = await self._aligned_curve(match, match_id)
+            candidates = dota_replay.score_fights(
+                match, focus_ids=focus_ids, curve=curve
             )
+            waves = max(1, min(5, int(self.cfg("keyfight_brief_waves", 3) or 3)))
+            selected = dota_replay.pick_candidates(candidates, top_n=waves)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 - 增强证据不可拖垮整场复盘
-            logger.warning(f"[dota2] 归因前关键团取证失败：{exc}")
-            return dota_keyfights.HEADER + "\n录像证据不可用：引擎、队列或录像暂不可用；按基础数据归因，不作录像级断言。"
+        except Exception as exc:  # noqa: BLE001 - 只是个增强项
+            logger.warning(f"[dota2] 关键团窗口筛选失败：{exc}")
+            return (
+                dota_keyfights.BRIEF_HEADER
+                + "\n录像证据不可用：窗口筛选失败，按基础数据归因，不作录像级断言。"
+            )
+        if not selected:
+            return dota_keyfights.BRIEF_HEADER + "\n没有可定位的关键团窗口。"
+
+        # 主视角写进每波的提示词。不写的话，块里只有英雄名、没有昵称，
+        # 模型没法把「请以钢板为主视角」对到具体哪个英雄身上（2026-10 踩过）。
+        focus_label = ""
+        if focus_ids:
+            aid = int(focus_ids[0])
+            name = focus_names.get(aid) or str(aid)
+            hero = ""
+            for player in match.get("players") or []:
+                if not isinstance(player, dict):
+                    continue
+                try:
+                    same = int(player.get("account_id") or 0) == aid
+                except (TypeError, ValueError):
+                    continue
+                if same:
+                    hero = hname(heroes, player.get("hero_id"))
+                    break
+            focus_label = f"{name}（本局玩的是 {hero}）" if hero else name
+
+        sections = [dota_keyfights.BRIEF_HEADER]
+        for order, candidate in enumerate(selected, 1):
+            idx = int(candidate["index"])
+            start = float(candidate.get("start") or 0)
+            end = float(candidate.get("end") or 0)
+            reason = str(candidate.get("pick_reason") or "关键")
+            self._jobs.stage(
+                f"关键团逐波核验：第 {order}/{len(selected)} 波"
+                f"（原始第 {idx} 波 {int(start)}–{int(end)} 秒）"
+            )
+
+            # 队列要的是零参协程工厂：取证在排队期间不能提前跑起来。
+            async def build(cand: dict = candidate) -> str:
+                fight = match["teamfights"][int(cand["index"]) - 1]
+                return await self._build_replay_block(
+                    match,
+                    fight,
+                    heroes,
+                    items,
+                    focus_ids,
+                    for_report=True,
+                    density="brief",
+                )
+
+            try:
+                block = await self.replay_queue.run(
+                    f"比赛 {match_id} 第 {idx} 波逐波核验取证", build
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 单波取证失败不影响别波
+                logger.warning(f"[dota2] 第 {idx} 波录像取证失败：{exc}")
+                sections.append(
+                    f"### 第 {idx} 波（{int(start)}–{int(end)} 秒；{reason}）\n"
+                    "录像证据不可用；这一波只能按基础数据看，不作录像级断言。"
+                )
+                continue
+
+            began = time.time()
+            brief = await self._call_report_llm(
+                dota_keyfights.brief_prompt(
+                    idx,
+                    start,
+                    end,
+                    reason=reason,
+                    focus_label=focus_label,
+                    block=block,
+                ),
+                umo=umo,
+                system_prompt=dota_keyfights.BRIEF_SYSTEM,
+                label=f"第 {idx} 波核验",
+                # 逐波核验是增强项：同一通道只重试一次，别让某一波拖满 4 分钟。
+                retries_override=1,
+            )
+            took = time.time() - began
+            if not brief or len(brief.strip()) < 40:
+                logger.warning(f"[dota2] 第 {idx} 波核验未拿到结论（{took:.1f}s）")
+                note = (
+                    "本波核验未完成（模型这次没有返回可用结论）；"
+                    "这一波只能按基础数据看，不要据此推断过程。"
+                )
+            else:
+                logger.info(
+                    f"[dota2] 第 {idx} 波核验完成"
+                    f"（数据块 {len(block)} 字符 · 结论 {len(brief.strip())} 字 · {took:.1f}s）"
+                )
+                note = brief.strip()
+            sections.append(
+                f"### 第 {idx} 波（{int(start)}–{int(end)} 秒；{reason}）\n{note}"
+            )
+        return "\n\n".join(sections)
 
     def _hero_kb_block(
         self,
@@ -7464,10 +7580,15 @@ class Dota2Plugin(Star):
         focus_ids: Sequence[int] | None = None,
         *,
         for_report: bool = False,
+        density: str = "full",
     ) -> str:
         """下载 → 解压 → 解析 → 组装数据块。整个函数在队列里串行执行。
 
         整场归因不需要动画 Fine，避免为它额外重下录像。
+
+        ``density`` 透传给 :func:`dota_replay_parse.build_fight_block`：
+        ``"brief"`` 是逐波核验用的压缩版（只留阵亡/控制/技能/道具，
+        血量与位置降采样），``"full"`` 保留完整过程，供人看与旧路径用。
         """
         match_id = int(match.get("match_id") or 0)
         engine = self._replay_engine_dir()
@@ -7693,6 +7814,7 @@ class Dota2Plugin(Star):
             aghs=aghs,
             illusions=illusions,
             focus_account_ids=focus_ids,
+            density=density,
         )
 
     def _fight_prompt(
@@ -9551,7 +9673,13 @@ class Dota2Plugin(Star):
         return f"⚠️ 模型调用失败：{message}"
 
     async def _call_report_llm(
-        self, prompt: str, *, umo: str = "", system_prompt: str = ""
+        self,
+        prompt: str,
+        *,
+        umo: str = "",
+        system_prompt: str = "",
+        label: str = "",
+        retries_override: int | None = None,
     ) -> str | None:
         """生成**报告 / 分析**用的大模型调用：专用 Key 优先，失败回退 AstrBot。
 
@@ -9574,6 +9702,12 @@ class Dota2Plugin(Star):
             umo: 会话来源，回退到 AstrBot 提供商时用来解析会话默认模型。
             system_prompt: 自定义系统提示词。留空则用配置项
                 ``analysis_system_prompt``，再留空用内置的报告模板。
+            label: 这条调用的日志标签，默认「分析正文」。**非空即视为辅助
+                调用**（例如逐波核验）——它的失败只写本地日志，不写
+                ``_last_report_error``，否则会顶掉主报告的失败归因，
+                让「没出报告」的说明指向一个不重要的旁支调用。
+            retries_override: 覆盖配置里的同通道重试次数。辅助调用传小值
+                （逐波核验传 1），避免某一波拖满 4 分钟才降级。
 
         Returns:
             报告正文；失败或未启用时返回 None（并在日志里说明原因）。
@@ -9588,6 +9722,9 @@ class Dota2Plugin(Star):
             system_prompt = DEFAULT_SYSTEM_PROMPT
 
         client = self._dedicated_client()
+        #: 日志前缀：主报告叫「分析正文」，辅助调用（逐波核验）用自己的名字。
+        #: 只影响日志与错误归属，不影响调用本身。
+        tag = label or "分析正文"
         #: 专用通道最后留下的错误。回退段要靠它决定「报错该归咎于谁」——
         #: 专用通道已经失败过，就别让回退的异常把首因顶掉（2026-11-26 的
         #: 教训：用户看到的永远是「回退通道 Request timed out」，真正的
@@ -9596,7 +9733,10 @@ class Dota2Plugin(Star):
         if client is not None:
             max_tokens = int(self.cfg("llm_max_tokens", 0) or 0)
             temperature = float(self.cfg("llm_temperature", 0.7) or 0)
-            retries = max(0, int(self.cfg("llm_stream_retries", 3) or 0))
+            if retries_override is None:
+                retries = max(0, int(self.cfg("llm_stream_retries", 3) or 0))
+            else:
+                retries = max(0, int(retries_override))
 
             # 同一通道最多试 ``retries + 1`` 次（首次 + 重试）。重试放在
             # 这里而不是 ``_stream_sync`` 里面，是因为「该不该重试」取决于
@@ -9626,7 +9766,11 @@ class Dota2Plugin(Star):
                     # 立刻重发换条路由；鉴权 / 配置错误重发没用。
                     if e.retryable_same_channel and attempt < retries:
                         continue
-                    self._note_report_error(e)
+                    if not label:
+                        # 辅助调用（逐波核验）的失败不写全局状态：它一旦写进去，
+                        # 主报告后面那次「没拿到结果」就会被解释成「超时」，
+                        # 而真正的原因其实是主报告自己那条链。
+                        self._note_report_error(e)
                 except Exception as e:  # noqa: BLE001
                     last_error = LLMRequestError(
                         f"专用模型调用出现异常：{e}", kind="other"
@@ -9634,7 +9778,8 @@ class Dota2Plugin(Star):
                     logger.error(
                         f"[dota2] 专用模型调用出现异常：{e}", exc_info=True
                     )
-                    self._note_report_error(last_error)
+                    if not label:
+                        self._note_report_error(last_error)
                 else:
                     # **成功也要留痕**。这里原来只 return，一声不响 —— 事后查
                     # 「这份战报到底走了哪条 key」时，日志里只有入口那轮的默认
@@ -9644,7 +9789,7 @@ class Dota2Plugin(Star):
                             f"[dota2] 专用模型第 {attempt} 次重试成功"
                         )
                     logger.info(
-                        f"[dota2] 分析正文已生成（通道=专用模型 "
+                        f"[dota2] {tag}已生成（通道=专用模型 "
                         f"{getattr(client, 'model', '') or '未命名'} · "
                         f"{len(text or '')} 字 · {time.time() - started:.1f}s）"
                     )
@@ -9685,7 +9830,7 @@ class Dota2Plugin(Star):
             text = await call_llm(provider, system_prompt, prompt, prefer_stream=True)
         except Exception as e:  # noqa: BLE001
             logger.error(f"[dota2] 调用大模型失败: {e}", exc_info=True)
-            if last_error is None:
+            if last_error is None and not label:
                 # 专用通道根本没跑（没配 Key / 没启用），回退的失败就是首因
                 self._note_report_error(
                     LLMRequestError(f"回退通道调用失败：{e}", kind="other")
@@ -9698,7 +9843,7 @@ class Dota2Plugin(Star):
             return None
         # 回退成功同样要留痕 —— 只有这样「专用通道没走成」才在日志里可见。
         logger.info(
-            f"[dota2] 分析正文已生成（通道=回退 AstrBot 默认模型（流式） · "
+            f"[dota2] {tag}已生成（通道=回退 AstrBot 默认模型（流式） · "
             f"{len(text or '')} 字 · {time.time() - started:.1f}s）"
         )
         return text
