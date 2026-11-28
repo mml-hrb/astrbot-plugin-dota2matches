@@ -9830,11 +9830,13 @@ class Dota2Plugin(Star):
             text = await call_llm(provider, system_prompt, prompt, prefer_stream=True)
         except Exception as e:  # noqa: BLE001
             logger.error(f"[dota2] 调用大模型失败: {e}", exc_info=True)
-            if last_error is None and not label:
-                # 专用通道根本没跑（没配 Key / 没启用），回退的失败就是首因
-                self._note_report_error(
-                    LLMRequestError(f"回退通道调用失败：{e}", kind="other")
-                )
+            if last_error is None:
+                # 专用通道根本没跑（没配 Key / 没启用），回退的失败就是首因。
+                # 辅助调用不写全局错误，但也不能去读取不存在的专用通道异常。
+                if not label:
+                    self._note_report_error(
+                        LLMRequestError(f"回退通道调用失败：{e}", kind="other")
+                    )
             else:
                 # 专用通道已经失败过 —— 那才是首因，不能覆盖
                 logger.warning(
